@@ -1,7 +1,7 @@
 # Security
 
 The threat model, the properties the contracts enforce, and the record of what the 2026-09-12
-adversarial review found and what was done about it.
+adversarial review and the 2026-09-13 documentation review found and what was done about it.
 
 > **Paths.** Paths resolve from the root of this repository, leekzor/callhouse-contracts. A path
 > followed by (leekzor/callhouse) lives in the app repository (keeper, indexer, web, ops and the
@@ -41,6 +41,10 @@ These are not conventions; they are checks in the deployed code, each with regre
 - **Cycle tenor is capped at 21 days** by a compiled-in constant (`MAX_CYCLE_TENOR`). The
   registry that sets the weekly cycle is a single third-party EOA; a hostile or fat-fingered
   cycle must produce a skipped week, not a years-long lock on depositor principal.
+- **A contract is exactly one token.** The OTM band, the premium floor and the utilisation cap
+  are all computed per 1e18 of the Stock Token, so `rollOpen` reverts `UnexpectedLotSize` unless
+  the cycle's lot is exactly 1e18. A lot change by the registry owner costs skipped weeks, not
+  in-the-money calls written against principal. See §4, finding 6.
 - **The written option's window must equal the cycle's window.** The deposit gate rests on
   "assignment cannot happen before `cycleExerciseTs`", which only holds if the option actually
   written shares that timestamp. `rollOpen` reverts `OptionWindowMismatch` otherwise.
@@ -54,6 +58,10 @@ These are not conventions; they are checks in the deployed code, each with regre
 - **Every payout is clamped to what is actually backed** (`_usdgAvailableForHolders`), and
   accounting is anchored on a measured USDG balance, not an arithmetic identity. The index
   drift costs dust, never principal. See ACCOUNTING.md §4.
+- **Each redeem-queue entry is paid its own escrow accrual.** Queued shares share one escrow, but
+  each entry receives only the USDG indexed while its own shares were in it (a reward debt taken
+  at `queueRedeem`), so a later queuer cannot take what an earlier queuer's shares earned. See
+  ACCOUNTING.md §5 and §4, finding 7.
 - **Rounding always favours the vault** in share maths (ACCOUNTING.md §3).
 - **The invariants in ACCOUNTING.md §7** are asserted continuously by the stateful suite.
 
@@ -64,7 +72,7 @@ These are not conventions; they are checks in the deployed code, each with regre
 | Keeper (hot) | propose strike/size/order, call the rolls | a wasted week and gas; the vault re-validates every field |
 | Guardian | halt writes, invalidate all listings | denial of new writes until the Admin Safe unhalts; exits stay open |
 | Admin Safe (2/3) | policy inside caps, fee recipient, Valorem fee acceptance, deposit cap | degraded terms inside compiled-in caps; still cannot touch a token |
-| Registry owner (third-party EOA) | sets the weekly cycle for the whole market | a skipped week; the band, the tenor ceiling and the option-window check refuse anything worse |
+| Registry owner (third-party EOA) | sets the weekly cycle for the whole market: option ids, strike ladder, exercise and expiry timestamps, which rungs are approved, and (between cycles) the lot size | since `6ed528f`: skipped weeks for as long as it withholds a usable cycle or keeps the lot at anything but one token, a cycle of up to 21 days, and a strike ladder anywhere inside the OTM band; the band, the tenor ceiling, the option-window check and the one-token lot check refuse anything worse. **Before `6ed528f` this row was wrong:** a lot above one token with an unrescaled ladder let the keeper's ordinary `rollOpen` write in-the-money calls against principal (§4, finding 6) |
 | Stock Token issuer | freeze transfers, pause the oracle, upgrade the proxy | settlement stops. Disclosed, not coded around — see §5 |
 
 ## 4. The 2026-09-12 adversarial review
@@ -73,9 +81,9 @@ An internal adversarial review run across 13 surfaces (vault core, share account
 machine and reentrancy, the Valorem and Seaport adapters, the order library, the distributor,
 access control, token integration, USDG distribution, economic/MEV, and the keeper, indexer
 API and web surfaces). 72 raw findings were raised; **51 survived adversarial refutation**
-(each finding had to produce a concrete, reachable loss or lie to survive). Everything below
-is fixed and carries a regression test in `test/unit/VaultSecurity.t.sol`, which
-documents each attack in full.
+(each finding had to produce a concrete, reachable loss or lie to survive). Everything in
+the "Fixed" table below is fixed and carries a regression test in `test/unit/VaultSecurity.t.sol`,
+which documents each attack in full.
 
 This was an internal review, not an external audit. Engaging one is still on the plan
 (`tasks.md` (leekzor/callhouse) E-05/E-06), along with the fork rehearsal weeks.
@@ -103,6 +111,19 @@ This was an internal review, not an external audit. Engaging one is still on the
 - **Indexer coverage of `FeeSwept`**, so fee recovery is visible off-chain, plus domain-event
   logging across the keeper and indexer for every alert the runbooks page on.
 
+### Found 2026-09-13, after the review
+
+Found 2026-09-13 during documentation review, verified with PoC, fixed in `6ed528f`. The
+2026-09-12 review missed both. Each surfaced while the protocol documentation was being written,
+was then verified adversarially with an executable proof of concept against the unfixed code, and
+was fixed with regression tests that document the attack. Severities are our own assessment; no
+external auditor has seen either finding or either fix.
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 6 | High (needs the third-party registry owner to act) | `rollOpen` checked the OTM band, the premium floor and utilisation per one token (`Policy.LOT = 1e18`) but wrote whatever `lotSize` the Overcall registry reported. The registry owner can change `lotSize` between cycles (`setLotSize` refuses only while a cycle is live) and list a ladder whose strikes were not rescaled. At lot 2e18 a strike of 227 USDG per contract is 113.50 per token against 220 spot, yet the band saw it 3.2% out of the money: the proof of concept wrote 23 contracts, a buyer filled at the premium floor, exercised, and took about $4,879 of an $11,000 book. Any lot above about 1.03e18 wrote an in-the-money call; with cap sizing, a lot above 1/0.95 also locked assets already reserved for settled redeemers | `ValoremLib.writeCalls` reverts `UnexpectedLotSize(1e18, lotSize)` unless the cycle's lot is exactly 1e18, before any approval or collateral moves. Library-only; `Vault` bytecode unchanged. `test/unit/VaultLotSize.t.sol` (5 tests) |
+| 7 | High | The redeem queue's escrow is one account, and its USDG accrual was split among the epoch's entries pro rata by shares at settlement. But the accrual is earned tranche by tranche, each time premium is indexed, on whatever the escrow held at that moment. A deposit that indexed premium between two queue entries moved value from the earlier queuer to the later one (in the proof of concept the earlier queuer's epoch USDG was 1,504,166 base units instead of 4,512,500), and a newcomer who deposited 30e18 after a fill, her own deposit being the checkpoint, and queued it took 6,768,750 of the 9,025,000 an earlier queuer's shares had earned, while earning nothing. Premium only, never principal; a checkpoint in `queueRedeem` would not have fixed it | Each account records a reward debt (`shares × accUsdgPerShare` when its shares enter escrow) and each epoch records the index it settled at; an entry is paid `floor((shares × epochIndex − debt) / 1e27)`, capped at what the epoch still holds, and the last claimant takes the remainder. Private storage only; public ABI unchanged. `test/unit/VaultQueueFairness.t.sol` (3 tests and a 256-run fuzz); ACCOUNTING.md §5 |
+
 ### Known and accepted, not bugs to fix
 
 - **The Stock Token issuer can freeze transfers and pause the oracle.** Settlement then stops.
@@ -111,7 +132,9 @@ This was an internal review, not an external audit. Engaging one is still on the
   stop). There is no technical mitigation — that is the asset.
 - **USDG and the Stock Token are upgradeable proxies.** Their admin keys are outside our
   control. The fee push is best-effort partly because of this.
-- **The registry owner is a single EOA.** Bounded by §2: worst case is a skipped week.
+- **The registry owner is a single EOA.** Bounded by §2 and the table in §3: since `6ed528f`,
+  skipped weeks, a cycle of up to 21 days, and its choice of strikes inside the band. Before
+  `6ed528f` a lot change could put principal at risk (finding 6).
 - **The 4663 sequencer is centralised** and has no Chainlink uptime feed. An outage surfaces
   as a stale price, which blocks writes — the safe direction.
 - **No upgradeability here.** A real bug means Vault v2 and a migration, communicated in

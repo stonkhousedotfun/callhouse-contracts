@@ -4,7 +4,7 @@ The document we hand to the external auditor (`tasks.md` (leekzor/callhouse) E-0
 It says what we want reviewed, what we do not, what we already believe is true of the code, and
 where we think it is weakest. Written 2026-09-12 against commit
 `27d502a83d72aabf28838c6926cc0b2f5043deb5`; line numbers, sizes and test counts refreshed
-2026-09-13 against this repository's commit `a4c38b0` (§1 "Commit").
+2026-09-13 against this repository's commit `b0ff57b`, after the two fixes of `6ed528f` (§1 "Commit").
 
 > **Paths and commits.** This file lives in leekzor/callhouse-contracts, the audit target, and
 > every path in it resolves from that repository's root (`src/`, `test/`, `script/`, `docs/`,
@@ -17,7 +17,8 @@ where we think it is weakest. Written 2026-09-12 against commit
 > rewrote the commit hashes: a commit hash in this document is a leekzor/callhouse commit unless
 > it is called this repository's. The contracts tree at `27d502a` is this repository's `adc2fbc`,
 > at `cb82bf3` it is `0bc700e`, and at `b31dfb0` it is `edbf1a5`; file contents are identical.
-> Commits after the split (`1187277`, `6023a96`, `a4c38b0`) exist only here.
+> Commits after the split (`1187277`, `6023a96`, `a4c38b0`, `865d842`, `d064658`, `6ed528f`,
+> `b0ff57b`, and the documentation-only commits between them) exist only here.
 
 It does not repeat the architecture or the accounting. Read `docs/ARCHITECTURE.md` (leekzor/callhouse)
 (§2 for the trust boundaries, §3 for the contracts), [ACCOUNTING.md](ACCOUNTING.md) (the money
@@ -39,7 +40,7 @@ Nothing is deployed to mainnet. Every `chains.4663.ours.*` entry in `ops/address
    (`Vault`), the three abstract bases it inherits (`Distributor`, `AdapterValorem`,
    `AdapterSeaport`), the two `public` libraries linked into it and reached by `DELEGATECALL`
    (`ValoremLib`, `SeaportOrderLib`), and the `internal` library that holds the compiled-in caps
-   (`Policy`). 1,190 nSLOC. The properties we want attacked are in §5.
+   (`Policy`). 1,201 nSLOC. The properties we want attacked are in §5.
 2. A configuration review of `script/Deploy.s.sol`, `script/Configure.s.sol`,
    `script/HandoverAdmin.s.sol` and `script/Verify.s.sol`, of the runbook `docs/DEPLOY.md`, and of
    the role topology in `ops/safes.md` (leekzor/callhouse): the constants, the preflight, the
@@ -58,7 +59,7 @@ will be tagged `audit-<date>`; `git status --porcelain` is empty at that tag (th
 that were at the monorepo root, `l2b.html`, `page.html`, `rh_sitemap.txt`, are not part of
 this repository); the auditor should reproduce every figure in §6 and §8 from that tag,
 not from this document. **Line numbers in this document are at this repository's commit
-`a4c38b0`** (and will be re-checked at the audit tag); line citations into files marked
+`b0ff57b`** (and will be re-checked at the audit tag); line citations into files marked
 (leekzor/callhouse) or (leekzor/callhouse-site) are outside that statement and were not
 re-derived. Since `27d502a` the contracts tree has changed in these commits of this
 repository: `edbf1a5`, the protocol fee changed to 5% of premium only (strike proceeds from
@@ -68,11 +69,21 @@ the tests; `1187277`, the standalone-repository migration (comment-only path mar
 `script/Deploy.s.sol` and `test/unit/Policy.t.sol`); `6023a96`, comment and dead-constant
 housekeeping in `Vault.sol`, `Policy.sol`, `IValoremClear.sol` and `Deploy.s.sol` with identical
 runtime sizes (Appendix A items 6 and 8–11); `a4c38b0`, the deploy scripts and runbook
-(§3 "Scripts"; `docs/DEPLOY.md`); and the bootstrap-admin revision of the scripts (script-only:
-`Deploy.s.sol` accepts `ADMIN`, new `HandoverAdmin.s.sol` and
+(§3 "Scripts"; `docs/DEPLOY.md`); `865d842`, one comment line in `IValoremClear.sol` naming the
+upstream repository (same line count); `d064658`, the bootstrap-admin revision of the scripts
+(script-only: `Deploy.s.sol` accepts `ADMIN`, new `HandoverAdmin.s.sol` and
 `script/rehearsal/ExecuteSafeBatch.s.sol`, `Configure.s.sol` loses its key-signing Safe mode,
-`Verify.s.sol` rewritten). Line numbers into `script/` are at that revision; `src/` and `test/` are
-unchanged by it.
+`Verify.s.sol` rewritten; `src/` and `test/` unchanged); `6ed528f`, the two fixes from the
+2026-09-13 documentation review (§6 defects 14 and 15): `ValoremLib.writeCalls` refuses any cycle
+lot other than 1e18 (six lines after L55; `ValoremLib` 3,557 → 3,621 B, so its CREATE2 address
+changes, and the `Vault` bytecode is unchanged by it), and `Vault.sol` pays each redeem-queue entry
+its own escrow accrual (private `_queueAccDebt` and `_epochAccUsdgPerShare`, new `_entryUsdg`,
+changes in `queueRedeem`, `_settleEpochEntry`, `previewCompleteRedeem` and `_settleQueue`; `Vault`
+23,426 → 23,618 B), with the new `test/unit/VaultLotSize.t.sol` and
+`test/unit/VaultQueueFairness.t.sol` and hand-derived updates to one zero-dust test each in
+`test/unit/VaultAssignment.t.sol` and `test/invariant/VaultInvariant.t.sol`; and `b0ff57b`, the
+deploy rehearsal re-run on `6ed528f` (`docs/DEPLOY.md` only). Every line number into `src/`, `test/`,
+`script/` and this repository's `README.md` was re-derived at `b0ff57b`.
 
 **Contact.** To be confirmed at kickoff. The site is not yet deployed at `callhouse.finance`: as of
 2026-09-13 the domain serves a registrar parking redirect (`/.well-known/security.txt` answers
@@ -132,22 +143,23 @@ properties this rests on.
 | `DEFAULT_ADMIN_ROLE` | At launch: the deployer key (bootstrap phase). After `HandoverAdmin.s.sol`: the admin Safe, Gnosis Safe 2-of-3 (`ops/safes.md` (leekzor/callhouse) §1) | `setPolicy` inside the `Policy.validate` caps; `setFeeRecipient` (non-zero); `setDepositCap` (unbounded, can close deposits); `setMaxPriceAge` in [1 hour, 7 days]; `acceptValoremFee`; `haltWrites` and `unhaltWrites`; grant/revoke `KEEPER_ROLE` and `GUARDIAN_ROLE`; grant admin to a fourth address; renounce | Move any Stock Token or USDG (there is no admin-gated transfer in the vault); upgrade; rescue or sweep to an arbitrary address; take more than 20% of harvested premium, or any fee on strike proceeds (the exclusion is in bytecode, not in `policy`); sell inside 1% OTM; widen staleness past 7 days. **No timelock on any admin action.** Worst case: 20% of harvested premium on filled weeks, routed to a recipient of its choosing, never principal |
 | `KEEPER_ROLE` | Hot EOA run by `keeper/` (leekzor/callhouse) (`ops/safes.md` (leekzor/callhouse) §2) | `rollOpen` (chooses the rung and size within policy); `approveListing` (proposes the whole Seaport order, at most 3 authorisations per cycle); `cancelListing`; `invalidateAllListings`; `rollClose` from `cycleExpiryTs` | Hold the option tokens or the claim; pay premium anywhere but the vault and Overcall's fee address; list above strike, below the policy floor, past `cycleExerciseTs`, or more than inventory; halt or unhalt; change any parameter; move a token. Worst case: a wasted week |
 | `GUARDIAN_ROLE` | 1-of-1 key on separate hardware, different continent (`ops/safes.md` (leekzor/callhouse) §3) | `haltWrites` (blocks `rollOpen` and `approveListing` only); `cancelListing`; `invalidateAllListings` (needs no order data) | `unhaltWrites` (the guardian can stop, never start); change parameters; block deposits, instant redemption, the queue, USDG claims, `lockBook` or `rollClose`; move a token. `ops/safes.md` (leekzor/callhouse) §4 is the checkable proof |
-| Fee recipient | Fee Safe (`ops/safes.md` (leekzor/callhouse) §6) | Receive the protocol fee through the best-effort push in `rollClose` or the permissionless `sweepFee()` (both via `_tryPayFee`, Vault L980–999) | Holds no role; nothing else |
-| Deployer | EOA running `Deploy.s.sol` | Fix every immutable at construction (asset, USDG, clearinghouse, registry, feed, Seaport, conduit key, zone, Overcall fee recipient); choose the one `admin` the constructor grants `DEFAULT_ADMIN_ROLE` to (Vault L299). **Launch plan: `admin` = the deployer's own address**, so until the handover the deployer key has every `DEFAULT_ADMIN_ROLE` power above | A wrong immutable is unfixable without a redeploy. Leaves the admin role only through `HandoverAdmin.s.sol` (grant to the Safe; renounce refused until the Safe has executed a transaction after the grant). `Verify.s.sol` checks the deployer holds admin in the bootstrap phase and nothing in the safe phase |
+| Fee recipient | Fee Safe (`ops/safes.md` (leekzor/callhouse) §6) | Receive the protocol fee through the best-effort push in `rollClose` or the permissionless `sweepFee()` (both via `_tryPayFee`, Vault L1013–1032) | Holds no role; nothing else |
+| Deployer | EOA running `Deploy.s.sol` | Fix every immutable at construction (asset, USDG, clearinghouse, registry, feed, Seaport, conduit key, zone, Overcall fee recipient); choose the one `admin` the constructor grants `DEFAULT_ADMIN_ROLE` to (Vault L315). **Launch plan: `admin` = the deployer's own address**, so until the handover the deployer key has every `DEFAULT_ADMIN_ROLE` power above | A wrong immutable is unfixable without a redeploy. Leaves the admin role only through `HandoverAdmin.s.sol` (grant to the Safe; renounce refused until the Safe has executed a transaction after the grant). `Verify.s.sol` checks the deployer holds admin in the bootstrap phase and nothing in the safe phase |
 | Anyone | — | `deposit`, `mint`, `redeem`, `withdraw`, `queueRedeem`, `completeRedeem`, `claimUsdg`, `claimUsdgTo`, ERC-20 transfers; `lockBook` after `cycleExerciseTs`; `rollClose` after `cycleExpiryTs + 1 hour`; `sweepFee` | — |
 
 On the proof in `ops/safes.md` (leekzor/callhouse) §4: it was re-derived against HEAD `27d502a` on 2026-09-12 (the
 step 1 and step 2 tables there carry the line numbers at that commit). The one thing to know
 when you re-run it: since defect 12 (§6) the fee leg is no longer a `safeTransfer` but a raw
-`address(usdg).call(abi.encodeCall(IERC20.transfer, (feeRecipient, fee)))` at Vault L992 inside
+`address(usdg).call(abi.encodeCall(IERC20.transfer, (feeRecipient, fee)))` at Vault L1025 inside
 `_tryPayFee`, reached from `_harvest` (only from `rollClose`) and from the permissionless
 `sweepFee`; the grep in step 2 has been extended to catch it, and the `forceApprove` sites are
-now in `ValoremLib.sol` L85/L88 (DELEGATECALL), not in `AdapterValorem.sol`. The guardian
+now in `ValoremLib.sol` L91/L94 (DELEGATECALL), not in `AdapterValorem.sol`. The guardian
 conclusion is unchanged. Re-derive the tables from the pinned tag rather than trusting the
 numbers.
 
 Third parties that hold no role but have power over the vault: the Overcall registry owner (a
-single EOA, `0x408adcFFebDF48EC23F1E3811A91AeD3cC951CC0`) sets the weekly cycle; the Stock Token
+single EOA, `0x408adcFFebDF48EC23F1E3811A91AeD3cC951CC0`) sets the weekly cycle and, between
+cycles, the lot size; the Stock Token
 issuer can pause every Stock Token at once, blocklist the vault address, burn vault-held tokens
 (`adminBurn`), pause its oracle and upgrade the token (§4, "Freeze and blocklist surface"); the
 Valorem Clear owner can flip a 15 bps engine fee; Paxos can upgrade USDG behind a 24 h timelock.
@@ -160,19 +172,19 @@ each is in §3 and §4 below.
 
 | File | nSLOC | Purpose | Externally callable surface |
 |---|---:|---|---|
-| `src/Vault.sol` | 534 | The deployed contract: shares, deposits, phase machine, roll, harvest, redeem queue, admin | 36 functions declared here (20 state-changing, 16 view) plus the constructor, plus the inherited ERC-20, AccessControl, Distributor and adapter surfaces |
+| `src/Vault.sol` | 544 | The deployed contract: shares, deposits, phase machine, roll, harvest, redeem queue, admin | 36 functions declared here (20 state-changing, 16 view) plus the constructor, plus the inherited ERC-20, AccessControl, Distributor and adapter surfaces |
 | `src/Distributor.sol` | 110 | Abstract ERC-20 base: the 1e27-scaled USDG accrual index, settle-on-transfer, claims, the balance checkpoint and the payout clamp | `claimUsdg`, `claimUsdgTo`, `claimableUsdg`, `usdgOwed`, 7 auto-getters; 6 internal hooks used by Vault |
 | `src/AdapterValorem.sol` | 77 | Abstract base: the per-cycle short position on Valorem (option id, claim id, count), position views, ERC-1155 receiver | 5 public views, 2 ERC-1155 hooks, 4 getters; `_writeCalls`/`_redeemClaim` reachable only through `rollOpen`/`rollClose` |
 | `src/AdapterSeaport.sol` | 111 | Abstract base: one authorised listing at a time, EIP-1271, cancel/counter bump, 3-per-cycle budget, the one-time ERC-1155 operator approval | `isValidSignature`, 5 immutable getters, 4 storage getters; internal mutators reachable only through Vault |
-| `src/lib/ValoremLib.sol` | 79 | **Linked public library, DELEGATECALL.** Option-vs-cycle validation, approval sizing incl. the Valorem engine fee, `write`, `redeem`, three never-reverting position views | `writeCalls`, `redeemClaim` (DELEGATECALL only), `lockedAssets`, `claimedExerciseProceeds`, `contractsAssigned` (views) |
+| `src/lib/ValoremLib.sol` | 80 | **Linked public library, DELEGATECALL.** Option-vs-cycle validation incl. the one-token lot, approval sizing incl. the Valorem engine fee, `write`, `redeem`, three never-reverting position views | `writeCalls`, `redeemClaim` (DELEGATECALL only), `lockedAssets`, `claimedExerciseProceeds`, `contractsAssigned` (views) |
 | `src/lib/SeaportOrderLib.sol` | 147 | **Linked public library, DELEGATECALL.** Field-by-field validation of the keeper's `OrderComponents`, `getOrderHash`, `validate`, hash-checked `cancel` | `approve`, `cancel` (DELEGATECALL only), `toParameters` (pure) |
 | `src/Policy.sol` | 132 | Internal pure library, inlined: the hard caps, OTM band, premium floor, the 95/5 per-contract split, utilisation and count caps, fee split, oracle normalisation | None external; 12 internal pure functions and 9 constants |
-| **Total** | **1,190** | | |
+| **Total** | **1,201** | | |
 
 nSLOC is what remains after stripping every `/* … */` block (all NatSpec), `//` comments and
-blank lines; the same seven files are 2,406 physical lines, so roughly half the text is
+blank lines; the same seven files are 2,445 physical lines, so roughly half the text is
 comment. A cruder count that only drops lines beginning with a comment marker (and so keeps
-the text inside the `/*////` section banners) gives 1,251. All seven files are `pragma solidity
+the text inside the `/*////` section banners) gives 1,262. All seven files are `pragma solidity
 0.8.28`. `Distributor`, `AdapterValorem` and `AdapterSeaport`
 have no bytecode of their own.
 
@@ -220,7 +232,7 @@ every chain-4663 address as a constant (each overridable by env for a fork rehea
 `admin` and `SAFE_FEE` as fee recipient, prints a warning when that admin has no code, and runs
 `_preflight` (registry `collateralToken`/`exerciseToken`/`clearinghouse` equal the asset, USDG and
 clearinghouse; `lotSize() == 1e18`; feed `answer > 0`, `updatedAt > 0`, `decimals() == 8`). The
-constructor grants `DEFAULT_ADMIN_ROLE` to that `admin` and to nobody else (Vault L299). Forge
+constructor grants `DEFAULT_ADMIN_ROLE` to that `admin` and to nobody else (Vault L315). Forge
 deploys both libraries through the CREATE2 factory `0x4e59b448…956C`, so their addresses depend only
 on bytecode (`docs/DEPLOY.md`).
 
@@ -260,7 +272,8 @@ USDG balance). `script/rehearse-deploy.sh` runs both admin paths on an anvil for
 under `--no-storage-caching`, including negative checks (swapped library addresses and a single
 flipped byte of vault code must fail Verify; renounce before the Safe has executed must be refused; a
 renounced key must be refused; the executor must refuse a non-anvil node). `docs/DEPLOY.md` is the
-runbook and holds the rehearsal record (fork block 62201116). `ops/safes.md` (leekzor/callhouse) §7 is
+runbook and holds the rehearsal record (fork block 62212405, re-run on `6ed528f`; the earlier run
+on the pre-fix tree was at fork block 62201116). `ops/safes.md` (leekzor/callhouse) §7 is
 the older cast-based deploy-day checklist (Appendix A item 12).
 
 Please check: that no constant is wrong for chain 4663 (Appendix C); that the preflight cannot
@@ -281,45 +294,49 @@ the deviations below). A four-state phase machine `Idle → Listed → Exercisab
 (`Settling` is transient inside `rollClose`; `rollClose` also accepts `Listed`) gates deposits,
 instant redemption and the queue.
 
-**External surface (line numbers at `a4c38b0`).**
+**External surface (line numbers at `b0ff57b`).**
 
-- Views: `decimals()` (always 18); `totalAssets()` L337 = max(idle − `reservedAssets`, 0) +
-  `lockedAssets()`, USDG excluded, unsold option inventory at zero; `idleAssets()` L345;
+- Views: `decimals()` (always 18); `totalAssets()` L353 = max(idle − `reservedAssets`, 0) +
+  `lockedAssets()`, USDG excluded, unsold option inventory at zero; `idleAssets()` L361;
   `convertToShares`/`convertToAssets` (virtual offset +1/+1, floor); `previewDeposit` (floor),
   `previewMint` (ceil); `previewRedeem`/`previewWithdraw` return 0 unless
-  `canRedeemInstantly()`; `canRedeemInstantly()` L389 = `phase == Idle && contractsWritten == 0`;
-  `maxDeposit` L399 (0 unless a deposit would succeed; else `depositCap − totalAssets()`
-  saturating); `maxMint` L416; `previewCompleteRedeem` L654; `spotUsdg()` L929 (Chainlink,
-  normalised to USDG 6-dp per 1e18 lot, reverts `StalePrice`/`SpotZero`); `uiMultiplier()` L944
-  (display only, 1e18 fallback); `supportsInterface` L1066 (ERC1155Receiver, EIP-1271,
-  AccessControl); public storage getters for phase, policy, cycle snapshot, reserves, queue
-  state, immutables.
-- Depositor paths, all `nonReentrant`: `deposit` L429 and `mint` L450 (require Idle, or Listed
-  before `cycleExerciseTs`, and no unredeemed assignment, via `_requireDepositPhase` L486; cap
+  `canRedeemInstantly()`; `canRedeemInstantly()` L405 = `phase == Idle && contractsWritten == 0`;
+  `maxDeposit` L415 (0 unless a deposit would succeed; else `depositCap − totalAssets()`
+  saturating); `maxMint` L432; `previewCompleteRedeem` L675 (owed balances plus the pending
+  entry's pro-rata assets and its per-entry USDG through `_entryUsdg` L693); `spotUsdg()` L962
+  (Chainlink, normalised to USDG 6-dp per 1e18 lot, reverts `StalePrice`/`SpotZero`);
+  `uiMultiplier()` L977 (display only, 1e18 fallback); `supportsInterface` L1099 (ERC1155Receiver,
+  EIP-1271, AccessControl); public storage getters for phase, policy, cycle snapshot, reserves,
+  queue state, immutables (the per-entry reward debt `_queueAccDebt` L188 and the per-epoch index
+  `_epochAccUsdgPerShare` L191 are private and have no getter).
+- Depositor paths, all `nonReentrant`: `deposit` L445 and `mint` L466 (require Idle, or Listed
+  before `cycleExerciseTs`, and no unredeemed assignment, via `_requireDepositPhase` L502; cap
   checked on `totalAssets() + assets`; `_checkpointHarvest()` runs before `_mint`); `redeem`
-  L507 and `withdraw` L522 (revert `UseQueue` unless flat; burn before transfer); `queueRedeem`
-  L548 (every phase, works under an issuer freeze because it moves no tokens; settles a prior
-  epoch into owed balances, settles the owner's USDG accrual, escrows the shares in the vault);
-  `completeRedeem` L580 (pays `owedAssets` + `owedQueueUsdg`, decrements reserves, debits
+  L523 and `withdraw` L538 (revert `UseQueue` unless flat; burn before transfer); `queueRedeem`
+  L564 (every phase, works under an issuer freeze because it moves no tokens; settles a prior
+  epoch into owed balances, settles the owner's USDG accrual, adds `shares × accUsdgPerShare` to
+  the owner's reward debt at L591, escrows the shares in the vault); `completeRedeem` L598 (settles
+  a closed epoch's entry, then pays `owedAssets` + `owedQueueUsdg`, decrements reserves, debits
   `usdgAccounted`).
-- Roll paths: `rollOpen` L675 (`KEEPER_ROLE`, `nonReentrant`; requires Idle, not halted,
+- Roll paths: `rollOpen` L706 (`KEEPER_ROLE`, `nonReentrant`; requires Idle, not halted,
   `registry.isWritingOpen()`, approved rung of the current cycle, `expiry > exercise`,
-  `expiry <= now + 21 days` at L696, Valorem fee off or accepted, `oraclePaused() == false`,
+  `expiry <= now + 21 days` at L727, Valorem fee off or accepted, `oraclePaused() == false`,
   fresh price, strike inside the OTM band, count within utilisation and cap; then
-  `ValoremLib.writeCalls`, snapshots `cycleNumber`/`cycleExerciseTs`/`cycleExpiryTs`/
-  `cycleStrikeUsdg`, resets the listing budget); `approveListing` L730 (`KEEPER_ROLE`, Listed,
-  not halted; inventory from `clear.balanceOf(vault, optionId)`; `_approveListing`; then
-  re-checks oracle liveness and `Policy.checkPremium` against live spot); `cancelListing` L747
-  and `invalidateAllListings` L757 (`KEEPER_ROLE` or `GUARDIAN_ROLE`, no phase or halt gate);
-  `lockBook` L768 (permissionless from `cycleExerciseTs`, invalidates any live listing);
-  `rollClose` L782 (keeper from `cycleExpiryTs`, anyone from +1 hour; phase → Settling,
-  invalidate live listing, read `contractsAssigned()`, `ValoremLib.redeemClaim`, `_harvest`,
-  `_settleQueue`, phase → Idle).
-- Fee and admin: `sweepFee` L971 (permissionless, always pays the stored `feeRecipient`,
-  raw-call best effort, clamped to balance); `haltWrites` L1007 (guardian or admin);
-  `unhaltWrites` L1016, `setPolicy` L1021, `setFeeRecipient` L1027, `setDepositCap` L1033,
-  `setMaxPriceAge` L1042, `acceptValoremFee` L1057 (all admin). `writesHalted` is checked at
-  L677 (`rollOpen`) and L732 (`approveListing`) and nowhere else.
+  `ValoremLib.writeCalls`, which also refuses a cycle lot other than 1e18, snapshots
+  `cycleNumber`/`cycleExerciseTs`/`cycleExpiryTs`/`cycleStrikeUsdg`, resets the listing budget);
+  `approveListing` L761 (`KEEPER_ROLE`, Listed, not halted; inventory from
+  `clear.balanceOf(vault, optionId)`; `_approveListing`; then re-checks oracle liveness and
+  `Policy.checkPremium` against live spot); `cancelListing` L778 and `invalidateAllListings` L788
+  (`KEEPER_ROLE` or `GUARDIAN_ROLE`, no phase or halt gate); `lockBook` L799 (permissionless from
+  `cycleExerciseTs`, invalidates any live listing); `rollClose` L813 (keeper from `cycleExpiryTs`,
+  anyone from +1 hour; phase → Settling, invalidate live listing, read `contractsAssigned()`,
+  `ValoremLib.redeemClaim`, `_harvest`, `_settleQueue` (which records the epoch's index at L923),
+  phase → Idle).
+- Fee and admin: `sweepFee` L1004 (permissionless, always pays the stored `feeRecipient`,
+  raw-call best effort, clamped to balance); `haltWrites` L1040 (guardian or admin);
+  `unhaltWrites` L1049, `setPolicy` L1054, `setFeeRecipient` L1060, `setDepositCap` L1066,
+  `setMaxPriceAge` L1075, `acceptValoremFee` L1090 (all admin). `writesHalted` is checked at
+  L708 (`rollOpen`) and L763 (`approveListing`) and nowhere else.
 - Constants: `MIN_PRICE_AGE = 1 hours`, `MAX_PRICE_AGE_CEIL = 7 days` (L84–85);
   `MAX_CYCLE_TENOR = 21 days` (L98).
 
@@ -339,27 +356,30 @@ and §4), USDG as a plain 6-decimal ERC-20 whose `balanceOf` delta is the harves
 USDG donated to the vault is harvested and fee'd; a blocklist or pause is tolerated by the
 best-effort fee push and the clamped claims), the Stock Token as non-rebasing with raw
 `balanceOf` and no transfer hooks (`uiMultiplier()` and `oraclePaused()` are probed by
-`staticcall` with graceful fallback, L936–949; an issuer freeze stops only the token-moving
+`staticcall` with graceful fallback, L969–982; an issuer freeze stops only the token-moving
 legs), the Chainlink feed as a write gate only (`answer > 0`, `updatedAt` within `maxPriceAge`,
 `updatedAt <= block.timestamp`; no `roundId`/`answeredInRound` check; no sequencer feed exists
 on 4663), the Overcall registry as honest-but-fallible (we independently bound tenor, require
-an approved rung of the current cycle, and cross-check the option's assets, lot and window),
+an approved rung of the current cycle, cross-check the option's assets, lot and window, and refuse
+any lot other than exactly 1e18),
 and OpenZeppelin 5.7.0 `ERC20`, `AccessControl`, `ReentrancyGuard`, `SafeERC20`, `Math.mulDiv`.
 `DEFAULT_ADMIN_ROLE` is assumed honest; `KEEPER_ROLE` is assumed compromisable. The protocol fee
 is charged on premium only. The harvest still measures all new USDG
 (`gross = balance − usdgAccounted`) and credits all of it, less the fee, to the index; but
 `rollClose` passes the USDG measured across `clear.redeem` (`usdgFromAssignment`, the balance
-delta in `ValoremLib.redeemClaim` L99–110) into `_accrueHarvest(feeFree)` (L829–841; the call at
-L804, `_harvest` L860–876), and the fee is `floor((gross − feeFree) × protocolFeeBps / 10000)`,
-saturating at 0. The deposit checkpoint passes `feeFree = 0` (L851). This is a product decision
+delta in `ValoremLib.redeemClaim` L105–116) into `_accrueHarvest(feeFree)` (L860–872; the call at
+L835, `_harvest` L891–907), and the fee is `floor((gross − feeFree) × protocolFeeBps / 10000)`,
+saturating at 0. The deposit checkpoint passes `feeFree = 0` (L882). This is a product decision
 taken 2026-09-13, replacing an earlier fee of 1000 bps on the whole inflow (which, on an assigned
 week, took 10% of returned principal); please confirm the implementation matches it (P-26).
 
-**Invariants to hold.** P-02, P-03, P-04, P-07, P-10 through P-15, P-17 through P-20 in §5,
-plus: `usdgAccounted` is set to the measured balance on every harvest and debited on every
+**Invariants to hold.** P-02, P-03, P-04, P-07, P-10 through P-15, P-17 through P-20 and P-28 in
+§5, plus: `usdgAccounted` is set to the measured balance on every harvest and debited on every
 outflow (claims, queue payouts, fee), so each inflow is counted once; reserves are increased
-only at settlement (L899–900) and decreased only on payout (L643–644); each epoch claimant takes
-`floor(remaining × shares / sharesRemaining)` and the last takes the remainder (L619–624);
+only at settlement (L932–933) and decreased only on payout (L664–665); each epoch claimant takes
+`floor(assetsRemaining × shares / sharesRemaining)` of the assets and
+`min(floor((shares × epochIndex − debt) / 1e27), usdgRemaining)` of the USDG, and the last takes
+the remainder of both (`_settleEpochEntry` L639–645, `_entryUsdg` L693–697; ACCOUNTING.md §5);
 `Policy.checkContracts` runs on `idleAssets()` so reserved assets are never writable collateral.
 
 **Focus:** §5 A.1, A.2, A.3, A.5, A.6, B.8, C.14, C.15, C.16.
@@ -371,7 +391,7 @@ with the settle hooked into `ERC20._update` so accrual survives transfers, mints
 `claimUsdg()`/`claimUsdgTo(address)`; `usdgDust` (remainder too small to index) and
 `usdgUnallocated` (USDG that arrived at zero supply) carried forward; `usdgAccounted` as the
 balance checkpoint; every payout clamped to `_usdgAvailableForHolders()`, which Vault overrides
-(L909) to `balance − usdgReservedForQueue − pendingFeeUsdg`, saturating.
+(L942) to `balance − usdgReservedForQueue − pendingFeeUsdg`, saturating.
 
 **External surface.** `claimUsdg()` L161 and `claimUsdgTo(address)` L166 (permissionless,
 **not** `nonReentrant`, CEI only: state debited before the `safeTransfer`); `claimableUsdg`
@@ -381,7 +401,7 @@ informational, read by nothing in the money path); getters `accUsdgPerShare`, `u
 Internal hooks: `_distributeUsdg` L131, `_settleAccount`, `_takeAccrued` L230 (escrow accrual
 swept into an epoch, clamped), `_usdgAvailableForHolders` (virtual), `_debitUsdgOut` L255
 (saturating), `_markUsdgAccounted`. `_update` L208 settles both parties, then `super._update`;
-Vault's `_update` L324 is `override(ERC20, Distributor)` and only calls `super`.
+Vault's `_update` L340 is `override(ERC20, Distributor)` and only calls `super`.
 
 **Dependencies and assumptions.** USDG has no transfer hook into sender or recipient (a
 before-transfer hook re-entering `deposit`/`rollClose` between `_debitUsdgOut` and the balance
@@ -408,11 +428,12 @@ ERC-1155 receiver; the library holds every Valorem call. `writeCalls` (ValoremLi
 `ValoremFeesEnabled` if `clear.feesEnabled() && !feeAccepted`; reverts `OptionAssetMismatch` /
 `OptionExerciseAssetMismatch` / `UnexpectedLotSize` / `OptionWindowMismatch` unless
 `clear.option(optionId)` matches (asset, USDG, `cyc.lotSize`, `cyc.exerciseTimestamp`,
-`cyc.expiryTimestamp`); `collateral = n × underlyingAmount`; `forceApprove(collateral [+
+`cyc.expiryTimestamp`); reverts `UnexpectedLotSize(1e18, lotSize)` unless `cyc.lotSize == 1e18`
+(L61, since `6ed528f`: every per-token check in `rollOpen` and `approveListing` assumes one token); `collateral = n × underlyingAmount`; `forceApprove(collateral [+
 collateral × feeBps / 10_000, floor 1, when fees are on])`; `clear.write(optionId, n)`; reverts
-`WriteReturnedNoClaim` on 0; `forceApprove(0)`. `redeemClaim` (L99): snapshots both balances,
+`WriteReturnedNoClaim` on 0; `forceApprove(0)`. `redeemClaim` (L105): snapshots both balances,
 `clear.redeem(claimKey)`, returns the measured deltas (checked subtraction). Three views
-(L121, L133, L146) return 0 when `claimKey == 0`, clamp negative `int256` to 0, and return 0 on
+(L127, L139, L152) return 0 when `claimKey == 0`, clamp negative `int256` to 0, and return 0 on
 any revert of `position()`/`claim()`; `contractsAssigned` divides `amountExercised` by 1e18.
 
 **External surface.** Adapter: `lockedAssets()` L72 (feeds `totalAssets()`),
@@ -438,10 +459,10 @@ callback into the writer; `feesEnabled()`/`feeBps()` are the only owner switches
 `feesEnabled = false`, `feeBps = 15`, owner-only with no timelock). `write` also accepts a claim
 id as `tokenId` to top up an existing claim; we rely on the registry never approving a
 claim-shaped id. The strike (`o.exerciseAmount`) is not checked in the library; Vault takes it
-from `registry.strikePerContract(optionId)` (L707), which the deployed registry forwards to
+from `registry.strikePerContract(optionId)` (L738), which the deployed registry forwards to
 `clear.option()` but `MockRegistry` stores independently.
 
-**Invariants to hold.** P-05, P-06, P-21, P-22, P-23 in §5, plus: all three claim-backed views
+**Invariants to hold.** P-05, P-06, P-21, P-22, P-23, P-27 in §5, plus: all three claim-backed views
 are 0 when flat and 0 on a Valorem revert, so `totalAssets()`, `maxDeposit()` and `deposit`
 never revert because of Valorem; `contractsSold()` never underflows; `collateral` is an exact
 integer (uint112 × uint96); `lockedAssets() == (contractsWritten − contractsAssigned()) × 1e18`
@@ -455,12 +476,12 @@ while a claim is open and 0 when Idle (`invariant_phaseSanity`).
 hash at a time (`listingHash`, `listingGrossUsdg`, `listingAmount`, `listingsThisCycle`),
 answers EIP-1271, cancels or counter-bumps, caps authorisations at
 `Policy.MAX_LISTINGS_PER_CYCLE = 3` per cycle, and grants a one-time
-`clear.setApprovalForAll(transferApprovalTarget, true)` in the constructor (Vault L302). The
+`clear.setApprovalForAll(transferApprovalTarget, true)` in the constructor (Vault L318). The
 library validates the keeper's `OrderComponents` against a `Checks` struct populated entirely
 from vault state (never from calldata), obtains the hash from `seaport.getOrderHash`, calls
 `seaport.validate` so the order fills with an empty signature, and cancels only an order whose
 recomputed hash equals `listingHash`. The economic premium floor (`Policy.checkPremium` against
-live spot) is deliberately not in the library; Vault runs it after `approve` returns (L742–743)
+live spot) is deliberately not in the library; Vault runs it after `approve` returns (L773–774)
 and the whole transaction reverts if it fails.
 
 **External surface.** `isValidSignature(bytes32 digest, bytes)` L123: returns `0x1626ba7e` iff
@@ -520,7 +541,7 @@ before the vault enters Exercisable or Settling; all Seaport parameters are immu
 the only thing between the Admin Safe and a policy that sells ATM calls or takes a 100% fee.
 
 **Surface (internal, with the entry point that reaches each).** `validate` L101 (constructor
-L296, `setPolicy` L1021–1025): `minOtmBps >= 100`, `maxOtmBps <= 2500`, `minOtm <= maxOtm`,
+L312, `setPolicy` L1054–1058): `minOtmBps >= 100`, `maxOtmBps <= 2500`, `minOtm <= maxOtm`,
 `minPremiumBps >= 10`, `maxUtilizationBps <= 10000`, `protocolFeeBps <= 2000`, `maxContractsCap
 != 0`. `launchDefaults` L118: `{300, 1200, 40, 9500, 500, 50}`. `strikeBand`/`checkStrike`
 L135/L146 (`rollOpen`): inclusive `[spot × (1 + minOtm), spot × (1 + maxOtm)]`, floor-rounded,
@@ -533,7 +554,7 @@ maxContractsCap` and `N <= floor(idle × maxUtil / 10000 / 1e18)`. `splitHarvest
 (`_accrueHarvest`, every deposit checkpoint and `rollClose`): fee floored, `(0, 0)` on a zero
 input. The vault passes it the fee-bearing amount, `gross − usdgFromAssignment` at the close and
 `gross` at a checkpoint, and discards its `net` output: `Vault` computes `net = gross − fee`
-itself (Vault L837–838), so strike proceeds reach the index without passing through the split.
+itself (Vault L868–869), so strike proceeds reach the index without passing through the split.
 `normalizeSpot` L264 (`_spotUsdg`): `SpotZero` on `answer <= 0` or a result that rounds
 to 0; rescales `feedDecimals → 6`. Constants L44–71: `BPS 10_000`, `MIN_OTM_FLOOR_BPS 100`,
 `MAX_OTM_CEIL_BPS 2_500`, `MIN_PREMIUM_FLOOR_BPS 10`, `MAX_UTILIZATION_CEIL_BPS 10_000`,
@@ -547,7 +568,8 @@ change to a different-decimals aggregator rescales spot silently), the registry'
 `strikePerContract` (assumed to be Valorem's `exerciseAmount` for one 1e18 lot in USDG 6-dp),
 Overcall's 5% per-contract rounding (mirrored from `ops/recon/R3-overcall-api.md` (leekzor/callhouse), not from any
 on-chain source), Seaport's fraction rule, USDG at 6 decimals (assumed, not verified in code),
-the Stock Token at 18 decimals with one lot = 1e18, and USD treated as 1:1 with USDG (no
+the Stock Token at 18 decimals with one lot = 1e18 (a cycle with any other lot is refused
+since `6ed528f`, P-27), and USD treated as 1:1 with USDG (no
 depeg consideration in the band or floor).
 
 **Invariants to hold.** P-01 in §5, plus: a written call is strictly OTM at write time for
@@ -631,7 +653,7 @@ registries are one compilation unit (`ops/recon/R12-overcall-discovery.md` (leek
 known to us; do not audit it. In scope: what we assume of it and how we bound it (`isWritingOpen`,
 `isApproved`, `cycleOf`, `strikePerContract`, `cycle()`, the constructor binding of
 `collateralToken`/`exerciseToken`/`clearinghouse`, the 21-day tenor cap, the window-equality
-check, and what we do not defend against, listed in §5). The JUGGERNAUT registry
+check, the one-token lot check, and what we do not defend against, listed in §5). The JUGGERNAUT registry
 `0x65dD407955912Be814f723724cE60f91ebd72616` is the trap: it is Overcall's frontend top-level
 `registry` key and must never be wired in (`Deploy.s.sol`, `ops/addresses.json` (leekzor/callhouse)
 `_TRAP_JUGGERNAUT_REGISTRY`).
@@ -730,37 +752,38 @@ keeps `Policy.splitPremium` and the keeper's split in agreement.
 ## 5. Properties the auditor should try to break
 
 Each is a falsifiable statement with its code location. SECURITY.md §2 is the prose version.
-Line numbers are at this repository's commit `a4c38b0` (§1 "Commit").
+Line numbers are at this repository's commit `b0ff57b` (§1 "Commit").
 
 | # | Property | Where |
 |---|---|---|
-| P-01 | No `policy` value outside the hard caps (`minOtmBps >= 100`, `maxOtmBps <= 2500`, `minOtm <= maxOtm`, `minPremiumBps >= 10`, `maxUtilizationBps <= 10000`, `protocolFeeBps <= 2000`, `maxContractsCap != 0`) can ever be stored | `Policy.sol` L101–115; `Vault.sol` L296, L1021–1025 |
-| P-02 | Once `block.timestamp >= cycleExerciseTs` in `Listed`, `deposit` and `mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0, whether or not anyone called `lockBook` | `Vault.sol` L486–498, L399–413 |
-| P-03 | While `claimKey != 0 && claimedExerciseProceeds() != 0`, no share can be minted by any path | `Vault.sol` L497; `ValoremLib.sol` L133–140 |
-| P-04 | `rollOpen` reverts `BadCycleWindow` if `expiry <= exercise` or `expiry > now + 21 days`, before any collateral moves | `Vault.sol` L98, L693–698 |
-| P-05 | The option written always has `underlyingAsset == asset`, `exerciseAsset == USDG`, `underlyingAmount == cyc.lotSize`, and exercise/expiry timestamps equal to the cycle's; otherwise nothing moves | `ValoremLib.sol` L50–64 |
-| P-06 | No write happens while `clear.feesEnabled()` is true unless `valoremFeeAccepted` | `Vault.sol` L702–703; `ValoremLib.sol` L50 |
-| P-07 | No state of `feeRecipient` or of USDG can make `rollClose` revert through the fee leg; `sweepFee()` always pays the stored recipient, never the caller | `Vault.sol` L871, L971–999 |
-| P-08 | No holder claim or queue take ever exceeds `_usdgAvailableForHolders() = balance − usdgReservedForQueue − pendingFeeUsdg` | `Distributor.sol` L183–185, L236–237; `Vault.sol` L909–913 |
-| P-09 | `usdgAccounted <= usdg.balanceOf(vault)` always, and every USDG outflow debits it | `Distributor.sol` L255–263; `Vault.sol` L830, L648–649, L995–996 |
-| P-10 | Rounding favours the vault: `deposit` floors shares, `mint` ceils assets, `redeem` floors assets, `withdraw` ceils shares; +1/+1 virtual offset; redeeming the whole supply pays at most `totalAssets()` | `Vault.sol` L351–365, L440, L456, L512, L526 |
-| P-11 | The share price never marks the short call to market and no price feed is read in the settlement path: `totalAssets() = (idle − reservedAssets) + lockedAssets()`, USDG excluded; `_spotUsdg` is called only from `rollOpen`, `approveListing` and the `spotUsdg()` view | `Vault.sol` L337–349, L708, L743, L929 |
-| P-12 | The phase machine moves only as drawn in `docs/ARCHITECTURE.md` (leekzor/callhouse) §3; `Idle ⇒ contractsWritten == 0 && claimKey == 0` | `Vault.sol` L676, L731, L769–770, L784–785, L792, L807; `invariant_phaseSanity` |
-| P-13 | Instant `redeem`/`withdraw` succeed only when `phase == Idle && contractsWritten == 0`; previews return 0 otherwise | `Vault.sol` L389–391, L508, L523, L379, L384 |
-| P-14 | The deposit cap is measured on `totalAssets()` (locked collateral included, reserved excluded), never on raw balance | `Vault.sol` L410–412, L433–434, L459–460 |
-| P-15 | A share minted after USDG arrived can never claim any of it: `_checkpointHarvest()` runs before every `_mint` and makes no external call other than `usdg.balanceOf` | `Vault.sol` L438, L454, L829–841, L850 |
+| P-01 | No `policy` value outside the hard caps (`minOtmBps >= 100`, `maxOtmBps <= 2500`, `minOtm <= maxOtm`, `minPremiumBps >= 10`, `maxUtilizationBps <= 10000`, `protocolFeeBps <= 2000`, `maxContractsCap != 0`) can ever be stored | `Policy.sol` L101–115; `Vault.sol` L312, L1054–1058 |
+| P-02 | Once `block.timestamp >= cycleExerciseTs` in `Listed`, `deposit` and `mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0, whether or not anyone called `lockBook` | `Vault.sol` L502–514, L415–429 |
+| P-03 | While `claimKey != 0 && claimedExerciseProceeds() != 0`, no share can be minted by any path | `Vault.sol` L513; `ValoremLib.sol` L139–146 |
+| P-04 | `rollOpen` reverts `BadCycleWindow` if `expiry <= exercise` or `expiry > now + 21 days`, before any collateral moves | `Vault.sol` L98, L724–729 |
+| P-05 | The option written always has `underlyingAsset == asset`, `exerciseAsset == USDG`, `underlyingAmount == cyc.lotSize`, and exercise/expiry timestamps equal to the cycle's; otherwise nothing moves | `ValoremLib.sol` L50–70 |
+| P-06 | No write happens while `clear.feesEnabled()` is true unless `valoremFeeAccepted` | `Vault.sol` L733–734; `ValoremLib.sol` L50 |
+| P-07 | No state of `feeRecipient` or of USDG can make `rollClose` revert through the fee leg; `sweepFee()` always pays the stored recipient, never the caller | `Vault.sol` L902, L1004–1032 |
+| P-08 | No holder claim or queue take ever exceeds `_usdgAvailableForHolders() = balance − usdgReservedForQueue − pendingFeeUsdg` | `Distributor.sol` L183–185, L236–237; `Vault.sol` L942–946 |
+| P-09 | `usdgAccounted <= usdg.balanceOf(vault)` always, and every USDG outflow debits it | `Distributor.sol` L255–263; `Vault.sol` L861, L669–670, L1028–1029 |
+| P-10 | Rounding favours the vault: `deposit` floors shares, `mint` ceils assets, `redeem` floors assets, `withdraw` ceils shares; +1/+1 virtual offset; redeeming the whole supply pays at most `totalAssets()` | `Vault.sol` L367–381, L456, L472, L528, L542 |
+| P-11 | The share price never marks the short call to market and no price feed is read in the settlement path: `totalAssets() = (idle − reservedAssets) + lockedAssets()`, USDG excluded; `_spotUsdg` is called only from `rollOpen`, `approveListing` and the `spotUsdg()` view | `Vault.sol` L353–365, L739, L774, L962 |
+| P-12 | The phase machine moves only as drawn in `docs/ARCHITECTURE.md` (leekzor/callhouse) §3; `Idle ⇒ contractsWritten == 0 && claimKey == 0` | `Vault.sol` L707, L762, L800–801, L815–816, L823, L838; `invariant_phaseSanity` |
+| P-13 | Instant `redeem`/`withdraw` succeed only when `phase == Idle && contractsWritten == 0`; previews return 0 otherwise | `Vault.sol` L405–407, L524, L539, L395, L400 |
+| P-14 | The deposit cap is measured on `totalAssets()` (locked collateral included, reserved excluded), never on raw balance | `Vault.sol` L426–428, L449–450, L475–476 |
+| P-15 | A share minted after USDG arrived can never claim any of it: `_checkpointHarvest()` runs before every `_mint` and makes no external call other than `usdg.balanceOf` | `Vault.sol` L454, L470, L860–872, L881 |
 | P-16 | The vault authorises at most one Seaport order at a time, at most 3 per cycle, only in the shape listed in 3.4; `isValidSignature` returns the magic value only for the recorded `listingHash` or its EIP-712 digest and never when `listingHash == 0` | `SeaportOrderLib.sol` L132–223; `AdapterSeaport.sol` L123–128, L154–191 |
-| P-17 | A rung is written only if `registry.isWritingOpen()`, `registry.isApproved(optionId)` and `registry.cycleOf(optionId) == cycle.number` | `Vault.sol` L681–688 |
-| P-18 | `maxPriceAge` can only ever be in [1 hour, 7 days] | `Vault.sol` L84–85, L1047–1049 |
-| P-19 | The guardian can stop but never start: `haltWrites` is guardian-or-admin, `unhaltWrites` admin-only, and a halt blocks only `rollOpen` and `approveListing` | `Vault.sol` L677, L732, L1007–1019 |
-| P-20 | Liveness never depends on the keeper: `lockBook` is permissionless from `cycleExerciseTs`, `rollClose` from `cycleExpiryTs + 1 hour`, `sweepFee` always; `queueRedeem` works in every phase and under an issuer freeze | `Vault.sol` L768–776, L782–790, L971, L548–577 |
+| P-17 | A rung is written only if `registry.isWritingOpen()`, `registry.isApproved(optionId)` and `registry.cycleOf(optionId) == cycle.number` | `Vault.sol` L712–719 |
+| P-18 | `maxPriceAge` can only ever be in [1 hour, 7 days] | `Vault.sol` L84–85, L1080–1082 |
+| P-19 | The guardian can stop but never start: `haltWrites` is guardian-or-admin, `unhaltWrites` admin-only, and a halt blocks only `rollOpen` and `approveListing` | `Vault.sol` L708, L763, L1040–1052 |
+| P-20 | Liveness never depends on the keeper: `lockBook` is permissionless from `cycleExerciseTs`, `rollClose` from `cycleExpiryTs + 1 hour`, `sweepFee` always; `queueRedeem` works in every phase and under an issuer freeze | `Vault.sol` L799–807, L813–821, L1004, L564–595 |
 | P-21 | The ERC-1155 receiver hooks accept only `msg.sender == clear` | `AdapterValorem.sol` L162–174 |
-| P-22 | No allowance to the clearinghouse survives a write; the approval equals exactly what upstream `write` pulls | `ValoremLib.sol` L74–88 |
+| P-22 | No allowance to the clearinghouse survives a write; the approval equals exactly what upstream `write` pulls | `ValoremLib.sol` L80–94 |
 | P-23 | `optionId`, `claimKey`, `contractsWritten` are non-zero together after a write and zero together after a redeem; `_redeemClaim` reverts `NoOpenClaim` when flat | `AdapterValorem.sol` L128–130, L140–150 |
-| P-24 | Checks-effects-interactions in every money path: burn before transfer in `redeem`/`withdraw`, owed and reserves zeroed before transfer in `completeRedeem`, `phase = Settling` before any external call in `rollClose`; every state-changing user entry point is `nonReentrant` except ERC-20 transfers and `claimUsdg`/`claimUsdgTo` | `Vault.sol` L515–516, L530–531, L641–649, L792 |
-| P-25 | Governance cannot reach principal by any path, including `setFeeRecipient` plus the 20% fee ceiling on a future assigned week (the fee base excludes strike proceeds, so the lever is 20% of that week's premium), `setDepositCap`, `setPolicy`, role grants, or renouncing | `Vault.sol` L1007–1060, L829–841 |
-| P-26 | The protocol fee is charged only on premium. On `rollClose`, `Harvest.feeUsdg == floor((Harvest.grossUsdg − RollClose.usdgFromAssignment) × protocolFeeBps / 10000)` (saturating at 0) and `Harvest.netUsdg == Harvest.grossUsdg − Harvest.feeUsdg`, both events from the same transaction; on a checkpoint `Harvest`, `feeUsdg == floor(grossUsdg × protocolFeeBps / 10000)`. Strike proceeds never reach `pendingFeeUsdg`: for any assignment count and strike, `pendingFeeUsdg` after the close equals what the identical unassigned week would have accrued | `Vault.sol` L801–804, L829–841, L850–853, L860–876; `ValoremLib.sol` L99–110; `Policy.sol` L245–253 |
-
+| P-24 | Checks-effects-interactions in every money path: burn before transfer in `redeem`/`withdraw`, owed and reserves zeroed before transfer in `completeRedeem`, `phase = Settling` before any external call in `rollClose`; every state-changing user entry point is `nonReentrant` except ERC-20 transfers and `claimUsdg`/`claimUsdgTo` | `Vault.sol` L531–532, L546–547, L662–670, L823 |
+| P-25 | Governance cannot reach principal by any path, including `setFeeRecipient` plus the 20% fee ceiling on a future assigned week (the fee base excludes strike proceeds, so the lever is 20% of that week's premium), `setDepositCap`, `setPolicy`, role grants, or renouncing | `Vault.sol` L1040–1093, L860–872 |
+| P-26 | The protocol fee is charged only on premium. On `rollClose`, `Harvest.feeUsdg == floor((Harvest.grossUsdg − RollClose.usdgFromAssignment) × protocolFeeBps / 10000)` (saturating at 0) and `Harvest.netUsdg == Harvest.grossUsdg − Harvest.feeUsdg`, both events from the same transaction; on a checkpoint `Harvest`, `feeUsdg == floor(grossUsdg × protocolFeeBps / 10000)`. Strike proceeds never reach `pendingFeeUsdg`: for any assignment count and strike, `pendingFeeUsdg` after the close equals what the identical unassigned week would have accrued | `Vault.sol` L832–835, L860–872, L881–884, L891–907; `ValoremLib.sol` L105–116; `Policy.sol` L245–253 |
+| P-27 | `rollOpen` never writes a cycle whose `lotSize != 1e18`: whatever the registry reports, `ValoremLib.writeCalls` reverts `UnexpectedLotSize(1e18, lotSize)` before any approval or collateral moves, so the per-token OTM band (`Policy.checkStrike`), utilisation (`Policy.checkContracts`) and, at `approveListing`, the premium floor (`Policy.checkPremium`) always measure the contract actually written; a written call is never in the money at write time because of its lot. Try any other path to `_writeCalls`, and any per-token computation that takes the lot from somewhere other than the checked cycle | `ValoremLib.sol` L55–61; `Vault.sol` L738–745, L774; `Policy.sol` L71; `test/unit/VaultLotSize.t.sol` |
+| P-28 | Each queue entry's USDG payout equals the index growth over its own time in escrow, and the epoch pays out exactly its pot. For every entry settled while others remain, `usdgOut == min(floor((shares × epochIndex − debt) / 1e27), usdgRemaining)`, where `debt = Σ shares × accUsdgPerShare` over the owner's `queueRedeem` calls into that epoch and `epochIndex` is `accUsdgPerShare` at that epoch's `_settleQueue`; the last claimant takes `usdgRemaining`, which differs from its own index growth by fewer base units than there were `queueRedeem` calls into the epoch whenever the pot is exactly the escrow's accrual on the entries' shares (no `_takeAccrued` clamp, no carried residual, no shares sent straight to the vault); the entries' `usdgOut` sum to exactly the pot `QueueSettled` reported, never more; USDG indexed before an entry's shares were escrowed is never paid to that entry; `previewCompleteRedeem` returns exactly what `completeRedeem` would pay in the same state; the asset leg stays `floor(assetsRemaining × shares / sharesRemaining)` with the remainder to the last claimant; `debt` is zeroed exactly when the entry is settled, including by the stale-slot flush in `queueRedeem` | `Vault.sol` L188, L191, L575, L591, L609, L639–641, L686, L693–697, L923; `test/unit/VaultQueueFairness.t.sol` |
 The money invariants of ACCOUNTING.md §7, asserted by the stateful suite's eight `invariant_*`
 functions (`test/invariant/VaultInvariant.t.sol`, 64 runs × depth 600):
 
@@ -769,7 +792,7 @@ functions (`test/invariant/VaultInvariant.t.sol`, 64 runs × depth 600):
 | I-1 | `asset.balanceOf(vault) + lockedAssets() == deposited − withdrawn − assignedOut` | `invariant_assetConservation` L1068 |
 | I-2 | `usdg.balanceOf(vault) >= sum(claimableUsdg) + usdgReservedForQueue + pendingFeeUsdg + usdgDust + usdgUnallocated` | `invariant_usdgBooksBalance` L1100 (books; `usdgAccounted <= balance` with zero tolerance; queue reserve equals epochs plus staged exactly) and `invariant_usdgHolderSolvency` L1149 (per holder) |
 | I-3 | `reservedAssets <= asset.balanceOf(vault)` and `usdgReservedForQueue <= usdg.balanceOf(vault)` | `invariant_reservesAreReal` L1212 |
-| I-4 | `totalSupply() == sum over holders + balanceOf(vault)`; `queuedShares == sum(queuedSharesOf)`; `queuedShares <= balanceOf(vault)`, with equality whenever no share has been sent to the vault address directly. The suite asserts the equality (L1180) because its handler never transfers shares to the vault: `transferShares` draws `to` from a closed `actors` array (L358–364) that does not contain it. On the contract itself neither `Vault._update` (L324) nor `Distributor._update` (L208) rejects `to == address(this)`, so any holder can break `queuedShares == balanceOf(vault)` with one `transfer`; the stray shares are never burned and are the sender's loss only (§7) | `invariant_shareAccounting` L1167 |
+| I-4 | `totalSupply() == sum over holders + balanceOf(vault)`; `queuedShares == sum(queuedSharesOf)`; `queuedShares <= balanceOf(vault)`, with equality whenever no share has been sent to the vault address directly. The suite asserts the equality (L1180) because its handler never transfers shares to the vault: `transferShares` draws `to` from a closed `actors` array (L358–364) that does not contain it. On the contract itself neither `Vault._update` (L340) nor `Distributor._update` (L208) rejects `to == address(this)`, so any holder can break `queuedShares == balanceOf(vault)` with one `transfer`; the stray shares are never burned and are the sender's loss only (§7) | `invariant_shareAccounting` L1167 |
 | I-5 | `totalSupply() > 0 ⇒ convertToAssets(totalSupply()) <= totalAssets()` | `invariant_noFreeShares` L1185 |
 | I-6 | `contractsWritten > 0 ⇒ phase != Idle`; `phase == Idle ⇒ claimKey == 0`; `lockedAssets() == (contractsWritten − contractsAssigned()) × 1e18` while open | `invariant_phaseSanity` L1270 |
 | I-7 | The protocol fee never touches strike proceeds: `protocolFeeBps` stays at `launchDefaults()` for the run, and `(usdg.balanceOf(feeRecipient) + pendingFeeUsdg) × 10000 <= premiumToVault × protocolFeeBps`, where `premiumToVault` is a handler ghost of the vault's USDG balance change on every successful fill (P-26) | `invariant_feeNeverTouchesStrikeProceeds` L1308 (body in `_assertFeeBoundedByPremium` L1315) |
@@ -785,25 +808,25 @@ Deduplicated across the per-contract records. Money paths first.
 **A. Loss or freeze of principal.**
 
 1. **Live NAV read from Valorem and the deposit gate.** `totalAssets()` reads
-   `clear.position(claimKey)` live (Vault L337–342 via ValoremLib L121–129). A buyer's
+   `clear.position(claimKey)` live (Vault L353–358 via ValoremLib L127–135). A buyer's
    `exercise` collapses `lockedAssets()` in the same transaction with no callback, while the
    strike USDG stays inside the claim until `rollClose`. The only defences are the
    `cycleExerciseTs` close and the `claimedExerciseProceeds() != 0` probe. Try: any minting or
    price-quoting path that bypasses `_requireDepositPhase`; a partial assignment below one lot
    or a bucket-accounting delay where `exerciseAmount` reads 0 while `underlyingAmount` already
-   fell; a `position()` revert or an out-of-gas inside the try/catch (ValoremLib L123–128,
-   L135–140) that makes both reads 0; negative `int256` clamps; a cycle whose
+   fell; a `position()` revert or an out-of-gas inside the try/catch (ValoremLib L129–134,
+   L141–146) that makes both reads 0; negative `int256` clamps; a cycle whose
    `exerciseTimestamp` is already in the past at `rollOpen`. On the out-of-gas branch: confirm
    for every consumer of the three views that EIP-150's 63/64 rule leaves too little gas to
    finish the outer transaction once the inner staticcall has starved, and whether `position()`
    gas can grow with the claim (upstream iterates claim buckets). This was the review's critical
    finding (§6, defect 10); we want it attacked again.
-2. **`rollClose` as the single exit.** Vault L782–808: `phase = Settling`, then
+2. **`rollClose` as the single exit.** Vault L813–839: `phase = Settling`, then
    `seaport.incrementCounter` (if a listing is live), `clear.redeem`, harvest, queue settle. A
    revert in Seaport or in `clear.redeem` (USDG blocklist of the vault; the vault address
    blocklisted on the Stock Token registry, or the registry-level pause, or Valorem's address
    blocklisted, §4 "Freeze and blocklist surface"; checked subtraction on the redeem deltas at
-   ValoremLib L103–109) strands collateral, the queue and every future cycle; there is no
+   ValoremLib L109–115) strands collateral, the queue and every future cycle; there is no
    alternative unwind, no rescue and no upgrade. Assess the blast radius and whether a
    documented recovery is required, given the care taken for the fee leg. For each of the two
    Stock Token actions separately (vault blocklisted; registry pause) enumerate which vault
@@ -816,43 +839,51 @@ Deduplicated across the per-contract records. Money paths first.
    Stock Token. Confirm the revert is
    on `transfer`/`transferFrom` only and never on `balanceOf`, since `totalAssets()` and every
    preview read `balanceOf`.
-3. **Queue settlement and reserves.** Vault L548–651, L885–904; Distributor L230–241.
+3. **Queue settlement and reserves.** Vault L564–697, L916–937; Distributor L230–241.
    `payoutAssets = idleAssets() × queued / totalSupply` computed before the burn with the
    escrow in the supply; USDG for the epoch comes from `_takeAccrued(vault)` clamped. Try: two
    uncollected epochs double-reserving; later instant redemptions of the remaining supply
    reaching into `reservedAssets`; the +1 offset; the escrow accrual residual migrating from one
    cohort to the next (`_takeAccrued`, Distributor L230–241); re-queueing after a settled but
    uncollected epoch; utilisation is measured on `idleAssets()` at `rollOpen` only, so a queue
-   that grows after the write is settled from whatever is idle at `rollClose`. Also: shares
-   sent straight to the vault address are accepted by `_update` and never burned (§7, I-4);
-   say whether a `to == address(this)` revert in `Vault._update` (L324) is worth its bytes
-   under the 1,150 B EIP-170 headroom, or whether the loss-to-sender-only argument suffices.
-4. **The USDG index and the clamps.** Distributor L118–152, L171–192; Vault L909–913. The index
+   that grows after the write is settled from whatever is idle at `rollClose`. The per-entry USDG
+   payout (P-28, since `6ed528f`; defect 15 in §6 is what it replaced): an entry's reward debt
+   accumulating over several `queueRedeem` calls in one epoch and being zeroed only in
+   `_settleEpochEntry` (L641), including by the stale-slot flush (L575); the cap at
+   `usdgRemaining` making earlier claims whole at later claimants' expense when the entries'
+   floors exceed the pot; `shares × accUsdgPerShare` near `uint256` overflow after a tiny-supply
+   distribution; a deposit or mint whose checkpoint indexes premium (or donated USDG) between two entries; and
+   any way for an entry to be paid USDG indexed before its shares were escrowed. Also: shares
+   sent straight to the vault address are accepted by `_update` and never burned (§7, I-4), and
+   their USDG accrual joins the escrow pot with no debt entry, so the epoch's last claimant
+   collects it; say whether a `to == address(this)` revert in `Vault._update` (L340) is worth its
+   bytes under the 958 B EIP-170 headroom, or whether the loss-to-sender-only argument suffices.
+4. **The USDG index and the clamps.** Distributor L118–152, L171–192; Vault L942–946. The index
    over-promises by up to one base unit per account per distribution (sum of `claimableUsdg`
    can exceed `totalUsdgDistributed` by that much); the clamp is the only thing between that
    drift and an underflow. Try: a claim that pays out of `usdgReservedForQueue` or
    `pendingFeeUsdg`; carried `usdgDust`/`usdgUnallocated` consumed by a holder claim so the
    next epoch is under-backed; the saturating `_debitUsdgOut`/`usdgOwed()` hiding a real leak;
    an outflow that forgets the debit (the three outflow sites are claims Distributor L190,
-   queue payout Vault L648–649, fee Vault L992–996; at the fee site the debit follows the
+   queue payout Vault L669–670, fee Vault L1025–1029; at the fee site the debit follows the
    external call); the `bal × delta` bound at 1e30+ shares or at 1 wei of shares.
-5. **Fee sweep raw call.** Vault L971–999. `pendingFeeUsdg` is clamped to the total balance,
+5. **Fee sweep raw call.** Vault L1004–1032. `pendingFeeUsdg` is clamped to the total balance,
    not to `_usdgAvailableForHolders`; "empty return equals success"; a USDG address without code
    would read as success; the `usdgAccounted` debit follows the external call. Try: paying the
    fee out of money reserved for the queue.
-6. **Harvest is any USDG balance increase.** Vault L829–841. Donated USDG, strike proceeds and
+6. **Harvest is any USDG balance increase.** Vault L860–872. Donated USDG, strike proceeds and
    premium are all distributed. Premium and donations are fee'd at `protocolFeeBps`; strike
    proceeds are not, because `rollClose` excludes the USDG measured across `clear.redeem`
-   (L801–804; P-26). Try: a donation that distorts the index, the fee, or a deposit-then-queue
+   (L832–835; P-26). Try: a donation that distorts the index, the fee, or a deposit-then-queue
    sequence that captures premium landing between the last checkpoint and exercise; any USDG
    that is not strike proceeds but lands inside the `redeemClaim` balance window (ValoremLib
-   L103–109) and so escapes the fee (a fee dodge harms only the protocol, but say if it is
+   L109–115) and so escapes the fee (a fee dodge harms only the protocol, but say if it is
    reachable); any path where `usdgFromAssignment` exceeds `gross` other than by saturation; an
    off-chain reader that treats `Harvest.feeUsdg / Harvest.grossUsdg` as the fee rate, which on
    an assigned week it is not; confirm a late depositor in `Listed` who shares assignment
    losses and strike proceeds is the intended economics
    (`test_lateDepositorDuringListed_isNotWrittenAgainstButSharesTheAssignment`).
-7. **Inflation and donation griefing.** Vault L351–365, L441. Offset +1 wei on an 18-decimal
+7. **Inflation and donation griefing.** Vault L367–381, L457. Offset +1 wei on an 18-decimal
    asset; first-depositor inflation is bounded only by the donation cost
    (`test_inflationGriefIsBoundedByTheDonation`); the cap counts donations; a direct Stock
    Token transfer also inflates `idleAssets()` and therefore the utilisation
@@ -884,14 +915,14 @@ Deduplicated across the per-contract records. Money paths first.
     for the domain separator during Seaport's own fill; and, irrelevant at launch with
     `zone = 0`, that a non-zero zone could cancel open orders on Seaport without the vault
     knowing.
-11. **Blanket, irrevocable operator approval on Clear.** AdapterSeaport L239–241 (Vault L302).
+11. **Blanket, irrevocable operator approval on Clear.** AdapterSeaport L239–241 (Vault L318).
     Covers the claim NFT and every future id; safety rests on Seaport requiring offerer
     authorisation and on the shape check pinning the offer to the current `optionId`. A
     non-zero conduit key would put a third-party-mutable conduit in that role; the constructor
     silently falls back to Seaport when the conduit does not resolve.
 12. **Linked libraries.** DELEGATECALL with full storage access; verify the five link sites in
     the deployed runtime, library call-protection, no storage, separate verification. Vault
-    runtime is 23,426 B with 1,150 B of EIP-170 headroom; any fix that does not fit moves code
+    runtime is 23,618 B with 958 B of EIP-170 headroom; any fix that does not fit moves code
     into a library.
 
 **C. Economic and governance.**
@@ -903,7 +934,7 @@ Deduplicated across the per-contract records. Money paths first.
     say whether `haltWrites`/`invalidateAllListings` are sufficient and fast enough; confirm the
     3-per-cycle cap counts authorisations (not live listings) and that a cancel never refunds a
     slot (AdapterSeaport L201, L228).
-14. **Oracle gate.** Vault L922–940, Policy L264–275. No `roundId`/`answeredInRound`; staleness
+14. **Oracle gate.** Vault L955–973, Policy L264–275. No `roundId`/`answeredInRound`; staleness
     window in days by design (4 days at launch; `us_equities_24/5`); `block.timestamp −
     updatedAt` panics on a future `updatedAt`; `decimals()` re-read live; `oraclePaused()`
     probed by `staticcall` where a non-32-byte return reads as not paused; no sequencer feed;
@@ -916,20 +947,24 @@ Deduplicated across the per-contract records. Money paths first.
     attacker-unbounded. Assess whether a lagging or manipulated weekend price lets the keeper
     write inside a band that is far in the money at Monday open, and confirm the answer only
     ever changes which rungs and prices are writable, never settlement.
-15. **The registry EOA.** Vault L683–698, ValoremLib L50–64. Defended: tenor > 21 days,
+15. **The registry EOA.** Vault L714–729, ValoremLib L50–70. Defended: tenor > 21 days,
     inverted window, unapproved rung, rung from another cycle, option metadata disagreeing with
-    the cycle. Not defended: a bad-but-legal strike ladder beyond the OTM band, `lotSize`
-    changes mid-cycle (`setLotSize`), option ids re-used across cycles, a cycle whose
-    `exerciseTimestamp` is already past, the strike not cross-checked against
-    `clear.option().exerciseAmount` in the library, and `setCycle`'s `canReplaceCycle()` race
-    (`ops/addresses.json` (leekzor/callhouse) `_race`).
+    the cycle, and, since `6ed528f`, a cycle lot other than exactly 1e18 (ValoremLib L61, P-27).
+    The registry refuses `setLotSize` while a cycle is live, so a lot cannot change mid-cycle;
+    the real vector was a change between cycles with a ladder whose strikes were not rescaled,
+    which before the fix let an ordinary `rollOpen` write in-the-money calls against principal
+    (§6 defect 14). It now costs skipped weeks. Not defended: a bad-but-legal strike ladder
+    beyond the OTM band, option ids re-used across cycles, a cycle whose `exerciseTimestamp` is
+    already past, the strike not cross-checked against `clear.option().exerciseAmount` in the
+    library, and `setCycle`'s `canReplaceCycle()` race (`ops/addresses.json` (leekzor/callhouse)
+    `_race`). Try: any other quantity the vault prices per token that the registry can scale.
 16. **Admin without a timelock, and immutability.** No upgrade, no rescue, no timelock;
     `setDepositCap` and `setPolicy` are immediate and not cycle-aware; the admin can renounce
     and freeze governance; a wrong immutable is unfixable. Say whether the `Policy` caps are
     "cannot rug" bounds rather than merely "unlikely": 1% OTM, a 0.10%-of-notional weekly
     premium floor, 100% utilisation leaving nothing idle for the queue, a fee of 20% of premium.
     Confirm P-25.
-17. **Valorem engine fee.** ValoremLib L74–88 mirrors `collateral × feeBps / 10_000` with a
+17. **Valorem engine fee.** ValoremLib L80–94 mirrors `collateral × feeBps / 10_000` with a
     floor of 1, on top of collateral, verified only against `MockClear`; check rounding and
     fee-on-top versus fee-deducted against upstream `write`. A mismatch with
     upstream `write` at `6436c823` makes every write revert on allowance once the switch flips,
@@ -945,7 +980,9 @@ Deduplicated across the per-contract records. Money paths first.
 
 19. `contractsAssigned()` integer-divides a fixed-point figure (event accuracy only; confirm it
     is never used for accounting). Untested error paths in ValoremLib: `OptionAssetMismatch`,
-    `OptionExerciseAssetMismatch`, `UnexpectedLotSize`, `WriteReturnedNoClaim`,
+    `OptionExerciseAssetMismatch`, `UnexpectedLotSize` from its first check
+    (`underlyingAmount != cyc.lotSize`; the one-token check at L61 is covered by
+    `test/unit/VaultLotSize.t.sol`), `WriteReturnedNoClaim`,
     `ValoremFeesEnabled` (shadowed by Vault's earlier `ValoremFeeNotAccepted` check), and the
     catch branches of the three position views. `MockClear` and `MockSeaport` infidelities
     (§6). The duplicate `HALT / ADMIN` banner in Vault.sol was removed in this repository's
@@ -958,7 +995,12 @@ Deduplicated across the per-contract records. Money paths first.
 **Internal adversarial review, 2026-09-12** (SECURITY.md §4): 13 surfaces, 72 raw findings, 51
 surviving refutation. Internal, not external. The thirteen defects fixed during the build and
 the review (`tasks.md` (leekzor/callhouse) "Defects found and fixed during the build"; the review-era ones are
-SECURITY.md §4 "Fixed" rows 1–5, where `tasks.md` (leekzor/callhouse) #11 merges SECURITY.md #2 and #3):
+SECURITY.md §4 "Fixed" rows 1–5, where `tasks.md` (leekzor/callhouse) #11 merges SECURITY.md #2 and #3),
+and two found on 2026-09-13, after the review, while the protocol documentation was being written
+(rows 14 and 15; SECURITY.md §4 "Found 2026-09-13, after the review", rows 6 and 7). Both were
+verified adversarially with an executable proof of concept against the unfixed code before being
+fixed in this repository's `6ed528f`; the severities are our own, and no external reviewer has
+seen either:
 
 | # | Defect | Fix |
 |---|---|---|
@@ -975,6 +1017,8 @@ SECURITY.md §4 "Fixed" rows 1–5, where `tasks.md` (leekzor/callhouse) #11 mer
 | 11 | **High** (two findings). Registry `setCycle` bounded expiry only from below (years-long lock of up to 95% of collateral); the vault trusted the registry that the option's window matched the cycle's | `MAX_CYCLE_TENOR = 21 days`; `rollOpen` reverts `BadCycleWindow` and `OptionWindowMismatch` |
 | 12 | **Medium.** Hard fee transfer inside `rollClose`; a blocklisted recipient, paused USDG or reverting receiver froze everything | Best-effort push, `pendingFeeUsdg`, permissionless `sweepFee()` |
 | 13 | **Medium.** Accepted Valorem fee still could not write: the 15 bps is pulled on top of collateral and only collateral was approved | Approve collateral + fee, scrub the allowance after |
+| 14 | **High** (needs the registry owner to act). `rollOpen` priced the OTM band, premium floor and utilisation per 1e18 (`Policy.LOT`) but wrote whatever `lotSize` the registry reported; the owner can change it between cycles (`setLotSize` refuses only while a cycle is live) and list an unrescaled ladder. PoC at lot 2e18: a 227 USDG/contract strike (113.50 per token against 220 spot) passed the band, 23 contracts were written and filled at the floor, the buyer exercised and took ~$4,879 of an $11,000 book; any lot above ~1.03e18 wrote an in-the-money call, and cap sizing above 1/0.95 also consumed assets reserved for settled redeemers | `ValoremLib.writeCalls` reverts `UnexpectedLotSize(1e18, lotSize)` unless the cycle lot is exactly 1e18 (P-27); `Vault` bytecode unchanged, `ValoremLib` 3,557 → 3,621 B |
+| 15 | **High.** The redeem queue's escrow accrual was split pro rata by final shares although it is earned tranche by tranche at different escrow compositions: a deposit indexing premium between two queue entries moved value from the earlier queuer to the later one (alice 1,504,166 instead of 4,512,500), and a deposit-then-queue newcomer took 6,768,750 of an earlier queuer's 9,025,000 while earning nothing. Premium only, never principal | Per-account reward debt (`shares × accUsdgPerShare` at escrow time) and the index at each epoch's settlement; an entry is paid `floor((shares × epochIndex − debt) / 1e27)` capped at the epoch's `usdgRemaining`, the last claimant takes the remainder (P-28; ACCOUNTING.md §5). Private storage only, public ABI unchanged; `Vault` 23,426 → 23,618 B |
 
 Regression tests for 10–13 are the eight tests in `test/unit/VaultSecurity.t.sol`
 (`test_critical_cannotDepositAfterAssignmentCrashesNav`,
@@ -986,12 +1030,23 @@ Regression tests for 10–13 are the eight tests in `test/unit/VaultSecurity.t.s
 `test_medium_blockedFeeRecipientDoesNotFreezeTheVault`,
 `test_medium_acceptedValoremFeeActuallyLetsTheVaultWrite`). Defect 9's regressions are
 `test_accrualIndexCanPromiseMoreUsdgThanItCredited`, `test_accrualDriftCostsDustAndNothingElse`
-and `test_settledRedeemerIsAlwaysPayable` in the invariant file. A keeper-focused sweep the
-same day fixed 18 off-chain defects; out of contract scope.
+and `test_settledRedeemerIsAlwaysPayable` in the invariant file. Defect 14's are the five tests in
+`test/unit/VaultLotSize.t.sol` (lots 2e18, 1.08e18 and 0.5e18 refused, a settled redeemer's reserve
+untouched at 1.1e18, writing again at 1e18); defect 15's are the three tests and one 256-run fuzz in
+`test/unit/VaultQueueFairness.t.sol` (`test_earlierQueuerKeepsTheTrancheOnlyHerSharesEarned`,
+`test_depositThenQueueTakesNoneOfAnEarlierQueuersPremium`,
+`test_trancheIndexedBetweenEntriesStaysWithTheEntryItAccruedTo`,
+`testFuzz_eachEntryIsPaidItsOwnIndexGrowth`), all four of which fail against the pre-fix vault
+(per `6ed528f`'s commit message; not re-run against it for this document). The fix also changed two
+zero-dust expectations by hand derivation: `test_twoQueuedRedeemersThroughAnAssignedWeek_leaveZeroDust`
+(the first claimant now receives its exact index-growth floor, one unit more than the old pro-rata
+floor) and `test_queueEpochDrawsDownToZeroDust` in `VaultInvariant.t.sol` (a 3-wei entry that
+earned 0.058 of a unit now receives 0). A keeper-focused sweep on 2026-09-12 fixed 18 off-chain defects; out of
+contract scope.
 
 **Unit and invariant tests**, all against mocks (`forge test --no-match-path 'test/fork/*'`,
-measured 2026-09-13 at `a4c38b0` after `rm -rf cache/invariant`: `Ran 12 test suites in 12.34s
-(60.29s CPU time): 310 tests passed, 0 failed, 0 skipped (310 total tests)`):
+measured 2026-09-13 at `b0ff57b` after `rm -rf cache/invariant`: `Ran 14 test suites in 12.60s
+(77.39s CPU time): 319 tests passed, 0 failed, 0 skipped (319 total tests)`):
 
 | Suite | Tests | Covers |
 |---|---:|---|
@@ -1004,12 +1059,15 @@ measured 2026-09-13 at `a4c38b0` after `rm -rf cache/invariant`: `Ran 12 test su
 | `test/unit/VaultDistributor.t.sol` | 19 | Pro-rata index, claims, transfers, late-depositor isolation, fee routing, dust and unallocated carry, fuzzed claim bounds |
 | `test/unit/VaultAssignment.t.sol` | 18 | Full/partial/zero assignment, the protocol fee base on assigned weeks, late depositor, queued redeemers through assigned weeks, fuzzed collateral/strike exactness |
 | `test/unit/VaultSecurity.t.sol` | 8 | The review regressions above |
+| `test/unit/VaultLotSize.t.sol` | 5 | Defect 14: cycle lots other than 1e18 refused with nothing written, a settled redeemer's reserve untouched, writing resumes at 1e18 |
+| `test/unit/VaultQueueFairness.t.sol` | 4 | Defect 15: per-entry escrow USDG, deposit-then-queue, a tranche indexed between entries, and a fuzz over three entries around two tranches |
 | `test/unit/Smoke.t.sol` | 4 | Fixture wiring, strike ladder, one clean cycle |
 | `test/unit/SplitDiff.t.sol` | 2 | Contract split vs keeper vectors; fuzzed fillability |
 | `test/invariant/VaultInvariant.t.sol` | 16 | The 8 `invariant_*` functions above (64 runs × depth 600, handler-driven with time as part of the fuzz, `afterInvariant` refusing vacuous or shrunk runs) plus 8 deterministic tests incl. `test_handlerReachesEveryState` |
-| **Total** | **310** | |
+| **Total** | **319** | |
 
-`README.md` (L84) and `tasks.md` (leekzor/callhouse) both give 310 across 12 suites (Appendix A item 2).
+`README.md` (L86) and `tasks.md` (leekzor/callhouse) still give 310 across 12 suites, the count
+before `6ed528f` (Appendix A item 2).
 `forge coverage` runs non-blocking in CI and has not gated anything.
 
 **What the stateful suite can and cannot do.** The handler registers exactly 17 selectors
@@ -1029,7 +1087,11 @@ sweep; `sweepFee` is never called, the fee leaves only through `rollClose`), A.6
 happens), B.10 (ERC-1155 push inflating relist size), C.16 and P-25 (`setPolicy`, `setDepositCap`,
 `setFeeRecipient` mid-cycle: no setter is ever called, the policy stays at `launchDefaults`),
 C.13's `invalidateAllListings` leg, and the `queuedShares == balanceOf(vault)` equality in I-4.
-Plan your own fuzzing there first.
+Two more rest on unit tests: the handler's registry never changes the lot (`MockRegistry.lotSize`
+stays 1e18), so P-27 is covered only by `VaultLotSize.t.sol`; and the handler queues and deposits,
+so the per-entry USDG code runs in every invariant run, but no `invariant_*` function checks that an
+entry received its own index growth, so P-28 is asserted only by `VaultQueueFairness.t.sol`. Plan
+your own fuzzing there first.
 
 **Fork tests against live chain 4663** (`FOUNDRY_PROFILE=fork`, `test/fork/ForkLive.t.sol`,
 21 tests): code presence at every address, Seaport version string, token decimals, registry
@@ -1130,8 +1192,13 @@ records flag; the auditor should confirm each is bounded as we claim rather than
   premium, never principal. A halt blocks only `rollOpen` and `approveListing`.
 - **Keeper economic discretion inside policy** (rung, size, price down to the floor, three
   listings, or skipping) is bounded by the caps, not eliminated.
-- **The registry owner is a single EOA.** Worst case is a skipped week; the tenor cap, the
-  window check and the band refuse anything worse.
+- **The registry owner is a single EOA.** Since `6ed528f` its worst case is skipped weeks (it
+  withholds a usable cycle, or sets a lot other than one token, which `rollOpen` now refuses), a
+  cycle of up to 21 days, and a strike ladder anywhere inside the OTM band; the tenor cap, the
+  window check, the band and the one-token lot check refuse anything worse. Before `6ed528f` that
+  claim was false: a lot change between cycles with an unrescaled ladder let an ordinary `rollOpen`
+  write in-the-money calls against principal (§6 defect 14). §5 C.15 lists what is still not
+  defended.
 - **The Stock Token issuer can pause every Stock Token at once, blocklist the vault address,
   burn vault-held tokens (`adminBurn`), pause the oracle and upgrade the token**, each from a
   single EOA with no timelock (§4 "Freeze and blocklist surface"). Settlement then stops;
@@ -1178,8 +1245,8 @@ forge-std v1.16.2 as git submodules under `lib/` (`foundry.lock`).
 
 ```bash
 forge fmt --check                                   # CI gate
-forge build --sizes                                 # Vault runtime 23,426 B; margin 1,150 B
-forge test -vvv --no-match-path 'test/fork/*'       # unit + invariant, mocks only: 310 tests
+forge build --sizes                                 # Vault runtime 23,618 B; margin 958 B
+forge test -vvv --no-match-path 'test/fork/*'       # unit + invariant, mocks only: 319 tests
 FOUNDRY_PROFILE=fork forge test --fork-url "$RH_RPC" -vvv   # 21 tests against live 4663
 forge coverage --no-match-path 'test/fork/*' --report summary   # non-blocking in CI
 ```
@@ -1187,13 +1254,14 @@ forge coverage --no-match-path 'test/fork/*' --report summary   # non-blocking i
 `RH_RPC` defaults in CI to `https://rpc.mainnet.chain.robinhood.com`. That public endpoint
 keeps historical state only for a trailing window of roughly 4,000–8,000 blocks
 (`keeper/DRYRUN.md` (leekzor/callhouse)), so an anvil fork that runs for more than a few minutes needs an archive
-endpoint. Sizes from `forge build --sizes` at `a4c38b0`: `Vault` runtime 23,426 B (margin
-1,150 B), initcode 27,055 B;
-`SeaportOrderLib` 5,694 B; `ValoremLib` 3,557 B; `Policy` 16 B (internal). `PolicyHarness`
+endpoint. Sizes from `forge build --sizes` at `b0ff57b`: `Vault` runtime 23,618 B (margin
+958 B), initcode 27,247 B;
+`SeaportOrderLib` 5,694 B; `ValoremLib` 3,621 B; `Policy` 16 B (internal). Before `6ed528f` they were
+`Vault` 23,426 B (margin 1,150 B) and `ValoremLib` 3,557 B. `PolicyHarness`
 (2,353 B) also appears in that table: it is a test-only wrapper around the internal library
 and is not deployed. `forge build` prints forge-lint warnings that are expected and are not a
 CI gate (the workflow runs `forge fmt --check`, `forge build --sizes` and `forge test`; no lint
-step, no `deny` in `foundry.toml`): `unsafe-typecast` at `src/lib/ValoremLib.sol` L125 and L137
+step, no `deny` in `foundry.toml`): `unsafe-typecast` at `src/lib/ValoremLib.sol` L131 and L143
 (both carry a `forge-lint: disable-next-line` comment that the current lint ignores),
 `script/Deploy.s.sol` L131, `src/mocks/MockClear.sol` L131 and several `test/` files;
 `erc20-unchecked-transfer` at four sites in three `test/unit/` files; `divide-before-multiply` at
@@ -1216,7 +1284,7 @@ missing `Referer`; `ops/bsproxy.js` (leekzor/callhouse) injects one.
 
 Traps (`tasks.md` (leekzor/callhouse) "Build constraints"):
 
-- **EIP-170.** 1,150 B of headroom under via-IR at 200 runs. Any remediation that adds more than
+- **EIP-170.** 958 B of headroom under via-IR at 200 runs. Any remediation that adds more than
   a small amount of code to `Vault` needs a third library extraction, not an optimiser setting.
   Re-run `forge build --sizes` on every fix.
 - **Tag space.** Each unit suite deploys the whole fixture; with via-IR on, another
@@ -1246,7 +1314,7 @@ Traps (`tasks.md` (leekzor/callhouse) "Build constraints"):
    impact in money terms, a proof of concept (a forge test on the `BaseTest` fixture in
    `test/Base.t.sol` where feasible; the mocks in `src/mocks/` are the
    fixture's dependencies), recommendation, and status after our fix.
-2. A verdict per property in §5 (P-01 … P-26, I-1 … I-7): held, broken (with the finding), or
+2. A verdict per property in §5 (P-01 … P-28, I-1 … I-7): held, broken (with the finding), or
    not assessed.
 3. A verdict per integration assumption in §3 and §4 (Valorem, Seaport, USDG, Stock Token,
    Chainlink, registry): confirmed, refuted, or not assessed, with the upstream source line
@@ -1294,18 +1362,23 @@ that repository's `79e6a19`.
 1. **Resolved 2026-09-13.** ACCOUNTING.md §6 said "both [fees] are on the premium only" while
    the code charged 1000 bps on the whole USDG inflow, strike proceeds included. The decision was
    to make the code match the premium-only intent at 500 bps: `Vault.sol` `_accrueHarvest(feeFree)`
-   L829–841, `Policy.launchDefaults` L118. ACCOUNTING.md §6, README.md (leekzor/callhouse), TECHSPEC.md (leekzor/callhouse), the
+   L860–872, `Policy.launchDefaults` L118. ACCOUNTING.md §6, README.md (leekzor/callhouse), TECHSPEC.md (leekzor/callhouse), the
    site and the dapp now say 5% of premium, and the keeper dry run was re-run under the new rule
    (§6). One residue: the keeper's `roll_close` alert still quotes harvest gross including strike
    proceeds on an assigned week, so fee/gross read from keeper output is not the rate
    (`keeper/DRYRUN.md` (leekzor/callhouse), `tasks.md` (leekzor/callhouse) K-21).
-2. **Resolved.** `README.md` (line 51 at `27d502a`) said "328 unit and invariant tests" while the
-   measured count was 307. Corrected to 307 in leekzor/callhouse `cb82bf3` (this repository's
-   `0bc700e`); at `a4c38b0` `README.md` L84 says "310 unit and invariant tests across 12 suites,
-   21 fork tests", which is the measured figure (§6) and the one in `tasks.md` (leekzor/callhouse).
-3. **Still true; explanatory, nothing to fix.** `tasks.md` (leekzor/callhouse) lists 13 defects;
+2. **Open again since `6ed528f`.** `README.md` (line 51 at `27d502a`) said "328 unit and invariant
+   tests" while the measured count was 307. Corrected to 307 in leekzor/callhouse `cb82bf3` (this
+   repository's `0bc700e`); at `a4c38b0` `README.md` L84 said "310 unit and invariant tests across
+   12 suites, 21 fork tests", the measured figure then and the one in `tasks.md`
+   (leekzor/callhouse). At `b0ff57b` `README.md` L86 still says 310 across 12 suites, and
+   `tasks.md` (leekzor/callhouse) L22 (read at that repository's `b961d7f`) still says 310 across
+   12, while the measured figure is 319 across 14 suites (§6). The fork count, 21, is unchanged.
+3. **Still true; explanatory, except one stale count.** `tasks.md` (leekzor/callhouse) lists 13 defects;
    SECURITY.md §4 has 5 review rows. `tasks.md` (leekzor/callhouse) #11 merges SECURITY.md #2
-   (tenor cap) and #3 (window mismatch).
+   (tenor cap) and #3 (window mismatch). The two 2026-09-13 defects are rows 14–15 in §6 and
+   SECURITY.md §4 rows 6–7; `tasks.md` (leekzor/callhouse) at `b961d7f` does not list them (its
+   L33 still says 13 defects in the first review), so its count is two behind.
 4. **Resolved** in leekzor/callhouse `cb82bf3`. `README.md` (leekzor/callhouse) (line 165 at
    `27d502a`) said the launch deposit cap is "20–50 NVDA"; it now says "20 NVDA at launch"
    (L190), matching `Deploy.s.sol`'s `LAUNCH_DEPOSIT_CAP = 20e18` and `tasks.md` (leekzor/callhouse)
@@ -1323,14 +1396,14 @@ that repository's `79e6a19`.
    suite had seven functions; the fee change added `invariant_feeNeverTouchesStrikeProceeds`, and
    §7 now lists all eight `invariant_*` functions as the code asserts them (USDG solvency is split
    into `invariant_usdgBooksBalance` and `invariant_usdgHolderSolvency`; §5 I-1 … I-7).
-8. **Resolved.** `writesHalted` gates `rollOpen` (L677) and `approveListing` (L732), and those
+8. **Resolved.** `writesHalted` gates `rollOpen` (L708) and `approveListing` (L763), and those
    checks are the spec; three documents said a halt blocks `rollOpen` only. `docs/ARCHITECTURE.md`
    (leekzor/callhouse) §3 was corrected in leekzor/callhouse `cb82bf3` and now reads "Pause and halt
    block `rollOpen` and `approveListing` **only**" (L127). `README.md` (L117 at `27d502a`) was
    corrected in the same commit (this repository's `0bc700e`) and now reads "A halt blocks
-   `rollOpen` and `approveListing` **only**" (L194). The audited source's own NatSpec was
+   `rollOpen` and `approveListing` **only**" (L202). The audited source's own NatSpec was
    corrected in this repository's `6023a96`: `writesHalted` (L115) now says "When true, `rollOpen`
-   and `approveListing` are blocked. Nothing else is." and `haltWrites` (L1005–1006) "Block
+   and `approveListing` are blocked. Nothing else is." and `haltWrites` (L1038–1039) "Block
    `rollOpen` and `approveListing`. Never blocks redemptions, claims, `cancelListing`, `lockBook`
    or `rollClose`." SECURITY.md and `ops/safes.md` (leekzor/callhouse) §3 had it right.
 9. **Resolved** in this repository's `6023a96`. `IValoremClear.sol`'s header referred to a
@@ -1347,7 +1420,7 @@ that repository's `79e6a19`.
     `checkStrike`/`checkPremium`.
 11. **Resolved** in this repository's `6023a96`. `Vault.sol`'s `HALT / ADMIN` section banner
     appeared twice, with the fee-sweep section between them; the empty first copy was removed and
-    the one remaining banner (L1001–1003) heads the halt and admin functions. Cosmetic.
+    the one remaining banner (L1034–1036) heads the halt and admin functions. Cosmetic.
 12. **Superseded by the bootstrap plan.** `ops/safes.md` (leekzor/callhouse) §7 says "Then, and
     only then, the deployer renounces `DEFAULT_ADMIN_ROLE`". An earlier revision of this appendix
     called that wrong because `Deploy.s.sol` then always passed the Safe as `admin`. The launch plan
@@ -1355,6 +1428,18 @@ that repository's `79e6a19`.
     `HandoverAdmin.s.sol` performs it, after granting the Safe and seeing the Safe execute.
     `ops/safes.md` §7 should point at that script and `docs/DEPLOY.md` path A rather than raw
     `cast` calls.
+13. **Resolved** in the documentation commit on top of this repository's `b0ff57b`. SECURITY.md §3
+    and §4 and this document's §7 said the registry owner's worst case is a skipped week. Before
+    `6ed528f` that was false: a lot change between cycles let `rollOpen` write in-the-money calls
+    (§6 defect 14). The fix makes it true for the lot vector, and the three places now say so with
+    the remaining powers listed (§7, §5 C.15). This document's §5 C.15 also described the lot risk
+    as "`lotSize` changes mid-cycle", which the registry forbids; it now describes the between-cycles
+    vector.
+14. **Resolved** in the same documentation commit. ACCOUNTING.md §5 described every queue claimant
+    as taking its proportion of what is left on both legs, and this document's §3.1 said each epoch
+    claimant takes `floor(remaining × shares / sharesRemaining)`. Since `6ed528f` that holds for
+    assets only; USDG is paid per entry by index growth (P-28). Both now describe the per-entry
+    rule.
 
 ## Appendix B. To be confirmed
 
@@ -1364,11 +1449,11 @@ facts:
 - Engagement timeline; the pinned commit and its `audit-<date>` tag; the engagement contact
   channel; the delivery mechanism for repository access (§1).
 - Housekeeping before the tag. **Done:** the `writesHalted` and `haltWrites` NatSpec
-  (`Vault.sol` L115, L1005–1006) and `README.md` (L194) say `rollOpen` and `approveListing`
+  (`Vault.sol` L115, L1038–1039) and `README.md` (L202) say `rollOpen` and `approveListing`
   (Appendix A item 8; this repository's `6023a96` and `0bc700e`); the `IValoremClear.sol` header
   no longer refers to `lib/clear`, `script/lib/ValoremDeployer.sol` or
   `src/vendor/ValoremArtifacts.sol` (Appendix A item 9; `6023a96`); every line number in this
-  document that points into this repository was re-derived at `a4c38b0`. **Remaining:** re-check
+  document that points into this repository was re-derived at `b0ff57b`. **Remaining:** re-check
   those line numbers at the tag, and re-derive the step 1 and step 2 tables in `ops/safes.md`
   (leekzor/callhouse) §4, which are still at `27d502a`.
 - Site hosting at `callhouse.xyz`: the domain currently serves a registrar parking redirect,
@@ -1392,12 +1477,14 @@ facts:
 - Any Seaport audit specific to 1.4, 1.5 or 1.6 (none found); the OpenZeppelin review OpenSea's
   launch post mentions (no document found; not cited).
 - **Resolved:** the unit and invariant test counts and suite figures in §6 after the
-  2026-09-13 fee change were re-measured at `a4c38b0` (310 across 12 suites, §6).
+  2026-09-13 fixes were re-measured at `b0ff57b` (319 across 14 suites, §6; 310 across 12 at
+  `a4c38b0`, before them). The 21 fork tests passed on `6ed528f` per its commit message; they were
+  not re-run for this document.
 - The L-04 live 1-contract listing against Overcall's production validator (§7).
 - The Valorem engine fee status at engagement time (off as of the 2026-09-12 fork run).
 - The deployed addresses of `Vault`, `SeaportOrderLib` and `ValoremLib`, and the link targets in
   the deployed runtime (nothing is deployed yet).
-- What the 2026-09-13 deploy rehearsal (`docs/DEPLOY.md`, fork block 62201116) does not prove: the
+- What the 2026-09-13 deploy rehearsal (`docs/DEPLOY.md`, fork block 62212405 on `6ed528f`) does not prove: the
   Safe{Wallet} Transaction Builder UI importing the generated batch file (only its format and
   calldata were checked; the Safe contract executed the same calls); hardware-wallet signing and
   the Safe{Wallet} transaction service on 4663; Blockscout source verification through

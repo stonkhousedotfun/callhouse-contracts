@@ -53,7 +53,7 @@ and the strike proceeds went to the USDG ledger instead.
 | `assets`, `idleAssets()`, `lockedAssets()`, `reservedAssets` | asset base units, 18 dp | `1e18` = 1.0000 NVDA |
 | shares (`cNVDA`) | 18 dp | 1 share = 1 NVDA at launch |
 | `spotUsdg`, `strikeUsdg`, every premium | USDG base units, 6 dp | `226_000_000` = $226.00 |
-| `contracts` | whole lots | 1 contract covers exactly `lotSize` = `1e18` of asset |
+| `contracts` | whole lots | 1 contract covers exactly `lotSize` = `1e18` of asset; `rollOpen` refuses a cycle with any other lot |
 | every `*Bps` | basis points | `300` = 3% |
 | `accUsdgPerShare` | USDG per share, scaled `1e27` | see §4 |
 
@@ -160,29 +160,106 @@ While a call is open, redemptions are queued. The mechanics:
 queueRedeem(shares)      shares move into ESCROW on the vault.
                          The owner's free balance is simply balanceOf; there is no separate lock.
                          Their USDG is settled first, so they keep everything already earned.
+  debt[owner] += shares * accUsdgPerShare          the index these shares enter escrow at
+                                                   (summed if the owner queues again in the epoch)
 
 _settleQueue()           runs inside rollClose, AFTER the harvest.
   escrowUsdg  = the escrow's own accrual over the cycle  (belongs to the queuers, not the stayers)
+  epochIndex[epochId] = accUsdgPerShare            the index the epoch closed at
   payoutAsset = idleAssets() * queuedShares / totalSupply
   burn the escrowed shares
   record Epoch{sharesRemaining, assetsRemaining, usdgRemaining}
   reservedAssets += payoutAsset ;  usdgReservedForQueue += escrowUsdg
 
-completeRedeem(to)       draws the owner's share out of their epoch and pays it.
+completeRedeem(to)       settles the owner's entry out of their epoch (below) and pays it.
 ```
+
+`debt` is the private `_queueAccDebt`, `epochIndex` the private `_epochAccUsdgPerShare`. Neither is
+in the public ABI.
+
+### What each entry is paid
+
+An entry is settled out of its epoch by `_settleEpochEntry`, reached from `completeRedeem` or from
+`queueRedeem` flushing a stale slot (below). `previewCompleteRedeem` computes the same two figures
+through the same `_entryUsdg`, so the preview is what the payout will be.
+
+```
+_settleEpochEntry(owner)
+  assets  = ep.assetsRemaining * shares / ep.sharesRemaining                          pro rata
+  usdgOut = shares == ep.sharesRemaining
+              ? ep.usdgRemaining                                          last claimant: the rest
+              : min( (shares * epochIndex[e] - debt[owner]) / 1e27 ,  ep.usdgRemaining )
+  debt[owner] = 0
+  ep.assetsRemaining -= assets ; ep.usdgRemaining -= usdgOut ; ep.sharesRemaining -= shares
+  owedAssets[owner] += assets  ; owedQueueUsdg[owner] += usdgOut
+```
+
+**Why the two legs are split differently.** The asset leg is a snapshot: `payoutAsset` is fixed at
+settlement from `idleAssets()` at that moment, and every escrowed share has the same claim on it
+however long it sat in escrow, so dividing by shares is exact. The USDG leg is not a snapshot. The
+escrow is one account holding everyone's queued shares, and its accrual grows tranche by tranche,
+each time premium is indexed (every deposit or mint checkpoint, and the harvest at the close), on
+whatever the escrow held at that moment. Shares that entered escrow after a tranche was indexed did
+not earn it. `shares * epochIndex - debt` is exactly the index growth over the entry's own time in
+escrow, which is what those shares would have accrued as an ordinary balance. What they earned
+before queueing was already settled to the owner's `claimableUsdg` by `queueRedeem`.
+
+**Rounding, the cap and the last claimant.** Each entry's figure floors once over its own growth;
+the escrow's pot floors once per change in the escrow's balance, which happens at each `queueRedeem`.
+So the pot and the sum of the entries' floors can differ by a few base units either way. When the
+floors add up to more than the pot, `min(…, ep.usdgRemaining)` stops an entry from taking what is not
+there, and an entry that claims after the others have taken their full floors can be short of its own
+by those units. When they add up to less, the **last claimant** (whoever settles last in the epoch,
+in claim order, not queue order; the one whose `shares == ep.sharesRemaining`) takes
+`ep.usdgRemaining`, which absorbs every earlier floor. Either way the epoch pays out its pot to the
+base unit and never more. When the pot is exactly the escrow's accrual over the entries' shares, the
+last claimant's figure differs from its own index growth by fewer base units than there were
+`queueRedeem` calls into the epoch. Three things break that equality, and the difference lands on
+the last claims (a surplus entirely on the last claimant; a shortfall on it first, then on the
+claims just before it): the `_takeAccrued` clamp to `_usdgAvailableForHolders()` binding at
+settlement (the pot is smaller); a residual left in the escrow's accrual by that clamp at an earlier
+settlement (larger); and the accrual of shares transferred straight to the vault address, which
+have no debt entry (larger).
 
 ### Zero dust, by construction
 
-Each epoch tracks *remaining* shares, assets and USDG, and every claimant takes their proportion of
-what is **left**:
+Each epoch tracks *remaining* shares, assets and USDG, and every claimant is paid out of what is
+**left**. The final claimant has `shares == ep.sharesRemaining` and receives exactly the remainder
+of both legs, so nothing is stranded. Asserted with deliberately awkward amounts in
+`test_zeroDust_threeAwkwardClaimantsLeaveNothingBehind`, and with the per-entry USDG figures derived
+by hand in `test_twoQueuedRedeemersThroughAnAssignedWeek_leaveZeroDust`.
+
+### Worked example: an earlier queuer keeps her tranche
+
+From `test_earlierQueuerKeepsTheTrancheOnlyHerSharesEarned`. Alice and bob deposit 10 NVDA each; 10
+contracts are written and filled, and 19.00 USDG reaches the vault, not yet indexed.
 
 ```
-assets = ep.assetsRemaining * shares / ep.sharesRemaining
+alice queues 5e18                 debt[alice] = 5e18 * 0 = 0            escrow holds 5e18
+carol deposits 10e18              checkpoint: gross 19_000_000, fee 950_000, net 18_050_000
+                                  indexed over 20e18 supply: index 902_500e9
+                                    escrow (alice's 5e18)          4_512_500
+                                    alice's unqueued 5e18          4_512_500   claimableUsdg
+                                    bob's 10e18                    9_025_000   claimableUsdg
+bob queues 10e18                  debt[bob] = 10e18 * 902_500e9           escrow holds 15e18
+rollClose, out of the money       nothing more indexed; epoch pot 4_512_500, epochIndex 902_500e9
+
+bob settles first                 (10e18 * 902_500e9 - 10e18 * 902_500e9) / 1e27 = 0
+alice settles last                takes ep.usdgRemaining = 4_512_500
+                                  (her own figure: 5e18 * 902_500e9 / 1e27 = 4_512_500)
+every unit                        4_512_500 + 0 + 4_512_500 + 9_025_000 = 18_050_000
 ```
 
-The final claimant has `shares == ep.sharesRemaining`, so they receive exactly the remainder and
-nothing is stranded. Asserted with deliberately awkward amounts in
-`test_zeroDust_threeAwkwardClaimantsLeaveNothingBehind`.
+The assets split pro rata as before: the 15 NVDA settled for the epoch are 5 for alice and 10 for bob.
+Split pro rata by final shares, as the vault did before this repository's `6ed528f`, the same pot
+gave alice 1_504_166 and bob about 3_008_333: two thirds of it to shares that were not in escrow
+when it was indexed.
+The deliberate form, a newcomer depositing 30e18 after a fill (her own deposit being the checkpoint)
+and queueing all of it, took 6_768_750 of the 9_025_000 an earlier queuer's 10e18 had earned; it now
+takes 0 (`test_depositThenQueueTakesNoneOfAnEarlierQueuersPremium`). Found 2026-09-13 while writing
+this documentation; the other regressions are
+`test_trancheIndexedBetweenEntriesStaysWithTheEntryItAccruedTo` and the fuzz
+`testFuzz_eachEntryIsPaidItsOwnIndexGrowth`, all in `test/unit/VaultQueueFairness.t.sol`.
 
 ### Settling is not paying
 
@@ -203,8 +280,10 @@ first event and reserves on the second; watching only `CompleteRedeem` misreads 
 ### Fairness
 
 Queued shares keep earning premium right up to settlement, and that accrual is paid out **with the
-redemption** rather than left to the holders who stayed. After an assigned week the queue collects
-a **mix** of leftover NVDA and strike USDG — never a guarantee of the token back.
+redemption** rather than left to the holders who stayed. Each entry is paid only what was indexed
+while its own shares sat in escrow, never a slice of what earlier entries earned before it arrived
+(above). After an assigned week the queue collects a **mix** of leftover NVDA and strike USDG —
+never a guarantee of the token back.
 
 `reservedAssets` and `usdgReservedForQueue` are excluded from NAV, so a settled-but-uncollected
 redeemer neither dilutes nor is diluted by anyone else.
@@ -346,6 +425,12 @@ allowance at all (invariant 6), because they are the obligations that must be ba
 With `rollClose` passing 0 instead of the claim redemption to the harvest (the pre-2026-09-13 fee
 rule, §6), invariant 8 failed with a counterexample that shrinks to seven calls: mint shares, roll open
 (3 contracts), approve a listing, fill, exercise 1, warp, roll close.
+
+The per-entry USDG split of §5 changes no formula above: an entry's `usdgOut` is still drawn out of
+`ep.usdgRemaining` and capped by it, so invariants 2 and 6 hold as written. None of the eight checks
+that each entry received its own index growth. The handler queues and deposits, so that code runs
+in every run, but the figures are asserted only in `test/unit/VaultQueueFairness.t.sol` (three
+deterministic tests and a fuzz over three entries around two tranches).
 
 ---
 
