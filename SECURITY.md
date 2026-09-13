@@ -131,12 +131,12 @@ Tracked in `tasks.md` (leekzor/callhouse) "Open questions":
 
 ## 6. Reporting
 
-If you believe you have found a vulnerability, do not open a public issue. The disclosure
-address is published at `https://callhouse.finance/.well-known/security.txt` (RFC 9116) and on
+If you believe you have found a vulnerability, do not open a public issue. Send it to
+**security@callhouse.finance**. The same address is published, machine-readably, at
+`https://callhouse.finance/.well-known/security.txt` (RFC 9116) and on
 `https://callhouse.finance/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` from
-`lib/legal.ts` (leekzor/callhouse-site); until that variable is configured and the site rebuilt, no address is
-designated, `security.txt` returns 404 on purpose, and the legal page says so in words. Setting
-it is a launch step in `ops/launch-legal.md` (leekzor/callhouse).
+`lib/legal.ts` (leekzor/callhouse-site), which was set 2026-09-13; the mailbox is a Cloudflare
+Email Routing forward to the operator.
 
 A bug bounty with a dedicated disclosure channel opens in mainnet week 2 (`tasks.md` (leekzor/callhouse) E-07). Until
 then the contracts are unaudited and a report is a favour, not a claim.
