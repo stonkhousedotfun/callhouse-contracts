@@ -41,12 +41,14 @@ src/
 test/
   Base.t.sol                the shared fixture; mirrors the live NVDA market
   unit/                     per-surface suites
-  invariant/                stateful campaign, six invariants
+  invariant/                stateful campaign, eight invariants
   fork/                     against live chain 4663
 script/
   Deploy.s.sol              constructor args, with an on-chain preflight
-  Configure.s.sol           grant roles, optional policy override
-docs/                       AUDIT-SCOPE.md, ACCOUNTING.md
+  Configure.s.sol           Safe batch for the role grants (and optional policy override)
+  Verify.s.sol              read-only post-deploy check
+  rehearse-deploy.sh        the whole deploy on an anvil fork, with real Safes
+docs/                       AUDIT-SCOPE.md, ACCOUNTING.md, DEPLOY.md
 lib/                        forge-std, openzeppelin-contracts (git submodules)
 ```
 
@@ -153,12 +155,20 @@ generated copies in `indexer/` and `web/` (leekzor/callhouse). The keeper's
 the vault. Foundry does this automatically during `forge script`; to link manually pass
 `--libraries` once per library.
 
-```bash
-forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast \
-  --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
+The full runbook, rehearsed on a fork with real Safes, is **[`docs/DEPLOY.md`](docs/DEPLOY.md)**
+(`script/rehearse-deploy.sh` reproduces the rehearsal). In short:
 
-forge script script/Configure.s.sol --rpc-url $RH_RPC --broadcast
+```bash
+forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow \
+  --verify --verifier blockscout --verifier-url <bsproxy>/api        # admin role goes to the Safe only
+EXPECT_KEEPER_CONFIGURED=false forge script script/Verify.s.sol --rpc-url $RH_RPC
+forge script script/Configure.s.sol --rpc-url $RH_RPC                # writes a Safe batch; no broadcast
+#   import broadcast/configure-safe-batch.json in Safe{Wallet} Transaction Builder, decode, sign, execute
+forge script script/Verify.s.sol --rpc-url $RH_RPC
 ```
+
+The deployer never holds a role, so there is nothing to renounce. Every admin action, starting with
+the keeper and guardian grants, is a Safe transaction.
 
 `Deploy.s.sol` runs an on-chain preflight before broadcasting: it refuses to deploy against a
 registry whose `collateralToken`, `exerciseToken` or `clearinghouse` do not match, and it checks the

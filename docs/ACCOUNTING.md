@@ -288,30 +288,64 @@ Overcall's schema rejects a zero-amount consideration item. `Policy.minListableU
 
 ## 7. The invariants
 
-Asserted continuously by the stateful suite in `test/invariant/`.
+Asserted after every call of the stateful suite, `test/invariant/VaultInvariant.t.sol` (64 runs ×
+600 calls in the default profile). There are **eight** `invariant_*` functions; USDG solvency is
+split into an aggregate half and a per-holder half. Formulas below are what the code asserts, not a
+paraphrase of intent.
 
 ```
-1. asset conservation
+1. asset conservation                                  invariant_assetConservation
+   deposited >= withdrawn + assignedOut
    asset.balanceOf(vault) + lockedAssets()  ==  deposited - withdrawn - assignedOut
+   (ghosts built from what callers asked for and what the vault returned, never from its balance)
 
-2. USDG solvency
-   usdg.balanceOf(vault)  >=  sum(claimableUsdg) + usdgReservedForQueue
-                            + pendingFeeUsdg + usdgDust + usdgUnallocated
+2. USDG books balance (aggregate)                      invariant_usdgBooksBalance
+   usdgOwed() + usdgReservedForQueue + usdgDust + usdgUnallocated + pendingFeeUsdg
+       <=  usdg.balanceOf(vault) + maxIndexRoundingDrift
+   usdgAccounted <= usdg.balanceOf(vault)                                   (no allowance)
+   usdgReservedForQueue == sum(epoch.usdgRemaining) + sum(owedQueueUsdg)    (no allowance)
 
-3. reserves are real
+3. USDG holder solvency (per holder)                   invariant_usdgHolderSolvency
+   sum(claimableUsdg) + usdgReservedForQueue + usdgDust + usdgUnallocated + pendingFeeUsdg
+       <=  usdg.balanceOf(vault) + maxIndexRoundingDrift
+
+4. share accounting                                    invariant_shareAccounting
+   totalSupply() == sum of holder balances (escrow at the vault included)
+   balanceOf(optionBuyer) == 0
+   queuedShares == balanceOf(vault)
+
+5. no free shares                                      invariant_noFreeShares
+   totalSupply() > 0  =>  convertToAssets(totalSupply()) <= totalAssets()
+   sum(convertToAssets(holder balance)) + reservedAssets  <=  asset.balanceOf(vault) + lockedAssets()
+
+6. reserves are real                                   invariant_reservesAreReal
    reservedAssets <= asset.balanceOf(vault)
    usdgReservedForQueue <= usdg.balanceOf(vault)
+   usdgReservedForQueue + pendingFeeUsdg <= usdg.balanceOf(vault)
+   reservedAssets == sum(epoch.assetsRemaining) + sum(owedAssets)
+   contractsAssigned() <= contractsWritten
+   lockedAssets() == (contractsWritten - contractsAssigned()) * 1e18
 
-4. share accounting
-   totalSupply() == sum over holders + the escrow balance at the vault
-
-5. no free shares
-   totalSupply() > 0  =>  convertToAssets(totalSupply()) <= totalAssets()
-
-6. phase sanity
+7. phase sanity                                        invariant_phaseSanity
    contractsWritten > 0  =>  phase != Idle
-   phase == Idle         =>  claimKey == 0
+   phase == Idle         =>  claimKey == 0, lockedAssets() == 0, canRedeemInstantly()
+   phase != Settling     (Settling is entered and left inside one rollClose)
+
+8. the fee never touches strike proceeds               invariant_feeNeverTouchesStrikeProceeds
+   protocolFeeBps == Policy.launchDefaults().protocolFeeBps   (one rate per run; pinned)
+   (usdg.balanceOf(feeRecipient) + pendingFeeUsdg) * 10_000  <=  premiumToVault * protocolFeeBps
+   (premiumToVault is a ghost measured as the vault's USDG balance change on every successful fill)
 ```
+
+`maxIndexRoundingDrift` is not slack. The index floors once per distribution while an account's
+pending accrual floors once over its combined delta, so holders can be promised a base unit per
+account per distribution more than was credited (§4). The handler bounds that exactly, and the run
+is refused if it ever reaches a dollar. The queue reserve and the pending fee are asserted with no
+allowance at all (invariant 6), because they are the obligations that must be backed to the unit.
+
+With `rollClose` passing 0 instead of the claim redemption to the harvest (the pre-2026-09-13 fee
+rule, §6), invariant 8 failed with a counterexample that shrinks to seven calls: mint shares, roll open
+(3 contracts), approve a listing, fill, exercise 1, warp, roll close.
 
 ---
 
