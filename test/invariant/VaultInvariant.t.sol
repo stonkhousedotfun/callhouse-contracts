@@ -1810,9 +1810,13 @@ contract VaultInvariantTest is BaseTest {
         assertEq(bOut, 918_181_818_181_818_188, "bob's pro-rata slice");
         assertEq(cOut, 3, "carol, last, takes exactly what is left");
         assertEq(aOut + bOut + cOut, 5_509_090_909_090_909_100, "the epoch paid out every base unit");
-        assertEq(aUsdg, 96_715_226, "alice's slice of the escrow accrual");
-        assertEq(bUsdg, 19_343_045, "bob's slice");
-        assertEq(cUsdg, 1, "carol's three wei of shares still earn one base unit");
+        // USDG is paid per entry by the index growth each entry's shares sat through in escrow
+        // (all three queued at index 0, settled at 19_343_045_454_545_454): floor(shares * index / 1e27).
+        // alice 96_715_227.27 -> 96_715_227; bob 19_343_045.59 -> 19_343_045; carol, last, takes the
+        // remainder 116_058_272 - 96_715_227 - 19_343_045 = 0, which is also her own floor (0.058).
+        assertEq(aUsdg, 96_715_227, "alice: floor of her shares' index growth");
+        assertEq(bUsdg, 19_343_045, "bob: floor of his shares' index growth");
+        assertEq(cUsdg, 0, "carol's three wei of shares earned 0.058 of a base unit, and the remainder is 0");
         assertEq(aUsdg + bUsdg + cUsdg, reservedUsdg, "and every base unit of the escrow's USDG");
 
         // ZERO DUST: nothing is stranded in the epoch or in the reserves.

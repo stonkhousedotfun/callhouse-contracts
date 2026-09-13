@@ -572,8 +572,11 @@ contract VaultAssignmentTest is BaseTest {
     ///           would strand if the last claimant were not given the balance)
     ///        index        floor(2_328_050_000 * 1e27 / 30e18) = 77_601_666_666_666_666
     ///        epoch USDG   floor(Q * index / 1e27)      =         862_240_741
-    ///          alice 7/10 -> floor(862_240_741*7/10)   =         603_568_518
-    ///          bob        -> takes the remainder       =         258_672_223  (floor 258_672_222)
+    ///          USDG is paid per entry by index growth, not pro rata (both queued at index 0):
+    ///          alice      -> floor(7k * index / 1e27)  =         603_568_519
+    ///          bob, last  -> takes the remainder       =         258_672_222  (= his own floor)
+    ///          The NVDA leg is still pro rata and still shows the one-wei strand the last-claimant
+    ///          rule prevents; on the USDG leg the per-entry floors already sum to the pot here.
     function test_twoQueuedRedeemersThroughAnAssignedWeek_leaveZeroDust() public {
         _deposit(alice, 20e18);
         _deposit(bob, 10e18);
@@ -605,22 +608,25 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(assetsRem, epochAssets, "and the assets");
         assertEq(usdgRem, epochUsdg, "and the USDG");
 
-        // First claimant: strict floor of the proportional share.
+        // First claimant: strict floor of the proportional share of NVDA, and exactly the index
+        // growth its own shares earned in escrow for USDG.
         vm.prank(alice);
         (uint256 aliceAssets, uint256 aliceUsdg) = vault.completeRedeem(alice);
         assertEq(aliceAssets, 5_185_185_189_851_851_851, "floor(epochAssets * 7/10)");
-        assertEq(aliceUsdg, 603_568_518, "floor(epochUsdg * 7/10)");
+        assertEq(aliceUsdg, 603_568_519, "floor(aliceQ * index / 1e27): what her shares earned");
 
-        // Last claimant: takes exactly what remains, which is one unit MORE than her own
-        // proportional floor on both legs. That one unit is the dust that never strands.
+        // Last claimant: takes exactly what remains of both legs. On NVDA that is one wei more than
+        // his proportional floor — the dust that never strands. On USDG it equals his own index
+        // growth, because the per-entry floors already sum to the pot.
         uint256 bobAssetsFloor = (epochAssets * bobQ) / (aliceQ + bobQ);
         uint256 bobUsdgFloor = (epochUsdg * bobQ) / (aliceQ + bobQ);
         vm.prank(bob);
         (uint256 bobAssets, uint256 bobUsdg) = vault.completeRedeem(bob);
         assertEq(bobAssets, 2_222_222_224_222_222_222, "the balance, not the floor");
-        assertEq(bobUsdg, 258_672_223, "the balance, not the floor");
+        assertEq(bobUsdg, 258_672_222, "the balance of the epoch");
         assertEq(bobAssets - bobAssetsFloor, 1, "exactly one wei of NVDA would otherwise strand");
-        assertEq(bobUsdg - bobUsdgFloor, 1, "exactly one base unit of USDG would otherwise strand");
+        assertEq(bobUsdg, (bobQ * vault.accUsdgPerShare()) / 1e27, "bob's remainder equals his own index growth");
+        assertLe(bobUsdgFloor, bobUsdg, "and is never less than the old pro-rata floor");
 
         // Conservation: the epoch is drained to nothing.
         assertEq(aliceAssets + bobAssets, epochAssets, "assets conserved exactly");

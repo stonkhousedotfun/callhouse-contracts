@@ -174,6 +174,22 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice USDG base units settled out of an epoch and waiting to be collected.
     mapping(address => uint256) public owedQueueUsdg;
 
+    /// @dev Per-account sum of `shares * accUsdgPerShare` over the account's queue entries in its
+    ///      current epoch, taken at the moment each entry was escrowed (the reward debt).
+    ///
+    ///      WHY THIS EXISTS. The escrow's USDG accrual is one pot, but it is earned tranche by
+    ///      tranche on whatever the escrow held when each tranche was indexed. Splitting the pot pro
+    ///      rata by final shares let a later queuer take part of what an earlier queuer's shares
+    ///      earned before the later shares arrived: a deposit that indexed premium between two queue
+    ///      entries moved a third of the earlier queuer's week to the later one, and a newcomer who
+    ///      deposited (indexing the premium) and queued could take most of it on purpose. Each entry
+    ///      now receives exactly `shares * epochIndex - debt`, the index growth its own shares sat
+    ///      through in escrow.
+    mapping(address => uint256) private _queueAccDebt;
+
+    /// @dev `accUsdgPerShare` at the moment each epoch settled.
+    mapping(uint256 => uint256) private _epochAccUsdgPerShare;
+
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -569,8 +585,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         queuedSharesOf[msg.sender] += shares;
         queuedShares += shares;
 
-        // Settle before escrowing so the depositor keeps every cent already earned.
+        // Settle before escrowing so the depositor keeps every cent already earned, and record the
+        // index these shares enter escrow at: they earn only what is indexed from here on.
         _settleAccount(msg.sender);
+        _queueAccDebt[msg.sender] += shares * accUsdgPerShare;
         _transfer(msg.sender, address(this), shares);
 
         emit QueueRedeem(msg.sender, shares, queuedEpoch);
@@ -613,11 +631,14 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
 
         Epoch storage ep = epochs[e];
 
-        // Draw down the epoch's remaining balances proportionally. The final claimant has
-        // `shares == ep.sharesRemaining`, so they receive exactly what is left and the
-        // division leaves nothing stranded.
+        // Assets draw down proportionally: every escrowed share is worth the same slice of the
+        // settled book. USDG does not, because shares escrowed at different index values earned
+        // different amounts; see `_queueAccDebt`. The final claimant has
+        // `shares == ep.sharesRemaining` and takes exactly what is left of both, so rounding never
+        // strands a unit.
         uint256 assets = (ep.assetsRemaining * shares) / ep.sharesRemaining;
-        uint256 usdgOut = (ep.usdgRemaining * shares) / ep.sharesRemaining;
+        uint256 usdgOut = _entryUsdg(owner, e, shares, ep);
+        _queueAccDebt[owner] = 0;
 
         ep.assetsRemaining -= assets;
         ep.usdgRemaining -= usdgOut;
@@ -662,7 +683,17 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         Epoch storage ep = epochs[e];
         if (ep.sharesRemaining == 0) return (assets, usdgOut);
         assets += (ep.assetsRemaining * shares) / ep.sharesRemaining;
-        usdgOut += (ep.usdgRemaining * shares) / ep.sharesRemaining;
+        usdgOut += _entryUsdg(owner, e, shares, ep);
+    }
+
+    /// @dev USDG owed to `owner`'s entry of `shares` in settled epoch `e`: the index growth those
+    ///      shares sat through in escrow, capped at what the epoch still holds. The last claimant
+    ///      takes the remainder, which absorbs the floor rounding of every earlier entry and of the
+    ///      escrow's own accrual.
+    function _entryUsdg(address owner, uint256 e, uint256 shares, Epoch storage ep) private view returns (uint256) {
+        if (shares == ep.sharesRemaining) return ep.usdgRemaining;
+        uint256 earned = (shares * _epochAccUsdgPerShare[e] - _queueAccDebt[owner]) / ACC_PRECISION;
+        return earned < ep.usdgRemaining ? earned : ep.usdgRemaining;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -886,8 +917,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         uint256 q = queuedShares;
         if (q == 0) return;
 
-        // The escrow's own accrual over the cycle belongs to the people who queued.
+        // The escrow's own accrual over the cycle belongs to the people who queued, each entry
+        // according to the index it entered at (`_entryUsdg`).
         uint256 escrowUsdg = _takeAccrued(address(this));
+        _epochAccUsdgPerShare[epochId] = accUsdgPerShare;
 
         uint256 supply = totalSupply();
         uint256 payoutAssets = supply == 0 ? 0 : (idleAssets() * q) / supply;

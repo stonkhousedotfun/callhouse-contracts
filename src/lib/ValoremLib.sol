@@ -53,6 +53,12 @@ library ValoremLib {
         if (o.underlyingAsset != address(asset)) revert OptionAssetMismatch(address(asset), o.underlyingAsset);
         if (o.exerciseAsset != exerciseAsset) revert OptionExerciseAssetMismatch(exerciseAsset, o.exerciseAsset);
         if (o.underlyingAmount != cyc.lotSize) revert UnexpectedLotSize(cyc.lotSize, o.underlyingAmount);
+        // The vault prices everything per ONE token: the OTM band compares the per-contract strike
+        // with per-1e18 spot, the premium floor is per 1e18, and utilisation divides idle by 1e18
+        // (Policy.LOT). The registry owner can change `lotSize` between cycles, and a contract of
+        // more than one token would make an in-the-money strike look out of the money and lock more
+        // collateral than utilisation allows. Refuse any lot other than exactly one token.
+        if (cyc.lotSize != 1e18) revert UnexpectedLotSize(1e18, cyc.lotSize);
 
         // The option's own window must be exactly the cycle's. The deployed registry enforces
         // this in `setCycle`, but the vault must not DEPEND on a third party having done so: the
