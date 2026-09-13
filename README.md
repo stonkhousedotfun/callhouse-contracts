@@ -48,7 +48,7 @@ forge fmt --check                                     # CI gate
 forge build --sizes                                   # watch the EIP-170 margin
 ```
 
-Current state: **328 unit and invariant tests, 21 fork tests, all passing**.
+Current state: **307 unit and invariant tests across 12 suites, 21 fork tests, all passing**.
 
 ---
 
@@ -114,8 +114,9 @@ so `forge verify-contract` works.
 | `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites`, `cancelListing`, `invalidateAllListings` |
 | anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `sweepFee` whenever a fee is pending |
 
-A halt blocks `rollOpen` **only**. `queueRedeem`, `completeRedeem`, `claimUsdg`, `cancelListing`,
-`lockBook` and `rollClose` all keep working, because a halt must never trap a depositor.
+A halt blocks `rollOpen` and `approveListing` **only**. `queueRedeem`, `completeRedeem`,
+`claimUsdg`, `cancelListing`, `lockBook` and `rollClose` all keep working, because a halt must
+never trap a depositor.
 
 Deposits close on the cycle's exercise **timestamp**, whether or not anyone calls `lockBook`:
 after it, `deposit`/`mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0.
