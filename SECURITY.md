@@ -132,8 +132,8 @@ Tracked in `tasks.md` (leekzor/callhouse) "Open questions":
 ## 6. Reporting
 
 If you believe you have found a vulnerability, do not open a public issue. The disclosure
-address is published at `https://callhouse.xyz/.well-known/security.txt` (RFC 9116) and on
-`https://callhouse.xyz/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` from
+address is published at `https://callhouse.finance/.well-known/security.txt` (RFC 9116) and on
+`https://callhouse.finance/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` from
 `lib/legal.ts` (leekzor/callhouse-site); until that variable is configured and the site rebuilt, no address is
 designated, `security.txt` returns 404 on purpose, and the legal page says so in words. Setting
 it is a launch step in `ops/launch-legal.md` (leekzor/callhouse).

@@ -62,7 +62,7 @@ dependencies, §3.5, P-01, P-07, P-25, P-26, §5 A.6, §7, Appendix A item 1, Ap
 line numbers re-derived against that working tree; every other `Vault.sol`/`Policy.sol` line
 number past those points is still at `27d502a` and is off by that shift until the tag.
 
-**Contact.** To be confirmed at kickoff. The site is not yet deployed at `callhouse.xyz`: as of
+**Contact.** To be confirmed at kickoff. The site is not yet deployed at `callhouse.finance`: as of
 2026-09-13 the domain serves a registrar parking redirect (`/.well-known/security.txt` answers
 HTTP 200 with an HTML `window.location.href="/lander"` stub, and `/lander` is a GoDaddy
 "for sale" page), so nothing there is the Next route and there is no RFC 9116 endpoint at all
@@ -1270,7 +1270,7 @@ facts:
   item 8); rewrite the `IValoremClear.sol` header so it no longer refers to `lib/clear`,
   `script/lib/ValoremDeployer.sol` or `src/vendor/ValoremArtifacts.sol` (Appendix A item 9);
   re-derive every line number in this document and in `ops/safes.md` (leekzor/callhouse) §4 at the tag.
-- Site hosting at `callhouse.xyz`: the domain currently serves a registrar parking redirect,
+- Site hosting at `callhouse.finance`: the domain currently serves a registrar parking redirect,
   not the site build (leekzor/callhouse-site), so the RFC 9116 path does not exist yet (§1).
 - The public disclosure address (`NEXT_PUBLIC_SECURITY_CONTACT_EMAIL`, `tasks.md` (leekzor/callhouse) L-05) and the
   path where the final report will be published in the repository (§9).

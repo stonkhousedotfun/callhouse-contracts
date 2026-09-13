@@ -213,5 +213,5 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 
 | Repository | What it is | Relationship |
 |---|---|---|
-| leekzor/callhouse | the app: keeper, indexer, web (app.callhouse.xyz), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
-| leekzor/callhouse-site | the marketing landing, callhouse.xyz | none on the code path; publishes the security contact and the unaudited disclosure |
+| leekzor/callhouse | the app: keeper, indexer, web (app.callhouse.finance), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
+| leekzor/callhouse-site | the marketing landing, callhouse.finance | none on the code path; publishes the security contact and the unaudited disclosure |
