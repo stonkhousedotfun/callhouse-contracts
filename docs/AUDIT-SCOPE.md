@@ -85,13 +85,12 @@ changes in `queueRedeem`, `_settleEpochEntry`, `previewCompleteRedeem` and `_set
 deploy rehearsal re-run on `6ed528f` (`docs/DEPLOY.md` only). Every line number into `src/`, `test/`,
 `script/` and this repository's `README.md` was re-derived at `b0ff57b`.
 
-**Contact.** To be confirmed at kickoff. The site is not yet deployed at `callhouse.finance`: as of
-2026-09-13 the domain serves a registrar parking redirect (`/.well-known/security.txt` answers
-HTTP 200 with an HTML `window.location.href="/lander"` stub, and `/lander` is a GoDaddy
-"for sale" page), so nothing there is the Next route and there is no RFC 9116 endpoint at all
-until deployment. Once hosted, the route handler `app/.well-known/security.txt/route.ts` (leekzor/callhouse-site)
-(L36–41) returns 404 on purpose until `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` is set and the site
-rebuilt (`tasks.md` (leekzor/callhouse) L-05; SECURITY.md §6 describes the same gap). The engagement uses a direct
+**Contact.** To be confirmed at kickoff. The product domain is `callhouse.finance` (it replaced
+`callhouse.xyz`, which is not ours and serves a registrar parking page). As of 2026-09-13 the site
+(leekzor/callhouse-site) is deployed on Railway, `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` is set to
+`security@callhouse.finance` (a Cloudflare Email Routing forward), and `/.well-known/security.txt`
+returns 200 with that contact on the Railway domain; the `callhouse.finance` DNS records were
+created the same day and TLS issuance follows (SECURITY.md §6). The engagement uses a direct
 channel agreed at kickoff, not that route.
 
 **Access.** The repository is `callhouse-contracts` (this tree), delivered as read access to the GitHub
@@ -1456,8 +1455,8 @@ facts:
   document that points into this repository was re-derived at `b0ff57b`. **Remaining:** re-check
   those line numbers at the tag, and re-derive the step 1 and step 2 tables in `ops/safes.md`
   (leekzor/callhouse) §4, which are still at `27d502a`.
-- Site hosting at `callhouse.xyz`: the domain currently serves a registrar parking redirect,
-  not the site build (leekzor/callhouse-site), so the RFC 9116 path does not exist yet (§1).
+- Site hosting at `callhouse.finance`: deployed on Railway and the DNS records created on
+  2026-09-13; confirm the custom domain serves the site with a valid certificate (§1).
 - The public disclosure address (`NEXT_PUBLIC_SECURITY_CONTACT_EMAIL`, `tasks.md` (leekzor/callhouse) L-05) and the
   path where the final report will be published in the repository (§9).
 - Whether Zellic's August 2023 patch review covers the whole `ed53af23 → fe39eb73` delta of

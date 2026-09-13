@@ -83,7 +83,7 @@ FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
 profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
 verbosity.
 
-Current state: **310 unit and invariant tests across 12 suites, 21 fork tests, all passing**.
+Current state: **319 unit and invariant tests across 14 suites, 21 fork tests, all passing**.
 
 ### CI, and why the local gate is the gate
 
@@ -98,8 +98,8 @@ that is fixed CI proves nothing, and the gate is the four commands above run loc
 
 ## Four things that will bite you
 
-**1. `Vault` has about 1.15 KB of headroom** under the EIP-170 24,576-byte runtime limit (23,426 B
-used, 1,150 B margin). via-IR is already on and BOTH `SeaportOrderLib` and `ValoremLib` are
+**1. `Vault` has about 0.96 KB of headroom** under the EIP-170 24,576-byte runtime limit (23,618 B
+used, 958 B margin, after the 2026-09-13 queue-fairness fix). via-IR is already on and BOTH `SeaportOrderLib` and `ValoremLib` are
 already extracted — the second extraction paid for the deposit-gate and cycle-window checks from
 the 2026-09-12 review. Optimiser runs were measured from 1 to 200 and move the figure by under
 200 bytes, so if you run out of room the answer is another library extraction, not another
