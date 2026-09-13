@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  contracts:
+    name: contracts (build + unit + invariant)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: recursive}
+      - uses: foundry-rs/foundry-toolchain@v1
+        with: {version: stable}
+      - name: forge fmt --check
+        run: forge fmt --check
+      - name: forge build --sizes
+        run: forge build --sizes
+      - name: unit + invariant tests
+        run: forge test -vvv --no-match-path 'test/fork/*'
+      - name: coverage summary
+        run: forge coverage --no-match-path 'test/fork/*' --report summary || true
+
+  contracts-fork:
+    name: contracts (fork 4663)
+    runs-on: ubuntu-latest
+    # Fork tests need a live RPC. They are the gate for M2 but must not block a PR
+    # when the RPC secret is absent (forks of this repo).
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: recursive}
+      - uses: foundry-rs/foundry-toolchain@v1
+        with: {version: stable}
+      - name: fork tests
+        env:
+          RH_RPC: ${{ secrets.RH_RPC || 'https://rpc.mainnet.chain.robinhood.com' }}
+        run: FOUNDRY_PROFILE=fork forge test --fork-url "$RH_RPC" -vvv

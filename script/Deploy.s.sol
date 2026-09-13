@@ -11,7 +11,7 @@ import {IChainlinkFeed} from "../src/interfaces/IChainlinkFeed.sol";
 import {ISeaport} from "../src/interfaces/ISeaport.sol";
 
 /// @notice Deploys one Callhouse vault.
-/// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/.
+/// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/ (leekzor/callhouse).
 ///      Run with:
 ///        forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast \
 ///          --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
@@ -31,7 +31,7 @@ contract DeployVault is Script {
 
     /// @dev The NVDA market registry. NOT the top-level `registry` key in Overcall's frontend
     ///      config — that one is the JUGGERNAUT market and wiring it here would collateralise
-    ///      calls with the wrong token. See ops/recon/R1-overcall-registry.md.
+    ///      calls with the wrong token. See ops/recon/R1-overcall-registry.md (leekzor/callhouse).
     address internal constant REGISTRY_NVDA = 0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA;
 
     /// @dev Overcall's premium fee recipient, taken from a real filled order's second
@@ -46,10 +46,10 @@ contract DeployVault is Script {
     address internal constant SEAPORT_ZONE = address(0);
 
     /// @dev Four days. The NVDA feed is `us_equities_24/5` and stops all weekend; a tighter
-    ///      window would block every Saturday and Sunday write. See ops/recon/R5-price-feed.md.
+    ///      window would block every Saturday and Sunday write. See ops/recon/R5-price-feed.md (leekzor/callhouse).
     uint32 internal constant MAX_PRICE_AGE = 4 days;
 
-    /// @dev README "Policy (launch)": start at 20 NVDA, not a TVL race.
+    /// @dev README (leekzor/callhouse) "Policy (launch)": start at 20 NVDA, not a TVL race.
     uint256 internal constant LAUNCH_DEPOSIT_CAP = 20e18;
 
     function run() external returns (Vault vault) {

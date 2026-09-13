@@ -1,10 +1,27 @@
-# contracts
+# callhouse-contracts
 
 The Callhouse vault. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
 
-See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) for how this fits with the keeper, indexer
-and web app, and [`../docs/ACCOUNTING.md`](../docs/ACCOUNTING.md) for the money maths. Read the
-accounting doc before changing anything in `src/`.
+One non-upgradeable vault on Robinhood Chain (chain id 4663) that runs a weekly covered call on
+the NVDA Stock Token: depositors put in NVDA and receive `cNVDA` shares, the vault writes
+out-of-the-money calls on Valorem Clear and sells them through Seaport 1.6 on Overcall's order
+book, and the USDG premium accrues to holders through a per-share index. The protocol fee is 5%
+of premium only; strike proceeds from an assignment are credited to holders fee-free. Nothing is
+deployed yet, and the contracts are unaudited.
+
+This repository is the audit target. The app (keeper, indexer, web, ops) lives in
+leekzor/callhouse and mounts this repository as a git submodule at `contracts/`.
+
+| Document | What it is |
+|---|---|
+| [`docs/AUDIT-SCOPE.md`](docs/AUDIT-SCOPE.md) | the audit scope: what is in and out, the properties to break, the areas of concern, build instructions. Auditors start here |
+| [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) | the money maths: two ledgers, the accrual index, the redeem queue, fees. Read it before changing anything in `src/` |
+| [`SECURITY.md`](SECURITY.md) | the threat model, the properties enforced in bytecode, the 2026-09-12 internal review, reporting |
+
+Paths in this repository's docs resolve from its root. A path followed by (leekzor/callhouse)
+lives in the app repository and resolves from that repository's root; a marker after a list
+applies to the whole list. For how the vault fits with the keeper, indexer and web app, see
+`docs/ARCHITECTURE.md` (leekzor/callhouse).
 
 ---
 
@@ -29,6 +46,8 @@ test/
 script/
   Deploy.s.sol              constructor args, with an on-chain preflight
   Configure.s.sol           grant roles, optional policy override
+docs/                       AUDIT-SCOPE.md, ACCOUNTING.md
+lib/                        forge-std, openzeppelin-contracts (git submodules)
 ```
 
 `Distributor`, `AdapterValorem` and `AdapterSeaport` are **abstract bases the vault inherits**, not
@@ -38,27 +57,49 @@ vault's own context.
 
 ---
 
-## Running the tests
+## Building and running the tests
+
+Everything runs from the repository root. The submodules are required; nothing builds without
+them.
 
 ```bash
-forge test                                            # unit + invariant, mocks only
+git clone --recurse-submodules git@github.com:leekzor/callhouse-contracts.git
+# or, in an existing checkout:
+git submodule update --init --recursive
+
+forge fmt --check                                     # format gate
+forge build --sizes                                   # watch the EIP-170 margin
+rm -rf cache/invariant                                # after any behaviour change (see 4 below)
+forge test --no-match-path 'test/fork/*'              # unit + invariant, mocks only
 forge test --match-path 'test/unit/VaultQueue.t.sol'  # one suite
 FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
-forge fmt --check                                     # CI gate
-forge build --sizes                                   # watch the EIP-170 margin
 ```
 
-Current state: **307 unit and invariant tests across 12 suites, 21 fork tests, all passing**.
+`RH_RPC` can be the public endpoint, `https://rpc.mainnet.chain.robinhood.com`. The `fork`
+profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
+verbosity.
+
+Current state: **310 unit and invariant tests across 12 suites, 21 fork tests, all passing**.
+
+### CI, and why the local gate is the gate
+
+`.github/workflows/ci.yml` runs two jobs: build, format, unit and invariant tests (with a
+non-blocking coverage summary), and the fork tests against chain 4663, using the `RH_RPC` secret
+when it is set and the public endpoint otherwise. Every GitHub Actions run on the leekzor account
+currently dies with `startup_failure` at the account level (billing), before any step runs. Until
+that is fixed CI proves nothing, and the gate is the four commands above run locally:
+`forge fmt --check`, `forge build --sizes`, the unit and invariant suite, and the fork suite.
 
 ---
 
 ## Four things that will bite you
 
-**1. `Vault` has about 1.4 KB of headroom** under the EIP-170 24,576-byte runtime limit (23,142 B
-used). via-IR is already on and BOTH `SeaportOrderLib` and `ValoremLib` are already extracted —
-the second extraction paid for the deposit-gate and cycle-window checks from the 2026-09-12
-review. Optimiser runs were measured from 1 to 200 and move the figure by under 200 bytes, so if
-you run out of room the answer is another library extraction, not another setting.
+**1. `Vault` has about 1.15 KB of headroom** under the EIP-170 24,576-byte runtime limit (23,426 B
+used, 1,150 B margin). via-IR is already on and BOTH `SeaportOrderLib` and `ValoremLib` are
+already extracted — the second extraction paid for the deposit-gate and cycle-window checks from
+the 2026-09-12 review. Optimiser runs were measured from 1 to 200 and move the figure by under
+200 bytes, so if you run out of room the answer is another library extraction, not another
+setting.
 
 **2. The test tree is near solc's tag-space limit.** Each unit suite deploys the whole fixture and
 compiles to roughly 100–122 KB of deployed bytecode. With via-IR on, adding another fixture-heavy
@@ -77,6 +118,32 @@ into a local first. This has caused eight false failures in this repo already.
 
 **4. Clear `cache/invariant` after changing contract behaviour.** Foundry replays persisted
 counterexamples, and a stale one surfaces as a mystery failure in an unrelated test.
+
+---
+
+## After a contract change: the ABI flow
+
+ABIs flow one way: this repository's `out/` → `ops/abis/Vault.json` (leekzor/callhouse) → the
+generated copies in `indexer/` and `web/` (leekzor/callhouse). The keeper's
+`keeper/src/abi.ts` (leekzor/callhouse) is hand-transcribed, and a keeper test checks it against
+`contracts/out` (leekzor/callhouse) when the artefacts are present.
+
+1. Here: make the change, run the full local gate, `forge build`, commit.
+2. In leekzor/callhouse, bump the submodule pin and rebuild the artefacts there (`out/` is not
+   committed):
+
+   ```bash
+   git -C contracts fetch && git -C contracts checkout <commit>
+   (cd contracts && forge build)
+   jq --indent 1 '.abi' contracts/out/Vault.sol/Vault.json > ops/abis/Vault.json
+   (cd indexer && pnpm gen:abis)
+   (cd web && pnpm gen:abis)
+   git add contracts ops/abis indexer web
+   ```
+
+   `jq --indent 1` reproduces the committed file byte for byte. If the change touches
+   `SeaportOrderLib` or `Policy`, refresh `ops/abis/SeaportOrderLib.json` and `ops/abis/Policy.json`
+   (leekzor/callhouse) the same way.
 
 ---
 
@@ -100,8 +167,8 @@ a top-level `registry` key that is the **JUGGERNAUT** market, not NVDA, and wiri
 collateralise NVDA calls with the wrong token.
 
 Blockscout for chain 4663 sits behind a Cloudflare challenge that keys on the **absence** of a
-`Referer` header, which `forge` never sends. `ops/bsproxy.js` is a tiny local proxy that injects one
-so `forge verify-contract` works.
+`Referer` header, which `forge` never sends. `ops/bsproxy.js` (leekzor/callhouse) is a tiny local
+proxy that injects one so `forge verify-contract` works.
 
 ---
 
@@ -122,7 +189,7 @@ Deposits close on the cycle's exercise **timestamp**, whether or not anyone call
 after it, `deposit`/`mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0.
 Assignment collapses NAV mid-transaction with no callback, so minting against the gap has to be
 impossible — that was the critical finding of the 2026-09-12 review, written up in
-[`../SECURITY.md`](../SECURITY.md).
+[`SECURITY.md`](SECURITY.md).
 
 ## Hard caps, compiled in
 
@@ -139,3 +206,12 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 | `maxPriceAge` | 4 days | 1 hour to 7 days |
 | listings per cycle | 3 | constant |
 | cycle tenor | 7 days (Overcall's) | **ceiling 21 days**, `MAX_CYCLE_TENOR` — a bad cycle from the registry EOA skips a week, it cannot lock collateral for years |
+
+---
+
+## Sibling repos
+
+| Repository | What it is | Relationship |
+|---|---|---|
+| leekzor/callhouse | the app: keeper, indexer, web (app.callhouse.xyz), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
+| leekzor/callhouse-site | the marketing landing, callhouse.xyz | none on the code path; publishes the security contact and the unaudited disclosure |

@@ -237,7 +237,7 @@ contract PolicyTest is Test {
 
     /// @dev The exact rounding Overcall's client uses. A unit price whose 5% does not divide
     ///      evenly must still produce per-contract-rounded amounts, or Seaport rejects the
-    ///      partial fill with InexactFraction. See ops/recon/R3-overcall-api.md.
+    ///      partial fill with InexactFraction. See ops/recon/R3-overcall-api.md (leekzor/callhouse).
     function test_splitPremium_roundsPerContractNotOnTotal() public view {
         // unit price 1_000_019: 5% is 50_000.95, which floors to 50_000 PER CONTRACT.
         (uint256 toVault, uint256 toOvercall, uint256 gross) = h.splitPremium(1_000_019, 3);
