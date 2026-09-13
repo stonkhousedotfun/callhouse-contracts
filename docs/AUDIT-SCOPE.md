@@ -40,11 +40,12 @@ Nothing is deployed to mainnet. Every `chains.4663.ours.*` entry in `ops/address
    `AdapterSeaport`), the two `public` libraries linked into it and reached by `DELEGATECALL`
    (`ValoremLib`, `SeaportOrderLib`), and the `internal` library that holds the compiled-in caps
    (`Policy`). 1,190 nSLOC. The properties we want attacked are in §5.
-2. A configuration review of `script/Deploy.s.sol`, `script/Configure.s.sol` and
-   `script/Verify.s.sol`, of the runbook `docs/DEPLOY.md`, and of the role topology in
-   `ops/safes.md` (leekzor/callhouse): the constants, the preflight, what the deployer holds
-   (nothing, from the constructor on; there is no renounce step, §3 "Scripts"), and whether any
-   key can reach a token.
+2. A configuration review of `script/Deploy.s.sol`, `script/Configure.s.sol`,
+   `script/HandoverAdmin.s.sol` and `script/Verify.s.sol`, of the runbook `docs/DEPLOY.md`, and of
+   the role topology in `ops/safes.md` (leekzor/callhouse): the constants, the preflight, the
+   bootstrap admin phase (the deployer key is `DEFAULT_ADMIN_ROLE` at launch and hands over to the
+   Safe later, §3 "Scripts"), the handover's safety conditions, and whether any key can reach a
+   token.
 3. A written verdict on each integration assumption we make about the third-party contracts we
    do not ask you to audit (§4). The contracts are theirs; the assumptions are ours.
 
@@ -66,8 +67,12 @@ assignment are never fee'd; see §3.1, P-26, §7), touching `Vault.sol` (`rollCl
 the tests; `1187277`, the standalone-repository migration (comment-only path markers in
 `script/Deploy.s.sol` and `test/unit/Policy.t.sol`); `6023a96`, comment and dead-constant
 housekeeping in `Vault.sol`, `Policy.sol`, `IValoremClear.sol` and `Deploy.s.sol` with identical
-runtime sizes (Appendix A items 6 and 8–11); and `a4c38b0`, the deploy scripts and runbook
-(§3 "Scripts"; `docs/DEPLOY.md`).
+runtime sizes (Appendix A items 6 and 8–11); `a4c38b0`, the deploy scripts and runbook
+(§3 "Scripts"; `docs/DEPLOY.md`); and the bootstrap-admin revision of the scripts (script-only:
+`Deploy.s.sol` accepts `ADMIN`, new `HandoverAdmin.s.sol` and
+`script/rehearsal/ExecuteSafeBatch.s.sol`, `Configure.s.sol` loses its key-signing Safe mode,
+`Verify.s.sol` rewritten). Line numbers into `script/` are at that revision; `src/` and `test/` are
+unchanged by it.
 
 **Contact.** To be confirmed at kickoff. The site is not yet deployed at `callhouse.finance`: as of
 2026-09-13 the domain serves a registrar parking redirect (`/.well-known/security.txt` answers
@@ -124,11 +129,11 @@ properties this rests on.
 
 | Key | Holder | Can | Cannot |
 |---|---|---|---|
-| `DEFAULT_ADMIN_ROLE` | Admin Safe, Gnosis Safe 2-of-3 (`ops/safes.md` (leekzor/callhouse) §1) | `setPolicy` inside the `Policy.validate` caps; `setFeeRecipient` (non-zero); `setDepositCap` (unbounded, can close deposits); `setMaxPriceAge` in [1 hour, 7 days]; `acceptValoremFee`; `haltWrites` and `unhaltWrites`; grant/revoke `KEEPER_ROLE` and `GUARDIAN_ROLE`; grant admin to a fourth address; renounce | Move any Stock Token or USDG (there is no admin-gated transfer in the vault); upgrade; rescue or sweep to an arbitrary address; take more than 20% of harvested premium, or any fee on strike proceeds (the exclusion is in bytecode, not in `policy`); sell inside 1% OTM; widen staleness past 7 days. **No timelock on any admin action.** Worst case: 20% of harvested premium on filled weeks, routed to a recipient of its choosing, never principal |
+| `DEFAULT_ADMIN_ROLE` | At launch: the deployer key (bootstrap phase). After `HandoverAdmin.s.sol`: the admin Safe, Gnosis Safe 2-of-3 (`ops/safes.md` (leekzor/callhouse) §1) | `setPolicy` inside the `Policy.validate` caps; `setFeeRecipient` (non-zero); `setDepositCap` (unbounded, can close deposits); `setMaxPriceAge` in [1 hour, 7 days]; `acceptValoremFee`; `haltWrites` and `unhaltWrites`; grant/revoke `KEEPER_ROLE` and `GUARDIAN_ROLE`; grant admin to a fourth address; renounce | Move any Stock Token or USDG (there is no admin-gated transfer in the vault); upgrade; rescue or sweep to an arbitrary address; take more than 20% of harvested premium, or any fee on strike proceeds (the exclusion is in bytecode, not in `policy`); sell inside 1% OTM; widen staleness past 7 days. **No timelock on any admin action.** Worst case: 20% of harvested premium on filled weeks, routed to a recipient of its choosing, never principal |
 | `KEEPER_ROLE` | Hot EOA run by `keeper/` (leekzor/callhouse) (`ops/safes.md` (leekzor/callhouse) §2) | `rollOpen` (chooses the rung and size within policy); `approveListing` (proposes the whole Seaport order, at most 3 authorisations per cycle); `cancelListing`; `invalidateAllListings`; `rollClose` from `cycleExpiryTs` | Hold the option tokens or the claim; pay premium anywhere but the vault and Overcall's fee address; list above strike, below the policy floor, past `cycleExerciseTs`, or more than inventory; halt or unhalt; change any parameter; move a token. Worst case: a wasted week |
 | `GUARDIAN_ROLE` | 1-of-1 key on separate hardware, different continent (`ops/safes.md` (leekzor/callhouse) §3) | `haltWrites` (blocks `rollOpen` and `approveListing` only); `cancelListing`; `invalidateAllListings` (needs no order data) | `unhaltWrites` (the guardian can stop, never start); change parameters; block deposits, instant redemption, the queue, USDG claims, `lockBook` or `rollClose`; move a token. `ops/safes.md` (leekzor/callhouse) §4 is the checkable proof |
 | Fee recipient | Fee Safe (`ops/safes.md` (leekzor/callhouse) §6) | Receive the protocol fee through the best-effort push in `rollClose` or the permissionless `sweepFee()` (both via `_tryPayFee`, Vault L980–999) | Holds no role; nothing else |
-| Deployer | EOA running `Deploy.s.sol` | Fix every immutable at construction (asset, USDG, clearinghouse, registry, feed, Seaport, conduit key, zone, Overcall fee recipient); pass `SAFE_ADMIN` as `admin`, so the Safe is admin from block one | Anything after the constructor. A wrong immutable is unfixable without a redeploy. The deployer never holds a role: the constructor grants `DEFAULT_ADMIN_ROLE` to `admin` and to nobody else (Vault L299), so there is nothing to renounce and every grant after deployment is a Safe transaction (`docs/DEPLOY.md`; `Verify.s.sol` checks "DEPLOYER holds no role") |
+| Deployer | EOA running `Deploy.s.sol` | Fix every immutable at construction (asset, USDG, clearinghouse, registry, feed, Seaport, conduit key, zone, Overcall fee recipient); choose the one `admin` the constructor grants `DEFAULT_ADMIN_ROLE` to (Vault L299). **Launch plan: `admin` = the deployer's own address**, so until the handover the deployer key has every `DEFAULT_ADMIN_ROLE` power above | A wrong immutable is unfixable without a redeploy. Leaves the admin role only through `HandoverAdmin.s.sol` (grant to the Safe; renounce refused until the Safe has executed a transaction after the grant). `Verify.s.sol` checks the deployer holds admin in the bootstrap phase and nothing in the safe phase |
 | Anyone | — | `deposit`, `mint`, `redeem`, `withdraw`, `queueRedeem`, `completeRedeem`, `claimUsdg`, `claimUsdgTo`, ERC-20 transfers; `lockBook` after `cycleExerciseTs`; `rollClose` after `cycleExpiryTs + 1 hour`; `sweepFee` | — |
 
 On the proof in `ops/safes.md` (leekzor/callhouse) §4: it was re-derived against HEAD `27d502a` on 2026-09-12 (the
@@ -211,58 +216,62 @@ the unit suite proves; §6 lists their known infidelities.
 **Scripts, in scope for configuration review only.** `script/Deploy.s.sol` fixes
 every chain-4663 address as a constant (each overridable by env for a fork rehearsal), installs
 `Policy.launchDefaults()` through the constructor, sets `MAX_PRICE_AGE = 4 days` and
-`LAUNCH_DEPOSIT_CAP = 20e18`, passes `SAFE_ADMIN` as admin and `SAFE_FEE` as fee recipient, and
-runs `_preflight` (registry `collateralToken`/`exerciseToken`/`clearinghouse` equal the asset,
-USDG and clearinghouse; `lotSize() == 1e18`; feed `answer > 0`, `updatedAt > 0`,
-`decimals() == 8`). The constructor grants `DEFAULT_ADMIN_ROLE` to that `admin` and to nobody
-else (Vault L299); the deployer key never holds a role, so there is no renounce step, and every
-later admin action, including the keeper and guardian grants, is a transaction from the Safe.
+`LAUNCH_DEPOSIT_CAP = 20e18`, passes `ADMIN` (if set, else `SAFE_ADMIN`) as the constructor's
+`admin` and `SAFE_FEE` as fee recipient, prints a warning when that admin has no code, and runs
+`_preflight` (registry `collateralToken`/`exerciseToken`/`clearinghouse` equal the asset, USDG and
+clearinghouse; `lotSize() == 1e18`; feed `answer > 0`, `updatedAt > 0`, `decimals() == 8`). The
+constructor grants `DEFAULT_ADMIN_ROLE` to that `admin` and to nobody else (Vault L299). Forge
+deploys both libraries through the CREATE2 factory `0x4e59b448…956C`, so their addresses depend only
+on bytecode (`docs/DEPLOY.md`).
 
-`Configure.s.sol` builds the calls `grantRole(KEEPER_ROLE, KEEPER)` and
-`grantRole(GUARDIAN_ROLE, GUARDIAN)` (requiring both non-zero and different), plus `setPolicy`
-only when `SET_POLICY=true`, and in every mode writes them as a Safe{Wallet} Transaction Builder
-batch (`broadcast/configure-safe-batch.json` by default, no checksum field; `foundry.toml` grants
-read-write on `./broadcast` for it). The mode is chosen by environment: (1) production, neither `ADMIN_PK`
-nor `REHEARSAL` set: nothing is broadcast, and the Safe owners import, check and sign the batch; (2) EOA admin
-(testnet), `ADMIN_PK` set: broadcasts the calls from that key and refuses unless it holds
-`DEFAULT_ADMIN_ROLE`; (3) Safe rehearsal (fork only), `REHEARSAL=true`, `SAFE_ADMIN` and
-`SAFE_OWNER_PKS`: signs each call with threshold-many owner keys, sorted by address, and executes it through the real
-Safe's `execTransaction`. `ADMIN_PK` takes precedence over `REHEARSAL`, and the "fork only" of
-mode 3 is a NatSpec instruction: the script itself does not check the chain or RPC (the local-RPC
-refusal is in `script/rehearse-deploy.sh`). The batch's `createdFromSafeAddress` is `SAFE_ADMIN`
-when set, checked against `hasRole`, and otherwise `address(0)`. Note it still casts
-`vm.envOr(uint256)` to `uint16`/`uint64` with silent truncation before `Policy.validate` sees the
-value (an operational footgun, not a contract bug).
+**The launch plan is a bootstrap admin**: `ADMIN` = the deployer's address. `Configure.s.sol` then
+broadcasts `grantRole(KEEPER_ROLE, KEEPER)` and `grantRole(GUARDIAN_ROLE, GUARDIAN)` (both non-zero
+and different; plus `setPolicy` only when `SET_POLICY=true`) from `ADMIN_PK`, refusing a key that does
+not hold `DEFAULT_ADMIN_ROLE`. Without `ADMIN_PK` it broadcasts nothing. In both modes it writes the
+same calls as a Safe{Wallet} Transaction Builder batch (`broadcast/configure-safe-batch.json`, no
+checksum field; `foundry.toml` grants read-write on `./broadcast`). It still casts `vm.envOr(uint256)`
+to `uint16`/`uint64` with silent truncation before `Policy.validate` sees the value (an operational
+footgun, not a contract bug).
 
-`Verify.s.sol` is read-only, runs every check and reverts if any failed (27 checks when both
-library addresses are given): the six immutables `asset`, `usdg`, `clear`, `seaport`, `registry`
-and `priceFeed` against the `Deploy.s.sol` constants (env
-overridable); policy bands, utilisation and contract cap equal to `launchDefaults()`,
-`protocolFeeBps == 500`, `depositCap`, `maxPriceAge == 4 days`, `feeRecipient == SAFE_FEE`;
-`SAFE_ADMIN` holds admin and has code; `DEPLOYER` holds none of the three roles; keeper and guardian
-hold their role (or not yet, with `EXPECT_KEEPER_CONFIGURED=false`) and nothing else; both role
-admins are `DEFAULT_ADMIN_ROLE`; Safe threshold and owner count (default 2 of 3); each library has
-code and its address appears in the vault runtime; phase Idle, not halted, Valorem fee not
-accepted, no cycle opened. `script/rehearse-deploy.sh` runs the whole sequence on an anvil fork of
-4663 (refusing any non-local RPC): creates the admin and fee Safes (2 of 3) through the canonical
-SafeProxyFactory 1.4.1, deploys with `forge script`, verifies unconfigured, writes the production
-batch and checks it is two calls to the vault with no role granted, proves a key-signed configure
-is refused, configures through the Safe with two owners supplied out of address order, and
-verifies again. `docs/DEPLOY.md` is the runbook and holds the rehearsal record (fork block
-62176750: 3 transactions, 7,514,058 gas, 27 of 27 checks before and after configuration, batch
-calldata decoded independently). `ops/safes.md` (leekzor/callhouse) §7 is the older cast-based
-deploy-day checklist (Appendix A item 12).
+`HandoverAdmin.s.sol` moves the admin role to the Safe in two runs. `STEP=grant`: requires `ADMIN_PK`
+to hold admin and `SAFE_ADMIN` to have code, threshold ≥ 2, owners ≥ threshold and no enabled module;
+grants `DEFAULT_ADMIN_ROLE` to the Safe; prints the Safe's nonce as `GRANT_NONCE`; writes a one-call
+smoke batch (`setMaxPriceAge` to its current value). `STEP=renounce`: same preconditions, plus the
+Safe holds admin and its nonce is above `GRANT_NONCE`, then `renounceRole` from the key. The nonce
+condition is a liveness proof of the Safe, not of the smoke call specifically: any Safe transaction
+after the grant satisfies it. `script/rehearsal/ExecuteSafeBatch.s.sol` (rehearsal only) executes a
+batch file through a Safe with owner keys (threshold-many, sorted by address) and refuses unless the
+node's `web3_clientVersion` starts with `anvil/`.
+
+`Verify.s.sol` is read-only and reverts if any check failed (55–64 checks depending on phase in the
+rehearsal). It compares the runtime bytecode of the vault and both libraries byte for byte with this
+checkout's `out/` artifacts, masking only link sites (each separately required to hold the expected
+library; all five), immutable slots (each checked by value) and a library's own deploy-address word
+(required to equal the library's address); it checks every immutable including
+`overcallFeeRecipient`, `conduitKey == 0`, `seaportZone == 0`, `transferApprovalTarget == seaport` and
+the clearinghouse `isApprovedForAll(vault, seaport)`; policy field by field against
+`launchDefaults()`, `depositCap`, `maxPriceAge`, `feeRecipient`, name, symbol, decimals; roles for
+`ADMIN_PHASE` (`bootstrap`: deployer holds admin; `safe`: `SAFE_ADMIN` holds admin and has code, deployer
+holds nothing) with keeper and guardian holding exactly their role, all three keys distinct and every
+role administered by `DEFAULT_ADMIN_ROLE`; for each Safe, a canonical 1.3.0/1.4.1 singleton, threshold,
+owners (optionally the exact set), no modules, no guard, canonical fallback handler; and a fresh state
+(Idle, not halted, no cycle, option, claim, listing, shares, reserves, pending fee, USDG books, asset or
+USDG balance). `script/rehearse-deploy.sh` runs both admin paths on an anvil fork with every forge call
+under `--no-storage-caching`, including negative checks (swapped library addresses and a single
+flipped byte of vault code must fail Verify; renounce before the Safe has executed must be refused; a
+renounced key must be refused; the executor must refuse a non-anvil node). `docs/DEPLOY.md` is the
+runbook and holds the rehearsal record (fork block 62201116). `ops/safes.md` (leekzor/callhouse) §7 is
+the older cast-based deploy-day checklist (Appendix A item 12).
 
 Please check: that no constant is wrong for chain 4663 (Appendix C); that the preflight cannot
 pass with the JUGGERNAUT registry `0x65dD407955912Be814f723724cE60f91ebd72616` instead of the
 NVDA one (fork test `test_fork_constructorRejectsWrongRegistry`); that the Safe batch calldata
 grants exactly `KEEPER_ROLE` and `GUARDIAN_ROLE` and nothing else (with a third call, `setPolicy`,
-only when `SET_POLICY=true`); that no path in `Deploy.s.sol` or `Configure.s.sol` leaves the
-deployer with a role, or, with `admin = SAFE_ADMIN`, puts `DEFAULT_ADMIN_ROLE` anywhere but the
-Safe; and whether `Verify.s.sol`'s coverage is enough for launch. Two limits of it to weigh: it
-does not read `overcallFeeRecipient`, `conduitKey`, `seaportZone` or the vault's ERC-1155 operator approval on the clearinghouse (the
-cast checklist in `ops/safes.md` (leekzor/callhouse) §7 steps 4–5 does), and its library check is
-a byte search of the runtime for each address, not a check of the five link sites.
+only when `SET_POLICY=true`); that `HandoverAdmin.s.sol` cannot leave the vault without an admin or
+with the key still admin after a successful renounce, and whether its liveness condition is
+sufficient; that the bootstrap phase's risk (one key with every admin power) is stated correctly in
+§2 and `docs/DEPLOY.md`; and whether `Verify.s.sol`'s bytecode comparison is sound (masking exactly
+the link and immutable references in the artifact, and nothing else).
 
 ### 3.1 `Vault.sol`
 
@@ -1186,7 +1195,7 @@ and is not deployed. `forge build` prints forge-lint warnings that are expected 
 CI gate (the workflow runs `forge fmt --check`, `forge build --sizes` and `forge test`; no lint
 step, no `deny` in `foundry.toml`): `unsafe-typecast` at `src/lib/ValoremLib.sol` L125 and L137
 (both carry a `forge-lint: disable-next-line` comment that the current lint ignores),
-`script/Deploy.s.sol` L122, `src/mocks/MockClear.sol` L131 and several `test/` files;
+`script/Deploy.s.sol` L131, `src/mocks/MockClear.sol` L131 and several `test/` files;
 `erc20-unchecked-transfer` at four sites in three `test/unit/` files; `divide-before-multiply` at
 `test/unit/SplitDiff.t.sol` L33. None is in the deployed path except the two `ValoremLib`
 casts, which are the `int256 → uint256` clamps discussed in 3.3. Optimiser runs from 1 to 200
@@ -1194,11 +1203,12 @@ move the Vault figure by under 200 bytes.
 
 Deploy and verify (`docs/DEPLOY.md`, the contract runbook; `README.md` "Deploying"; `ops/deploy.md`
 (leekzor/callhouse) covers hosting only; `ops/safes.md` (leekzor/callhouse) §7):
-`forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --verify --verifier blockscout
---verifier-url https://robinhoodchain.blockscout.com/api`, then `Verify.s.sol` with
-`EXPECT_KEEPER_CONFIGURED=false`, then `Configure.s.sol` with no key and no `--broadcast` to write
-the Safe batch, which the admin Safe imports, signs and executes, then `Verify.s.sol` again (§3
-"Scripts"). The rehearsal is `script/rehearse-deploy.sh` against a local anvil fork of 4663.
+`forge script script/Deploy.s.sol` with `ADMIN` = the deployer (the launch plan), `--broadcast
+--verify` through `ops/bsproxy.js`; `Verify.s.sol` with `ADMIN_PHASE=bootstrap
+EXPECT_KEEPER_CONFIGURED=false`; `Configure.s.sol` with `ADMIN_PK`; `Verify.s.sol` again; and later
+`HandoverAdmin.s.sol` grant, a Safe transaction, renounce, and `Verify.s.sol` with `ADMIN_PHASE=safe`
+(§3 "Scripts"). Every `forge script` against a fork or mainnet should pass `--no-storage-caching`
+(`docs/DEPLOY.md`). The rehearsal is `script/rehearse-deploy.sh` against a local anvil fork of 4663.
 `forge script` deploys and links both libraries automatically; manual linking is
 `--libraries src/lib/SeaportOrderLib.sol:SeaportOrderLib:<addr>` and the equivalent for
 `src/lib/ValoremLib.sol:ValoremLib`. Blockscout sits behind a Cloudflare challenge keyed on a
@@ -1338,11 +1348,13 @@ that repository's `79e6a19`.
 11. **Resolved** in this repository's `6023a96`. `Vault.sol`'s `HALT / ADMIN` section banner
     appeared twice, with the fee-sweep section between them; the empty first copy was removed and
     the one remaining banner (L1001–1003) heads the halt and admin functions. Cosmetic.
-12. **Open, in leekzor/callhouse.** After its checklist, `ops/safes.md` (leekzor/callhouse) §7
-    says "Then, and only then, the deployer renounces `DEFAULT_ADMIN_ROLE`". The deployer never
-    holds it: the constructor grants `DEFAULT_ADMIN_ROLE` to `admin` only (Vault L299), and
-    `Deploy.s.sol` passes `SAFE_ADMIN`, so there is nothing to renounce. `docs/DEPLOY.md` is the current contract
-    runbook and says so; `Verify.s.sol` checks that the deployer holds no role.
+12. **Superseded by the bootstrap plan.** `ops/safes.md` (leekzor/callhouse) §7 says "Then, and
+    only then, the deployer renounces `DEFAULT_ADMIN_ROLE`". An earlier revision of this appendix
+    called that wrong because `Deploy.s.sol` then always passed the Safe as `admin`. The launch plan
+    is now that the deployer key IS the admin at launch (`ADMIN`), so a renounce step exists again;
+    `HandoverAdmin.s.sol` performs it, after granting the Safe and seeing the Safe execute.
+    `ops/safes.md` §7 should point at that script and `docs/DEPLOY.md` path A rather than raw
+    `cast` calls.
 
 ## Appendix B. To be confirmed
 
@@ -1385,7 +1397,7 @@ facts:
 - The Valorem engine fee status at engagement time (off as of the 2026-09-12 fork run).
 - The deployed addresses of `Vault`, `SeaportOrderLib` and `ValoremLib`, and the link targets in
   the deployed runtime (nothing is deployed yet).
-- What the 2026-09-13 deploy rehearsal (`docs/DEPLOY.md`, fork block 62176750) does not prove: the
+- What the 2026-09-13 deploy rehearsal (`docs/DEPLOY.md`, fork block 62201116) does not prove: the
   Safe{Wallet} Transaction Builder UI importing the generated batch file (only its format and
   calldata were checked; the Safe contract executed the same calls); hardware-wallet signing and
   the Safe{Wallet} transaction service on 4663; Blockscout source verification through

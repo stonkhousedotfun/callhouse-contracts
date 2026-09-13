@@ -45,9 +45,11 @@ test/
   fork/                     against live chain 4663
 script/
   Deploy.s.sol              constructor args, with an on-chain preflight
-  Configure.s.sol           Safe batch for the role grants (and optional policy override)
-  Verify.s.sol              read-only post-deploy check
-  rehearse-deploy.sh        the whole deploy on an anvil fork, with real Safes
+  Configure.s.sol           keeper and guardian grants: from the admin key, or as a Safe batch
+  HandoverAdmin.s.sol       move DEFAULT_ADMIN_ROLE from the bootstrap key to the Safe
+  Verify.s.sol              read-only post-deploy check, bytecode included
+  rehearse-deploy.sh        both admin paths on an anvil fork, with real Safes
+  rehearsal/                ExecuteSafeBatch.s.sol (anvil only)
 docs/                       AUDIT-SCOPE.md, ACCOUNTING.md, DEPLOY.md
 lib/                        forge-std, openzeppelin-contracts (git submodules)
 ```
@@ -156,19 +158,25 @@ the vault. Foundry does this automatically during `forge script`; to link manual
 `--libraries` once per library.
 
 The full runbook, rehearsed on a fork with real Safes, is **[`docs/DEPLOY.md`](docs/DEPLOY.md)**
-(`script/rehearse-deploy.sh` reproduces the rehearsal). In short:
+(`script/rehearse-deploy.sh` reproduces it, including negative checks). The launch plan for now is a
+**bootstrap admin**: the deployer key holds `DEFAULT_ADMIN_ROLE` at launch and hands it to the 2-of-3
+Safe later. In short (pass `--no-storage-caching` to every call; see the runbook for why):
 
 ```bash
-forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow \
-  --verify --verifier blockscout --verifier-url <bsproxy>/api        # admin role goes to the Safe only
-EXPECT_KEEPER_CONFIGURED=false forge script script/Verify.s.sol --rpc-url $RH_RPC
-forge script script/Configure.s.sol --rpc-url $RH_RPC                # writes a Safe batch; no broadcast
-#   import broadcast/configure-safe-batch.json in Safe{Wallet} Transaction Builder, decode, sign, execute
-forge script script/Verify.s.sol --rpc-url $RH_RPC
+ADMIN=<deployer address> forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --verify ...
+ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false forge script script/Verify.s.sol --rpc-url $RH_RPC
+ADMIN_PK=... forge script script/Configure.s.sol --rpc-url $RH_RPC --broadcast   # keeper + guardian grants
+ADMIN_PHASE=bootstrap forge script script/Verify.s.sol --rpc-url $RH_RPC
+# later: the handover
+STEP=grant    forge script script/HandoverAdmin.s.sol --rpc-url $RH_RPC --broadcast   # then the Safe executes the smoke batch
+STEP=renounce forge script script/HandoverAdmin.s.sol --rpc-url $RH_RPC --broadcast   # refused until the Safe has executed
+ADMIN_PHASE=safe forge script script/Verify.s.sol --rpc-url $RH_RPC
 ```
 
-The deployer never holds a role, so there is nothing to renounce. Every admin action, starting with
-the keeper and guardian grants, is a Safe transaction.
+Until the handover, the deployer key has every admin power (fee up to 20% of premium and its
+recipient, deposit cap, policy inside the hard caps, role grants). `Verify.s.sol` compares the
+deployed vault and libraries byte for byte with this commit's build and checks every immutable,
+parameter, role and Safe setting.
 
 `Deploy.s.sol` runs an on-chain preflight before broadcasting: it refuses to deploy against a
 registry whose `collateralToken`, `exerciseToken` or `clearinghouse` do not match, and it checks the

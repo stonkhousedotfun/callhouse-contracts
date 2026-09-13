@@ -56,7 +56,11 @@ contract DeployVault is Script {
 
     function run() external returns (Vault vault) {
         uint256 pk = vm.envUint("DEPLOYER_PK");
-        address admin = vm.envAddress("SAFE_ADMIN");
+        // DEFAULT_ADMIN_ROLE goes to exactly one address at construction. ADMIN wins if set, else
+        // SAFE_ADMIN. Launch plan for now: ADMIN = the deployer's own address (bootstrap phase), with
+        // the Safe taking over later through script/HandoverAdmin.s.sol (docs/DEPLOY.md).
+        address admin = vm.envOr("ADMIN", address(0));
+        if (admin == address(0)) admin = vm.envAddress("SAFE_ADMIN");
         address feeRecipient = vm.envAddress("SAFE_FEE");
 
         // Allow every address to be overridden for a fork rehearsal or a second market.
@@ -97,11 +101,16 @@ contract DeployVault is Script {
         console2.log("asset           ", asset);
         console2.log("registry        ", registry);
         console2.log("priceFeed       ", feed);
-        console2.log("admin (Safe)    ", admin);
+        console2.log("admin           ", admin);
         console2.log("feeRecipient    ", feeRecipient);
         console2.log("depositCap      ", cap);
         console2.log("");
-        console2.log("NEXT: run script/Configure.s.sol to grant KEEPER_ROLE and GUARDIAN_ROLE.");
+        if (admin.code.length == 0) {
+            console2.log("");
+            console2.log("WARNING: the admin is a PLAIN KEY, not a Safe. Until HandoverAdmin.s.sol has granted the");
+            console2.log("Safe and renounced this key, whoever holds it has every admin power over the vault.");
+        }
+        console2.log("NEXT: script/Configure.s.sol grants KEEPER_ROLE and GUARDIAN_ROLE (docs/DEPLOY.md).");
     }
 
     /// @dev Refuse to deploy against a registry that does not describe this pair. Getting this

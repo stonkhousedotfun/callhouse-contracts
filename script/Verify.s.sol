@@ -4,50 +4,104 @@ pragma solidity 0.8.28;
 import {Script, console2} from "forge-std/Script.sol";
 import {Vault} from "../src/Vault.sol";
 import {Policy, PolicyParams} from "../src/Policy.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {IERC1155Minimal} from "../src/interfaces/IERC1155Minimal.sol";
 
 interface ISafeView {
     function getOwners() external view returns (address[] memory);
     function getThreshold() external view returns (uint256);
+    function getModulesPaginated(address start, uint256 pageSize)
+        external
+        view
+        returns (address[] memory array, address next);
 }
 
-/// @notice Read-only post-deploy check of a Callhouse vault. Broadcasts nothing; reverts on the first
-///         thing that is not what launch requires.
-/// @dev Run after `Deploy.s.sol` and after the admin Safe has executed the `Configure.s.sol` batch:
+/// @notice Read-only post-deploy check of a Callhouse vault. Broadcasts nothing. Prints every check
+///         and reverts at the end if any failed.
+/// @dev Run from a checkout of the EXACT commit that was deployed, after `forge build`: the bytecode
+///      check compares the chain against `out/`.
 ///        forge script script/Verify.s.sol --rpc-url $RH_RPC
-///      Every expectation is an environment variable so the same script checks a fork rehearsal, a
-///      testnet deploy and mainnet. Mainnet defaults are the constants `Deploy.s.sol` uses.
 ///
-///      Required: VAULT, SAFE_ADMIN, SAFE_FEE, KEEPER, GUARDIAN, DEPLOYER (the address that sent the
-///      deploy transaction; it must hold no role at all).
-///      Optional: SEAPORT_ORDER_LIB, VALOREM_LIB (checked to have code and to be linked into the vault
-///      runtime), EXPECT_SAFE_THRESHOLD (default 2), EXPECT_SAFE_OWNERS (default 3),
-///      EXPECT_KEEPER_CONFIGURED (default true; set false to check a vault before the Safe batch ran),
-///      plus the same address overrides `Deploy.s.sol` accepts (ASSET, USDG, CLEARINGHOUSE, SEAPORT,
-///      REGISTRY, PRICE_FEED, DEPOSIT_CAP).
+///      WHAT IS CHECKED
+///        1. Chain id.
+///        2. Runtime bytecode of the vault and both libraries, byte for byte against this commit's
+///           compiled artifacts. Only three kinds of byte are masked: the library link sites (each
+///           checked separately to hold the expected library address), the immutable slots (each
+///           checked separately through its getter), and a library's own deploy-address word
+///           (checked to equal that library's address). A match proves the logic and every
+///           compiled-in hard cap are this commit's — nothing a getter can show covers that.
+///        3. Every immutable through its getter, including the Seaport fee recipient, conduit key,
+///           zone and the ERC-1155 transfer-approval target, plus the approval itself on Valorem.
+///        4. Policy, field by field, against `Policy.launchDefaults()`; deposit cap; price age;
+///           fee recipient; share token name, symbol and decimals.
+///        5. Roles, for the admin phase in ADMIN_PHASE:
+///             bootstrap — the deployer key holds DEFAULT_ADMIN_ROLE (the launch plan for now);
+///             safe      — the admin Safe holds it and the deployer holds no role at all.
+///           In both: keeper and guardian hold exactly their one role, or none if unconfigured.
+///        6. The admin Safe, when one is named: its singleton is a canonical Safe 1.3.0/1.4.1 build,
+///           threshold and owner count, optionally the exact owner set, no modules (a module
+///           bypasses signatures), no transaction guard, canonical fallback handler. The fee Safe
+///           gets the same checks when it is a contract.
+///        7. Fresh state (unless EXPECT_FRESH=false): Idle, not halted, Valorem fee not accepted, no
+///           cycle, no listing, no claim, no shares, nothing reserved, owed, pending or accounted,
+///           epoch 1, and no asset or USDG held.
+///
+///      ENVIRONMENT
+///        Required: VAULT, SEAPORT_ORDER_LIB, VALOREM_LIB, SAFE_FEE, KEEPER, GUARDIAN, DEPLOYER.
+///        ADMIN_PHASE   bootstrap | safe (default safe). SAFE_ADMIN is required for `safe`.
+///        EXPECT_KEEPER_CONFIGURED  default true.  EXPECT_FRESH  default true.
+///        EXPECT_SAFE_THRESHOLD     default 2.     EXPECT_SAFE_OWNERS default 3.
+///        EXPECT_SAFE_OWNER_SET     optional comma-separated owner addresses, order free.
+///        Address overrides as in Deploy.s.sol: ASSET, USDG, CLEARINGHOUSE, SEAPORT, REGISTRY,
+///        PRICE_FEED, OVERCALL_FEE_RECIPIENT, DEPOSIT_CAP, VAULT_NAME, VAULT_SYMBOL, EXPECT_CHAIN_ID.
 contract VerifyVault is Script {
+    /// @dev Safe storage: slot 0 is the singleton; guard and fallback handler live at these hashed slots.
+    bytes32 internal constant SAFE_GUARD_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
+    bytes32 internal constant SAFE_FALLBACK_SLOT = 0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5;
+    address internal constant SAFE_SENTINEL = address(0x1);
+
+    /// @dev Canonical Safe singletons and the 1.4.1 fallback handler, all deployed on chain 4663.
+    address internal constant SAFE_L2_141 = 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762;
+    address internal constant SAFE_141 = 0x41675C099F32341bf84BFc5382aF534df5C7461a;
+    address internal constant SAFE_L2_130 = 0x3E5c63644E683549055b9Be8653de26E0B4CD36E;
+    address internal constant FALLBACK_141 = 0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99;
+
+    struct Ref {
+        uint256 length;
+        uint256 start;
+    }
+
     uint256 internal failures;
+    uint256 internal passes;
 
     function run() external {
         Vault vault = Vault(vm.envAddress("VAULT"));
+        address sol = vm.envAddress("SEAPORT_ORDER_LIB");
+        address vl = vm.envAddress("VALOREM_LIB");
+
+        console2.log("chain");
+        _check(block.chainid == vm.envOr("EXPECT_CHAIN_ID", uint256(4663)), "chain id");
         require(address(vault).code.length > 0, "VAULT has no code");
 
+        _bytecode(vault, sol, vl);
         _immutables(vault);
         _parameters(vault);
         _roles(vault);
-        _safe(vm.envAddress("SAFE_ADMIN"));
-        _libraries(vault);
-        _freshState(vault);
+        _safes();
+        if (vm.envOr("EXPECT_FRESH", true)) _freshState(vault);
 
         console2.log("");
         if (failures != 0) {
-            console2.log("VERIFY FAILED:", failures, "check(s)");
+            console2.log("VERIFY FAILED:", failures, "check(s) failed of", failures + passes);
             revert("verify failed");
         }
-        console2.log("VERIFY PASSED");
+        console2.log("VERIFY PASSED:", passes, "checks");
     }
 
     function _check(bool ok, string memory what) internal {
         if (ok) {
+            passes++;
             console2.log(string.concat("  ok    ", what));
         } else {
             failures++;
@@ -55,15 +109,151 @@ contract VerifyVault is Script {
         }
     }
 
+    /*//////////////////////////////////////////////////////////////
+                               BYTECODE
+    //////////////////////////////////////////////////////////////*/
+
+    function _bytecode(Vault vault, address sol, address vl) internal {
+        console2.log("bytecode (against out/ of this checkout)");
+        string memory solName = "src/lib/SeaportOrderLib.sol:SeaportOrderLib";
+        string memory vlName = "src/lib/ValoremLib.sol:ValoremLib";
+
+        // Vault: link sites must hold the library addresses; immutables are masked here and checked
+        // by value in _immutables.
+        string memory vaultJson = vm.readFile("out/Vault.sol/Vault.json");
+        (bytes memory want, bool[] memory mask, uint256 linksOk, uint256 linksSeen) =
+            _expectedWithLinks(vaultJson, address(vault).code, solName, sol, vlName, vl);
+        _maskImmutables(vaultJson, mask);
+        _check(linksSeen == 5 && linksOk == 5, "vault: all 5 library link sites hold the expected addresses");
+        _check(
+            _equalMasked(address(vault).code, want, mask),
+            "vault: runtime == compiled Vault, outside link/immutable slots"
+        );
+
+        _library("out/SeaportOrderLib.sol/SeaportOrderLib.json", sol, "SeaportOrderLib");
+        _library("out/ValoremLib.sol/ValoremLib.json", vl, "ValoremLib");
+    }
+
+    /// @dev A via-IR public library stores its own address in an immutable for call protection; that
+    ///      word must equal the library's address and everything else must match the artifact.
+    function _library(string memory path, address lib, string memory name) internal {
+        bytes memory code = lib.code;
+        if (code.length == 0) {
+            _check(false, string.concat(name, ": has code"));
+            return;
+        }
+        string memory json = vm.readFile(path);
+        bytes memory want = vm.parseBytes(vm.parseJsonString(json, ".deployedBytecode.object"));
+        bool[] memory mask = new bool[](want.length);
+        Ref[] memory refs =
+            abi.decode(vm.parseJson(json, ".deployedBytecode.immutableReferences.library_deploy_address"), (Ref[]));
+        bool selfOk = refs.length > 0;
+        for (uint256 r; r < refs.length; r++) {
+            for (uint256 k; k < refs[r].length; k++) {
+                mask[refs[r].start + k] = true;
+            }
+            if (code.length >= refs[r].start + 32) {
+                selfOk = selfOk && uint256(_word(code, refs[r].start)) == uint256(uint160(lib));
+            }
+        }
+        _check(selfOk, string.concat(name, ": deploy-address word == its own address"));
+        _check(_equalMasked(code, want, mask), string.concat(name, ": runtime == compiled artifact"));
+    }
+
+    /// @dev Replaces every `__$<34 hex>$__` link placeholder in the artifact's hex with zeros so it
+    ///      parses, masks those 20 bytes, and checks the deployed bytes there are the library the
+    ///      placeholder names.
+    function _expectedWithLinks(
+        string memory json,
+        bytes memory deployed,
+        string memory solName,
+        address sol,
+        string memory vlName,
+        address vl
+    ) internal pure returns (bytes memory want, bool[] memory mask, uint256 ok, uint256 seen) {
+        bytes memory hex_ = bytes(vm.parseJsonString(json, ".deployedBytecode.object"));
+        bytes memory solTag = _placeholderTag(solName);
+        bytes memory vlTag = _placeholderTag(vlName);
+        uint256 offsetCount;
+        uint256[] memory offsets = new uint256[](16);
+        address[] memory expect = new address[](16);
+
+        for (uint256 i = 2; i + 40 <= hex_.length; i++) {
+            if (hex_[i] != "_" || hex_[i + 1] != "_" || hex_[i + 2] != "$") continue;
+            bytes memory tag = new bytes(34);
+            for (uint256 t; t < 34; t++) {
+                tag[t] = hex_[i + 3 + t];
+            }
+            expect[offsetCount] =
+                keccak256(tag) == keccak256(solTag) ? sol : (keccak256(tag) == keccak256(vlTag) ? vl : address(0));
+            offsets[offsetCount++] = (i - 2) / 2;
+            for (uint256 c; c < 40; c++) {
+                hex_[i + c] = "0";
+            }
+            i += 39;
+        }
+
+        want = vm.parseBytes(string(hex_));
+        mask = new bool[](want.length);
+        for (uint256 n; n < offsetCount; n++) {
+            seen++;
+            for (uint256 k; k < 20; k++) {
+                mask[offsets[n] + k] = true;
+            }
+            if (expect[n] != address(0) && deployed.length >= offsets[n] + 20) {
+                if (address(bytes20(_word(deployed, offsets[n]))) == expect[n]) ok++;
+            }
+        }
+    }
+
+    function _placeholderTag(string memory fullyQualified) internal pure returns (bytes memory tag) {
+        bytes memory h = bytes(vm.toString(keccak256(bytes(fullyQualified))));
+        tag = new bytes(34);
+        for (uint256 i; i < 34; i++) {
+            tag[i] = h[2 + i];
+        }
+    }
+
+    function _maskImmutables(string memory json, bool[] memory mask) internal pure {
+        string[] memory ids = vm.parseJsonKeys(json, ".deployedBytecode.immutableReferences");
+        for (uint256 i; i < ids.length; i++) {
+            Ref[] memory refs = abi.decode(
+                vm.parseJson(json, string.concat(".deployedBytecode.immutableReferences.", ids[i])), (Ref[])
+            );
+            for (uint256 r; r < refs.length; r++) {
+                for (uint256 k; k < refs[r].length; k++) {
+                    mask[refs[r].start + k] = true;
+                }
+            }
+        }
+    }
+
+    function _equalMasked(bytes memory got, bytes memory want, bool[] memory mask) internal pure returns (bool) {
+        if (got.length != want.length) return false;
+        for (uint256 i; i < got.length; i++) {
+            if (!mask[i] && got[i] != want[i]) return false;
+        }
+        return true;
+    }
+
+    function _word(bytes memory b, uint256 offset) internal pure returns (bytes32 w) {
+        assembly {
+            w := mload(add(add(b, 32), offset))
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         IMMUTABLES AND PARAMETERS
+    //////////////////////////////////////////////////////////////*/
+
     function _immutables(Vault vault) internal {
         console2.log("immutables");
+        address clear = vm.envOr("CLEARINGHOUSE", 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0);
+        address seaport = vm.envOr("SEAPORT", 0x0000000000000068F116a894984e2DB1123eB395);
         _check(address(vault.asset()) == vm.envOr("ASSET", 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC), "asset");
         _check(address(vault.usdg()) == vm.envOr("USDG", 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168), "usdg");
-        _check(
-            address(vault.clear()) == vm.envOr("CLEARINGHOUSE", 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0),
-            "clearinghouse"
-        );
-        _check(address(vault.seaport()) == vm.envOr("SEAPORT", 0x0000000000000068F116a894984e2DB1123eB395), "seaport");
+        _check(address(vault.clear()) == clear, "clearinghouse");
+        _check(address(vault.seaport()) == seaport, "seaport");
         _check(
             address(vault.registry()) == vm.envOr("REGISTRY", 0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA),
             "registry is the NVDA market, not JUGGERNAUT"
@@ -72,40 +262,78 @@ contract VerifyVault is Script {
             address(vault.priceFeed()) == vm.envOr("PRICE_FEED", 0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15),
             "price feed"
         );
+        _check(
+            vault.overcallFeeRecipient()
+                == vm.envOr("OVERCALL_FEE_RECIPIENT", 0xdAe7e82A2E7D566C67E87C164B05a1C560190782),
+            "Overcall fee recipient"
+        );
+        _check(vault.conduitKey() == bytes32(0), "conduit key is zero (Overcall lists with no conduit)");
+        _check(vault.seaportZone() == address(0), "Seaport zone is zero");
+        _check(vault.transferApprovalTarget() == seaport, "ERC-1155 transfer approval target is Seaport");
+        _check(
+            IERC1155Minimal(clear).isApprovedForAll(address(vault), seaport),
+            "Valorem ERC-1155 approval for Seaport is set"
+        );
     }
 
     function _parameters(Vault vault) internal {
         console2.log("parameters");
         (uint16 minOtm, uint16 maxOtm, uint16 minPrem, uint16 maxUtil, uint16 feeBps, uint64 cap) = vault.policy();
         PolicyParams memory want = Policy.launchDefaults();
-        _check(
-            minOtm == want.minOtmBps && maxOtm == want.maxOtmBps && minPrem == want.minPremiumBps
-                && maxUtil == want.maxUtilizationBps && cap == want.maxContractsCap,
-            "policy bands, utilisation and contract cap == launchDefaults"
-        );
-        _check(feeBps == 500, "protocolFeeBps == 500 (5% of premium)");
+        _check(minOtm == want.minOtmBps, "policy.minOtmBps == 300");
+        _check(maxOtm == want.maxOtmBps, "policy.maxOtmBps == 1200");
+        _check(minPrem == want.minPremiumBps, "policy.minPremiumBps == 40");
+        _check(maxUtil == want.maxUtilizationBps, "policy.maxUtilizationBps == 9500");
+        _check(feeBps == want.protocolFeeBps && feeBps == 500, "policy.protocolFeeBps == 500 (5% of premium)");
+        _check(cap == want.maxContractsCap, "policy.maxContractsCap == 50");
         _check(vault.depositCap() == vm.envOr("DEPOSIT_CAP", uint256(20e18)), "depositCap == 20 NVDA");
         _check(vault.maxPriceAge() == 4 days, "maxPriceAge == 4 days");
         _check(vault.feeRecipient() == vm.envAddress("SAFE_FEE"), "feeRecipient == SAFE_FEE");
+        _check(
+            keccak256(bytes(vault.name())) == keccak256(bytes(vm.envOr("VAULT_NAME", string("Callhouse NVDA")))),
+            "share name"
+        );
+        _check(
+            keccak256(bytes(vault.symbol())) == keccak256(bytes(vm.envOr("VAULT_SYMBOL", string("cNVDA")))),
+            "share symbol"
+        );
+        _check(vault.decimals() == 18, "share decimals == 18");
     }
 
+    /*//////////////////////////////////////////////////////////////
+                                 ROLES
+    //////////////////////////////////////////////////////////////*/
+
     function _roles(Vault vault) internal {
-        console2.log("roles");
         bytes32 admin = vault.DEFAULT_ADMIN_ROLE();
         bytes32 keeperRole = vault.KEEPER_ROLE();
         bytes32 guardianRole = vault.GUARDIAN_ROLE();
-        address safe = vm.envAddress("SAFE_ADMIN");
         address keeper = vm.envAddress("KEEPER");
         address guardian = vm.envAddress("GUARDIAN");
         address deployer = vm.envAddress("DEPLOYER");
         bool configured = vm.envOr("EXPECT_KEEPER_CONFIGURED", true);
+        bool bootstrap = keccak256(bytes(vm.envOr("ADMIN_PHASE", string("safe")))) == keccak256("bootstrap");
 
-        _check(vault.hasRole(admin, safe), "SAFE_ADMIN holds DEFAULT_ADMIN_ROLE");
-        _check(safe.code.length > 0, "SAFE_ADMIN is a contract, not a key");
+        console2.log(bootstrap ? "roles (phase: bootstrap, deployer is admin)" : "roles (phase: safe)");
+        if (bootstrap) {
+            _check(vault.hasRole(admin, deployer), "DEPLOYER holds DEFAULT_ADMIN_ROLE (bootstrap)");
+            address safe = vm.envOr("SAFE_ADMIN", address(0));
+            if (safe != address(0)) {
+                console2.log(
+                    vault.hasRole(admin, safe)
+                        ? "  info  SAFE_ADMIN already holds admin too: handover in progress, renounce is next"
+                        : "  info  SAFE_ADMIN does not hold admin yet"
+                );
+            }
+        } else {
+            address safe = vm.envAddress("SAFE_ADMIN");
+            _check(vault.hasRole(admin, safe), "SAFE_ADMIN holds DEFAULT_ADMIN_ROLE");
+            _check(safe.code.length > 0, "SAFE_ADMIN is a contract, not a key");
+            _check(!vault.hasRole(admin, deployer), "DEPLOYER no longer holds DEFAULT_ADMIN_ROLE");
+        }
         _check(
-            !vault.hasRole(admin, deployer) && !vault.hasRole(keeperRole, deployer)
-                && !vault.hasRole(guardianRole, deployer),
-            "DEPLOYER holds no role"
+            !vault.hasRole(keeperRole, deployer) && !vault.hasRole(guardianRole, deployer),
+            "DEPLOYER holds neither KEEPER_ROLE nor GUARDIAN_ROLE"
         );
         _check(
             vault.hasRole(keeperRole, keeper) == configured,
@@ -117,49 +345,109 @@ contract VerifyVault is Script {
         );
         _check(!vault.hasRole(admin, keeper) && !vault.hasRole(guardianRole, keeper), "keeper holds nothing else");
         _check(!vault.hasRole(admin, guardian) && !vault.hasRole(keeperRole, guardian), "guardian holds nothing else");
-        _check(vault.getRoleAdmin(keeperRole) == admin && vault.getRoleAdmin(guardianRole) == admin, "role admins");
+        _check(keeper != guardian && keeper != deployer && guardian != deployer, "keeper, guardian, deployer distinct");
+        _check(
+            vault.getRoleAdmin(keeperRole) == admin && vault.getRoleAdmin(guardianRole) == admin
+                && vault.getRoleAdmin(admin) == admin,
+            "every role is administered by DEFAULT_ADMIN_ROLE"
+        );
+        _check(vault.supportsInterface(type(IAccessControl).interfaceId), "supports IAccessControl");
     }
 
-    function _safe(address safe) internal {
-        console2.log("admin safe");
-        if (safe.code.length == 0) return;
-        _check(ISafeView(safe).getThreshold() == vm.envOr("EXPECT_SAFE_THRESHOLD", uint256(2)), "Safe threshold");
-        _check(ISafeView(safe).getOwners().length == vm.envOr("EXPECT_SAFE_OWNERS", uint256(3)), "Safe owner count");
-    }
+    /*//////////////////////////////////////////////////////////////
+                                 SAFES
+    //////////////////////////////////////////////////////////////*/
 
-    /// @dev A public library is reached by DELEGATECALL to an address PUSH20'd into the caller's
-    ///      runtime, so a linked vault contains each library address verbatim.
-    function _libraries(Vault vault) internal {
-        console2.log("linked libraries");
-        address sol = vm.envOr("SEAPORT_ORDER_LIB", address(0));
-        address vl = vm.envOr("VALOREM_LIB", address(0));
-        if (sol == address(0) && vl == address(0)) {
-            console2.log("  skip  SEAPORT_ORDER_LIB / VALOREM_LIB not given");
-            return;
+    function _safes() internal {
+        address adminSafe = vm.envOr("SAFE_ADMIN", address(0));
+        if (adminSafe != address(0) && adminSafe.code.length > 0) {
+            console2.log("admin safe");
+            _safe(
+                adminSafe,
+                "admin Safe",
+                vm.envOr("EXPECT_SAFE_THRESHOLD", uint256(2)),
+                vm.envOr("EXPECT_SAFE_OWNERS", uint256(3))
+            );
+            string memory set = vm.envOr("EXPECT_SAFE_OWNER_SET", string(""));
+            if (bytes(set).length != 0) {
+                address[] memory want = vm.envAddress("EXPECT_SAFE_OWNER_SET", ",");
+                address[] memory got = ISafeView(adminSafe).getOwners();
+                bool same = want.length == got.length;
+                for (uint256 i; same && i < want.length; i++) {
+                    bool found;
+                    for (uint256 j; j < got.length; j++) {
+                        if (got[j] == want[i]) found = true;
+                    }
+                    same = found;
+                }
+                _check(same, "admin Safe owners == EXPECT_SAFE_OWNER_SET");
+            }
         }
-        bytes memory code = address(vault).code;
-        _check(sol.code.length > 0 && _contains(code, sol), "SeaportOrderLib has code and is linked into the vault");
-        _check(vl.code.length > 0 && _contains(code, vl), "ValoremLib has code and is linked into the vault");
+        address feeSafe = vm.envAddress("SAFE_FEE");
+        if (feeSafe.code.length > 0) {
+            console2.log("fee safe");
+            _safe(feeSafe, "fee Safe", 1, 1);
+        } else {
+            console2.log("  info  SAFE_FEE is a plain address, not a Safe");
+        }
     }
+
+    function _safe(address safe, string memory label, uint256 minThreshold, uint256 minOwners) internal {
+        address singleton = address(uint160(uint256(vm.load(safe, bytes32(0)))));
+        _check(
+            singleton == SAFE_L2_141 || singleton == SAFE_141 || singleton == SAFE_L2_130,
+            string.concat(label, ": singleton is a canonical Safe 1.4.1 / 1.3.0 build")
+        );
+        uint256 threshold = ISafeView(safe).getThreshold();
+        uint256 owners = ISafeView(safe).getOwners().length;
+        _check(threshold >= minThreshold && threshold <= owners, string.concat(label, ": threshold"));
+        _check(owners >= minOwners, string.concat(label, ": owner count"));
+        (address[] memory modules,) = ISafeView(safe).getModulesPaginated(SAFE_SENTINEL, 10);
+        _check(modules.length == 0, string.concat(label, ": no modules enabled"));
+        _check(vm.load(safe, SAFE_GUARD_SLOT) == bytes32(0), string.concat(label, ": no transaction guard"));
+        address fallbackHandler = address(uint160(uint256(vm.load(safe, SAFE_FALLBACK_SLOT))));
+        _check(
+            fallbackHandler == FALLBACK_141 || fallbackHandler == address(0),
+            string.concat(label, ": fallback handler is canonical (or none)")
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              FRESH STATE
+    //////////////////////////////////////////////////////////////*/
 
     function _freshState(Vault vault) internal {
         console2.log("fresh state");
         _check(uint8(vault.phase()) == 0, "phase Idle");
         _check(!vault.writesHalted(), "writes not halted");
         _check(!vault.valoremFeeAccepted(), "Valorem engine fee not accepted");
-        _check(vault.cycleNumber() == 0 && vault.contractsWritten() == 0, "no cycle opened");
-    }
-
-    function _contains(bytes memory hay, address needle) internal pure returns (bool) {
-        bytes20 n = bytes20(needle);
-        if (hay.length < 20) return false;
-        for (uint256 i; i <= hay.length - 20; i++) {
-            bytes20 w;
-            assembly {
-                w := mload(add(add(hay, 32), i))
-            }
-            if (w == n) return true;
-        }
-        return false;
+        _check(
+            vault.cycleNumber() == 0 && vault.cycleExerciseTs() == 0 && vault.cycleExpiryTs() == 0
+                && vault.cycleStrikeUsdg() == 0,
+            "no cycle opened"
+        );
+        _check(
+            vault.optionId() == 0 && vault.claimKey() == 0 && vault.contractsWritten() == 0,
+            "no option written, no claim"
+        );
+        _check(
+            vault.listingHash() == bytes32(0) && vault.listingsThisCycle() == 0 && vault.listingAmount() == 0,
+            "no listing"
+        );
+        _check(vault.totalSupply() == 0 && vault.queuedShares() == 0 && vault.epochId() == 1, "no shares, epoch 1");
+        _check(
+            vault.reservedAssets() == 0 && vault.usdgReservedForQueue() == 0 && vault.pendingFeeUsdg() == 0,
+            "nothing reserved or pending"
+        );
+        _check(
+            vault.usdgAccounted() == 0 && vault.accUsdgPerShare() == 0 && vault.usdgDust() == 0
+                && vault.usdgUnallocated() == 0,
+            "USDG books empty"
+        );
+        _check(
+            IERC20(address(vault.asset())).balanceOf(address(vault)) == 0
+                && vault.usdg().balanceOf(address(vault)) == 0,
+            "holds no asset and no USDG"
+        );
     }
 }
