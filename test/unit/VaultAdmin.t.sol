@@ -32,7 +32,7 @@ contract VaultAdminTest is BaseTest {
             maxOtmBps: 1_200,
             minPremiumBps: 40,
             maxUtilizationBps: 9_500,
-            protocolFeeBps: 1_000,
+            protocolFeeBps: 500,
             maxContractsCap: 50
         });
     }
@@ -282,41 +282,42 @@ contract VaultAdminTest is BaseTest {
         //   gross premium       = $2.00 x 6 filled contracts             = 12_000_000
         //   Overcall's 5%       = floor(2_000_000 * 500 / 10_000) * 6    =    600_000
         //   into the vault      = 12_000_000 - 600_000                   = 11_400_000
-        //   protocol fee 10%    = 11_400_000 * 1_000 / 10_000            =  1_140_000
-        //     (accrued into `pendingFeeUsdg` by the checkpoint, swept at rollClose)
-        //   net to depositors   = 11_400_000 - 1_140_000                 = 10_260_000
+        //   protocol fee 5%     = 11_400_000 * 500 / 10_000              =    570_000
+        //     (all premium, no assignment; accrued into `pendingFeeUsdg` by the checkpoint,
+        //      swept at rollClose)
+        //   net to depositors   = 11_400_000 - 570_000                   = 10_830_000
         //   supply AT THE CHECKPOINT = alice 20e18 + bob 10e18           =       30e18
         //     (Carol's 10e18 is minted after the index moves; Alice has not queued yet)
-        //   indexDelta          = 10_260_000 * 1e27 / 30e18              = 342e12, exact
-        //   alice (20e18)       = 20e18 * 342e12 / 1e27                  =  6_840_000
-        //   bob   (10e18)       = 10e18 * 342e12 / 1e27                  =  3_420_000
+        //   indexDelta          = 10_830_000 * 1e27 / 30e18              = 361e12, exact
+        //   alice (20e18)       = 20e18 * 361e12 / 1e27                  =  7_220_000
+        //   bob   (10e18)       = 10e18 * 361e12 / 1e27                  =  3_610_000
         //   carol (10e18, after)=                                        =          0
-        //   and 6_840_000 + 3_420_000 = 10_260_000 exactly: no dust.
+        //   and 7_220_000 + 3_610_000 = 10_830_000 exactly: no dust.
         //
         // Alice then queues her whole 20e18 into escrow ON the vault. `queueRedeem` settles her
-        // first, so her 6_840_000 stays in HER accrued balance rather than riding the shares
+        // first, so her 7_220_000 stays in HER accrued balance rather than riding the shares
         // into escrow; the epoch's USDG leg is therefore 0 here. The close itself harvests
-        // nothing: balance 11_400_000 == owed 10_260_000 + pending fee 1_140_000, so gross is
+        // nothing: balance 11_400_000 == owed 10_830_000 + pending fee 570_000, so gross is
         // 0 and `_harvest` only sweeps the fee.
-        assertEq(usdg.balanceOf(feeSafe), 1_140_000, "protocol fee taken during a halt");
+        assertEq(usdg.balanceOf(feeSafe), 570_000, "protocol fee taken during a halt");
         assertEq(vault.pendingFeeUsdg(), 0, "and the accrued fee really left at the close");
 
         // --- claimUsdg -------------------------------------------------------------------
-        assertEq(vault.claimableUsdg(bob), 3_420_000, "bob's share of the net premium");
+        assertEq(vault.claimableUsdg(bob), 3_610_000, "bob's share of the net premium");
         // Carol deposited AFTER the premium landed, so the checkpoint fixed the index before
         // her shares existed and she earns none of it. A halt changes nothing about that.
         assertEq(vault.claimableUsdg(carol), 0, "a late depositor does not share the week");
         vm.prank(bob);
         uint256 bobClaimed = vault.claimUsdg();
-        assertEq(bobClaimed, 3_420_000);
-        assertEq(usdg.balanceOf(bob), 3_420_000, "claim paid under halt");
+        assertEq(bobClaimed, 3_610_000);
+        assertEq(usdg.balanceOf(bob), 3_610_000, "claim paid under halt");
 
         // --- completeRedeem --------------------------------------------------------------
-        // Alice's 6_840_000 was settled to HER account by `queueRedeem` before the shares
+        // Alice's 7_220_000 was settled to HER account by `queueRedeem` before the shares
         // moved into escrow, because Carol's deposit had already checkpointed the index. So
         // the epoch's USDG leg is empty and the premium is hers to claim directly — the money
         // is in the same place either way, and nothing was stranded on the burned shares.
-        assertEq(vault.claimableUsdg(alice), 6_840_000, "her accrual followed her, not the escrow");
+        assertEq(vault.claimableUsdg(alice), 7_220_000, "her accrual followed her, not the escrow");
         vm.prank(alice);
         (uint256 aliceAssets, uint256 aliceUsdg) = vault.completeRedeem(alice);
         assertEq(aliceAssets, 20e18, "collateral out under halt");
@@ -324,11 +325,11 @@ contract VaultAdminTest is BaseTest {
         assertEq(nvda.balanceOf(alice), 30e18, "alice whole again");
 
         vm.prank(alice);
-        assertEq(vault.claimUsdg(), 6_840_000, "and she can still collect it after redeeming");
-        assertEq(usdg.balanceOf(alice), 6_840_000, "premium paid under halt");
+        assertEq(vault.claimUsdg(), 7_220_000, "and she can still collect it after redeeming");
+        assertEq(usdg.balanceOf(alice), 7_220_000, "premium paid under halt");
 
         // Every base unit of the net premium reached a holder, and none of it is stuck.
-        assertEq(usdg.balanceOf(alice) + usdg.balanceOf(bob) + usdg.balanceOf(carol), 10_260_000, "net premium");
+        assertEq(usdg.balanceOf(alice) + usdg.balanceOf(bob) + usdg.balanceOf(carol), 10_830_000, "net premium");
         assertEq(usdg.balanceOf(address(vault)), 0, "the vault kept nothing back");
 
         // --- instant redeem and withdraw --------------------------------------------------
@@ -540,15 +541,16 @@ contract VaultAdminTest is BaseTest {
     ///        gross premium     = $2.00 x 10 contracts                = 20_000_000
     ///        Overcall's 5%     = floor(2_000_000 * 500 / 10_000) * 10 =  1_000_000  (per contract)
     ///        into the vault    = 20_000_000 - 1_000_000              = 19_000_000
-    ///        protocol fee 10%  = 19_000_000 * 1_000 / 10_000         =  1_900_000
-    ///        net to depositors = 19_000_000 - 1_900_000              = 17_100_000
-    ///      Alice is the only holder, so she takes the whole net both weeks: 2 x 17_100_000.
+    ///        protocol fee 5%   = 19_000_000 * 500 / 10_000           =    950_000  (premium only)
+    ///        net to depositors = 19_000_000 - 950_000                = 18_050_000
+    ///      Alice is the only holder, so she takes the whole net both weeks: 2 x 18_050_000
+    ///      (18_050_000 * 1e27 / 20e18 = 902_500e9 indexes exactly, so no dust either week).
     function test_setFeeRecipient_routesTheNextFee() public {
         _deposit(alice, 20e18);
 
         _fullCycleOtm(10, _okUnitPrice());
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "10% of the 19 USDG the vault harvested");
-        assertEq(vault.claimableUsdg(alice), 17_100_000, "week 1 net to the only depositor");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "5% of the 19 USDG of premium the vault harvested");
+        assertEq(vault.claimableUsdg(alice), 18_050_000, "week 1 net to the only depositor");
 
         vm.prank(admin);
         vault.setFeeRecipient(newFeeSafe);
@@ -557,15 +559,15 @@ contract VaultAdminTest is BaseTest {
         _nextCycle();
         _fullCycleOtm(10, _okUnitPrice());
 
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "the old safe received nothing more");
-        assertEq(usdg.balanceOf(newFeeSafe), 1_900_000, "the new safe took the second week");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "the old safe received nothing more");
+        assertEq(usdg.balanceOf(newFeeSafe), 950_000, "the new safe took the second week");
         assertEq(usdg.balanceOf(overcallFee), 2_000_000, "Overcall took 5% both weeks regardless");
 
         // The rotation moved WHO is paid, never HOW MUCH. Depositors are untouched by it, and
         // the fee is not double-charged to cover the new Safe.
-        assertEq(vault.claimableUsdg(alice), 34_200_000, "two identical weeks of net premium");
+        assertEq(vault.claimableUsdg(alice), 36_100_000, "two identical weeks of net premium");
         vm.prank(alice);
-        assertEq(vault.claimUsdg(), 34_200_000, "and it is all actually payable");
+        assertEq(vault.claimUsdg(), 36_100_000, "and it is all actually payable");
         assertEq(usdg.balanceOf(address(vault)), 0, "nothing stranded on the vault after two weeks");
         assertEq(vault.totalAssets(), 20e18, "and the rotation never touched the collateral");
     }
@@ -777,8 +779,12 @@ contract VaultAdminTest is BaseTest {
 
         uint256 aliceUsdg = vault.claimableUsdg(alice);
         uint256 bobUsdg = vault.claimableUsdg(bob);
-        assertEq(aliceUsdg, 11_400_000, "alice's two thirds of the 17.10 net");
-        assertEq(bobUsdg, 5_700_000, "bob's third");
+        // net 18_050_000 over 30e18 shares: indexDelta = floor(18_050_000 * 1e27 / 30e18)
+        // = 601_666_666_666_666, which credits 18_049_999 and carries 1 base unit as dust.
+        //   alice = floor(20e18 * 601_666_666_666_666 / 1e27) = 12_033_333
+        //   bob   = floor(10e18 * 601_666_666_666_666 / 1e27) =  6_016_666
+        assertEq(aliceUsdg, 12_033_333, "alice's two thirds of the 18.05 net, floored");
+        assertEq(bobUsdg, 6_016_666, "bob's third, floored");
 
         nvda.setFrozen(true);
 

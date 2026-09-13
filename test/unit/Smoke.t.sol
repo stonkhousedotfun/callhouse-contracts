@@ -44,16 +44,17 @@ contract SmokeTest is BaseTest {
         // Overcall took 5%, so the vault received 95%.
         assertEq(usdg.balanceOf(overcallFee), 1_000_000, "Overcall fee");
 
-        // The protocol fee is 10% of what the vault actually harvested.
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "10% of the 19 USDG net");
+        // The protocol fee is 5% of the premium the vault actually harvested:
+        // 19_000_000 * 500 / 10_000 = 950_000. An OTM week has no strike proceeds.
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "5% of the 19 USDG of premium");
 
         // The remainder is claimable by the depositor, not folded into the share price.
-        assertEq(vault.claimableUsdg(alice), 17_100_000, "90% of 19 USDG");
+        assertEq(vault.claimableUsdg(alice), 18_050_000, "95% of 19 USDG");
         assertEq(vault.totalAssets(), 20e18, "collateral came back whole, OTM");
 
         vm.prank(alice);
         vault.claimUsdg();
-        assertEq(usdg.balanceOf(alice), 17_100_000);
+        assertEq(usdg.balanceOf(alice), 18_050_000);
 
         // Back to Idle, so redemption is instant again.
         assertEq(_phase(), 0);

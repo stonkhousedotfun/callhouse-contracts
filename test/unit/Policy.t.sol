@@ -80,7 +80,7 @@ contract PolicyTest is Test {
         assertEq(p.maxOtmBps, 1_200, "max OTM 12%");
         assertEq(p.minPremiumBps, 40, "min premium 0.40%/wk");
         assertEq(p.maxUtilizationBps, 9_500, "95% utilization");
-        assertEq(p.protocolFeeBps, 1_000, "10% protocol fee");
+        assertEq(p.protocolFeeBps, 500, "5% protocol fee on premium");
         assertEq(p.maxContractsCap, 50, "50 contract cap");
     }
 
@@ -339,13 +339,15 @@ contract PolicyTest is Test {
                                 FEES
     //////////////////////////////////////////////////////////////*/
 
-    function test_splitHarvest_tenPercent() public view {
+    /// @dev splitHarvest is handed premium only (the vault strips strike proceeds first), so
+    ///      at launch this is "5% of premium": 100_000_000 * 500 / 10_000 = 5_000_000.
+    function test_splitHarvest_fivePercent() public view {
         (uint256 fee, uint256 net) = h.splitHarvest(100_000_000, _p());
-        assertEq(fee, 10_000_000);
-        assertEq(net, 90_000_000);
+        assertEq(fee, 5_000_000);
+        assertEq(net, 95_000_000);
     }
 
-    /// @dev README: "10% of USDG harvested (filled weeks only)". An unfilled week is free.
+    /// @dev The fee is 5% of premium (filled weeks only). An unfilled week is free.
     function test_splitHarvest_unfilledWeekIsFree() public view {
         (uint256 fee, uint256 net) = h.splitHarvest(0, _p());
         assertEq(fee, 0, "no fee on an unfilled week");

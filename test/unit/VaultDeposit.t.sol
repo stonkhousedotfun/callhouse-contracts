@@ -662,14 +662,15 @@ contract VaultDepositTest is BaseTest {
     ///        buyer pays 10 contracts x $2.00           = 20_000_000 USDG gross
     ///        Overcall's 5%, floored per contract       =  1_000_000 to overcallFee
     ///        vault receives                            = 19_000_000
-    ///        protocol fee, 10% of the harvest          =  1_900_000, held in pendingFeeUsdg
-    ///        net pushed into the index                 = 17_100_000
+    ///        protocol fee, 5% of the premium           =    950_000, held in pendingFeeUsdg
+    ///          (a checkpoint passes feeFree 0; strike proceeds cannot be here yet)
+    ///        net pushed into the index                 = 18_050_000
     ///        supply AT THE CHECKPOINT = alice alone    =       20e18
-    ///        indexDelta = 17_100_000 * 1e27 / 20e18    = 855_000_000_000_000, exact
-    ///        alice      = 20e18 * indexDelta / 1e27    = 17_100_000   (all of it)
+    ///        indexDelta = 18_050_000 * 1e27 / 20e18    = 902_500_000_000_000, exact
+    ///        alice      = 20e18 * indexDelta / 1e27    = 18_050_000   (all of it)
     ///        bob        = snapshot taken AT that index =          0
-    ///      At the close the vault holds 19_000_000 against owed 17_100_000 + pending fee
-    ///      1_900_000, so `_harvest` finds gross 0 and only sweeps the fee to feeSafe.
+    ///      At the close the vault holds 19_000_000 against owed 18_050_000 + pending fee
+    ///      950_000, so `_harvest` finds gross 0 and only sweeps the fee to feeSafe.
     ///      Alice wrote the call and carried the whole week, and she keeps every cent her risk
     ///      earned. Bob arrived after the hand was decided and leaves with his principal, and
     ///      nothing else.
@@ -693,17 +694,17 @@ contract VaultDepositTest is BaseTest {
 
         // The index moved before his shares existed, so the split is already settled here,
         // days before the close.
-        assertEq(vault.claimableUsdg(alice), 17_100_000, "the writer's week, indexed at the checkpoint");
+        assertEq(vault.claimableUsdg(alice), 18_050_000, "the writer's week, indexed at the checkpoint");
         assertEq(vault.claimableUsdg(bob), 0, "and the latecomer starts from that index");
-        assertEq(vault.pendingFeeUsdg(), 1_900_000, "the fee accrued rather than leaving inside a deposit");
+        assertEq(vault.pendingFeeUsdg(), 950_000, "the fee accrued rather than leaving inside a deposit");
 
         _closeCycle();
 
         assertEq(vault.claimableUsdg(bob), 0, "no pay for a risk never taken");
-        assertEq(vault.claimableUsdg(alice), 17_100_000, "the harvest is the writer's, whole");
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "and the fee was swept once, at the close");
+        assertEq(vault.claimableUsdg(alice), 18_050_000, "the harvest is the writer's, whole");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "and the fee was swept once, at the close");
         assertEq(vault.pendingFeeUsdg(), 0, "with nothing left pending");
-        assertEq(vault.usdgDust(), 0, "17.10 over 20e18 shares indexes exactly");
+        assertEq(vault.usdgDust(), 0, "18.05 over 20e18 shares indexes exactly");
 
         // He gets his principal back and not a cent more.
         vm.prank(bob);

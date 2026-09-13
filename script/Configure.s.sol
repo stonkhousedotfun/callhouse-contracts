@@ -30,7 +30,7 @@ contract ConfigureVault is Script {
                     maxOtmBps: uint16(vm.envOr("MAX_OTM_BPS", uint256(1200))),
                     minPremiumBps: uint16(vm.envOr("MIN_PREMIUM_BPS", uint256(40))),
                     maxUtilizationBps: uint16(vm.envOr("MAX_UTILIZATION_BPS", uint256(9500))),
-                    protocolFeeBps: uint16(vm.envOr("PROTOCOL_FEE_BPS", uint256(1000))),
+                    protocolFeeBps: uint16(vm.envOr("PROTOCOL_FEE_BPS", uint256(500))),
                     maxContractsCap: uint64(vm.envOr("MAX_CONTRACTS_CAP", uint256(50)))
                 })
             );

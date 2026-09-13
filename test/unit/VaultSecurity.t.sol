@@ -222,10 +222,11 @@ contract VaultSecurityTest is BaseTest {
         assertEq(uint8(vault.phase()), 0, "the vault returned to Idle");
         assertEq(vault.contractsWritten(), 0, "the claim was redeemed");
         assertEq(usdg.balanceOf(feeSafe), 0, "the fee could not be paid");
-        assertEq(vault.pendingFeeUsdg(), 1_900_000, "and is held, not lost");
+        // 5% of the 19_000_000 premium = 950_000; alice, the only holder, nets 18_050_000.
+        assertEq(vault.pendingFeeUsdg(), 950_000, "and is held, not lost");
 
         // Depositors are entirely unaffected.
-        assertEq(vault.claimableUsdg(alice), 17_100_000, "their share is untouched");
+        assertEq(vault.claimableUsdg(alice), 18_050_000, "their share is untouched");
         vm.prank(alice);
         vault.claimUsdg();
         assertTrue(vault.canRedeemInstantly());
@@ -236,15 +237,15 @@ contract VaultSecurityTest is BaseTest {
         // Sweeping while still blocked is a no-op that reverts rather than losing the fee.
         vm.expectRevert(Distributor.NothingToClaim.selector);
         vault.sweepFee();
-        assertEq(vault.pendingFeeUsdg(), 1_900_000, "still held");
+        assertEq(vault.pendingFeeUsdg(), 950_000, "still held");
 
         // Once the block lifts, anyone can push it through. It always goes to the stored
         // recipient, never to the caller.
         usdg.setBlocked(feeSafe, false);
         vm.prank(carol);
         uint256 paid = vault.sweepFee();
-        assertEq(paid, 1_900_000);
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "paid to the fee Safe, not to carol");
+        assertEq(paid, 950_000);
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "paid to the fee Safe, not to carol");
         assertEq(usdg.balanceOf(carol), 0);
         assertEq(vault.pendingFeeUsdg(), 0);
     }

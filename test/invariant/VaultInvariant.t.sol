@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {BaseTest} from "../Base.t.sol";
 import {Vault} from "../../src/Vault.sol";
+import {Policy} from "../../src/Policy.sol";
 import {MockClear} from "../../src/mocks/MockClear.sol";
 import {MockERC20} from "../../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
@@ -60,6 +61,21 @@ contract VaultHandler is Test {
     uint256 public totalWithdrawn;
     /// @notice Asset base units handed to option buyers through assignment. Gone for good.
     uint256 public totalAssignedOut;
+
+    /*//////////////////////////////////////////////////////////////
+                  GHOST STATE FOR THE PROTOCOL FEE BOUND
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Every fee-bearing USDG base unit that ever reached the vault: the vault's leg of
+    ///         each successful Overcall fill, MEASURED as the vault's USDG balance delta across
+    ///         the `fulfil` call rather than recomputed from the order.
+    /// @dev The protocol fee may only ever be charged on this. Strike proceeds are deliberately
+    ///      NOT counted: they arrive inside `rollClose` when the Valorem claim is redeemed, and
+    ///      they are the assigned depositors' own principal. The handler never donates USDG to
+    ///      the vault (a donation would be fee-bearing exactly like premium, and would have to be
+    ///      added here as a measured delta the day an action that donates exists).
+    ///      {VaultInvariantTest.invariant_feeNeverTouchesStrikeProceeds} bounds the fee by it.
+    uint256 public ghostPremiumToVault;
 
     /*//////////////////////////////////////////////////////////////
                               CALL STATS
@@ -638,8 +654,21 @@ contract VaultHandler is Test {
         uint256 fillAmount = bound(fillSeed, 1, remaining);
         usdg.mint(buyer, live.unitPrice * fillAmount + 1e6);
 
+        uint256 vaultUsdgBefore = usdg.balanceOf(address(vault));
         vm.prank(buyer);
         try seaport.fulfil(c, fillAmount) {
+            // The ghost is the MEASURED inflow, so a partial fill counts exactly what Seaport
+            // actually moved. It is cross-checked against the order's own vault leg (Overcall's
+            // 5% floored per contract, so the fraction is always exact) to prove the
+            // measurement is the premium and nothing else.
+            uint256 premiumIn = usdg.balanceOf(address(vault)) - vaultUsdgBefore;
+            uint256 feePerContract = (live.unitPrice * 500) / BPS;
+            assertEq(
+                premiumIn,
+                (live.unitPrice - feePerContract) * fillAmount,
+                "a fill paid the vault something other than its consideration leg"
+            );
+            ghostPremiumToVault += premiumIn;
             succeeded++;
             cFill++;
         } catch (bytes memory err) {
@@ -1252,6 +1281,53 @@ contract VaultInvariantTest is BaseTest {
         assertTrue(uint8(vault.phase()) != 3, "observed the Settling phase from outside rollClose");
     }
 
+    /// @notice The protocol fee is a cut of PREMIUM, never of principal. Everything the fee
+    ///         recipient has ever been paid, plus everything accrued and not yet swept, is at most
+    ///         `protocolFeeBps` of the premium that ever reached the vault.
+    /// @dev WHY THIS BOUND IS SOUND. Let u = usdg.balanceOf(vault) - usdgAccounted, the USDG the
+    ///      harvest has not yet seen. A fill raises u by exactly its premium. Every payout lowers
+    ///      the balance and `usdgAccounted` together, or (when `_debitUsdgOut` saturates) lowers
+    ///      u, so no outflow ever raises it. A harvest charges its fee on u minus the fee-free
+    ///      amount and resets u to 0: a deposit/mint checkpoint passes 0, and `rollClose` passes
+    ///      the claim redemption S, measured the instant before the harvest and therefore also
+    ///      sitting inside u, so its fee base is u - S, the premium since the last harvest. So
+    ///      the fee bases summed over every harvest never exceed the premium summed over every
+    ///      fill, and since each fee is floor(base * bps / 10_000), sum(fee) * 10_000 <=
+    ///      sum(base) * bps <= premium * bps. Stated multiplied out so no floor enters the bound.
+    ///
+    ///      `feeSafe` is fed by nothing but `_tryPayFee`, which moves a fee out of
+    ///      `pendingFeeUsdg` only when the transfer succeeds, so `balance(feeSafe) +
+    ///      pendingFeeUsdg` is exactly the lifetime fee accrued. The handler has no action that
+    ///      changes the policy or the fee recipient, so one `protocolFeeBps` governs every
+    ///      harvest in a run; that is pinned below rather than assumed. If a policy-changing
+    ///      action is ever added, bound by the MAXIMUM fee bps seen over the run instead.
+    ///
+    ///      What it catches: fee'ing strike proceeds. A single assigned 226.00 contract fee'd at
+    ///      5% is 11.30 USDG, while the handler never prices a contract above ~5.57 USDG gross, so the
+    ///      first assigned close after a pre-change build would put the fee far over this line.
+    function invariant_feeNeverTouchesStrikeProceeds() public view {
+        _assertFeeBoundedByPremium(handler.ghostPremiumToVault());
+    }
+
+    /// @dev The body of {invariant_feeNeverTouchesStrikeProceeds}, taking the premium as an
+    ///      argument so a hand-driven unit test that never went through the handler can state the
+    ///      same property against the premium it put in itself.
+    function _assertFeeBoundedByPremium(uint256 premiumToVault) internal view {
+        (,,,, uint16 feeBps,) = vault.policy();
+        assertEq(
+            feeBps,
+            Policy.launchDefaults().protocolFeeBps,
+            "the fee bps moved during a run: this bound assumes one rate and must track the max"
+        );
+
+        uint256 feesTaken = usdg.balanceOf(feeSafe) + vault.pendingFeeUsdg();
+        assertLe(
+            feesTaken * 10_000,
+            premiumToVault * feeBps,
+            "protocol fee exceeds protocolFeeBps of the premium: it has been charged on strike proceeds"
+        );
+    }
+
     /*//////////////////////////////////////////////////////////////
                             ANTI-VACUITY
     //////////////////////////////////////////////////////////////*/
@@ -1425,6 +1501,7 @@ contract VaultInvariantTest is BaseTest {
         invariant_noFreeShares();
         invariant_reservesAreReal();
         invariant_phaseSanity();
+        invariant_feeNeverTouchesStrikeProceeds();
     }
 
     /// @notice The redeem queue takes a whole position, which is what the handler assumes
@@ -1594,12 +1671,13 @@ contract VaultInvariantTest is BaseTest {
     ///        gross = 6_000_000, and the policy floor is
     ///          220_000_000 * 3 * 40 / 10_000                  = 2_640_000  -> clears it.
     ///      Nobody exercises, so at rollClose the claim returns all 3e18 and no strike proceeds.
-    ///      Harvest: balance 5_700_000, nothing committed, so gross = 5_700_000.
-    ///        protocol fee = 5_700_000 * 1_000 / 10_000        =   570_000
-    ///        net to holders                                   = 5_130_000
-    ///      Index: delta = 5_130_000 * 1e27 / 10e18 = 5.13e14, and 5.13e14 * 10e18 / 1e27
-    ///        = 5_130_000 exactly, so usdgDust stays 0.
-    ///      alice's accrual = 10e18 * 5.13e14 / 1e27            = 5_130_000.
+    ///      Harvest: balance 5_700_000, nothing committed, so gross = 5_700_000, all premium
+    ///      (no assignment, so nothing fee-free).
+    ///        protocol fee = 5_700_000 * 500 / 10_000          =   285_000
+    ///        net to holders                                   = 5_415_000
+    ///      Index: delta = 5_415_000 * 1e27 / 10e18 = 5.415e14, and 5.415e14 * 10e18 / 1e27
+    ///        = 5_415_000 exactly, so usdgDust stays 0.
+    ///      alice's accrual = 10e18 * 5.415e14 / 1e27           = 5_415_000.
     ///      And the share price does not move: 10e18 assets still back 10e18 shares.
     function test_premiumHarvestSplitsToTheBaseUnit() public {
         _deposit(alice, 10e18);
@@ -1620,11 +1698,11 @@ contract VaultInvariantTest is BaseTest {
         _rollClose();
 
         assertEq(nvda.balanceOf(address(vault)), 10e18, "all collateral came back: nobody exercised");
-        assertEq(usdg.balanceOf(feeSafe), 570_000, "protocol fee is 10% of the harvest");
-        assertEq(usdg.balanceOf(address(vault)), 5_130_000, "and the rest stays for holders");
-        assertEq(vault.totalUsdgDistributed(), 5_130_000, "credited in full");
-        assertEq(vault.usdgDust(), 0, "5_130_000 over 10e18 shares indexes exactly");
-        assertEq(vault.claimableUsdg(alice), 5_130_000, "alice can claim every cent of it");
+        assertEq(usdg.balanceOf(feeSafe), 285_000, "protocol fee is 5% of the premium harvested");
+        assertEq(usdg.balanceOf(address(vault)), 5_415_000, "and the rest stays for holders");
+        assertEq(vault.totalUsdgDistributed(), 5_415_000, "credited in full");
+        assertEq(vault.usdgDust(), 0, "5_415_000 over 10e18 shares indexes exactly");
+        assertEq(vault.claimableUsdg(alice), 5_415_000, "alice can claim every cent of it");
 
         // USDG is NOT part of the share price: 10e18 of asset still backs 10e18 of shares.
         assertEq(vault.totalAssets(), 10e18, "share backing unchanged by the premium");
@@ -1632,7 +1710,7 @@ contract VaultInvariantTest is BaseTest {
 
         vm.prank(alice);
         uint256 claimed = vault.claimUsdg();
-        assertEq(claimed, 5_130_000, "claim pays the accrual exactly");
+        assertEq(claimed, 5_415_000, "claim pays the accrual exactly");
         assertEq(usdg.balanceOf(address(vault)), 0, "vault is flat on USDG");
         assertEq(vault.usdgOwed(), 0, "and owes nobody anything");
     }
@@ -1649,19 +1727,27 @@ contract VaultInvariantTest is BaseTest {
     ///                + 1_111_111_111_111_111_113 = 12_222_222_222_222_222_221  (all 1:1)
     ///        queued  = 5_000_000_000_000_000_001 + 1_000_000_000_000_000_007 + 3
     ///                =  6_000_000_000_000_000_011
-    ///        3 contracts written, 3 sold, 1 exercised, so at rollClose the claim returns
-    ///        2e18 of asset and 236_000_000 of strike proceeds:
+    ///        3 contracts written on the 231 rung, 3 sold, 1 exercised, so at rollClose the
+    ///        claim returns 2e18 of asset and 231_000_000 of strike proceeds:
     ///          asset balance = 12_222_222_222_222_222_221 - 3e18 + 2e18
     ///                        = 11_222_222_222_222_222_221
     ///        payoutAssets = 11_222_222_222_222_222_221 * 6_000_000_000_000_000_011
     ///                       / 12_222_222_222_222_222_221 = 5_509_090_909_090_909_100
-    ///        USDG: premium 5_700_000 + strike 231_000_000 = 236_700_000 gross,
-    ///          fee = 23_670_000 (10%), net = 213_030_000. Indexed over the pre-burn supply:
-    ///          delta = 213_030_000 * 1e27 / 12_222_222_222_222_222_221 = 17_429_727_272_727_272
-    ///          credited = delta * 12_222_222_222_222_222_221 / 1e27 = 213_029_999, so exactly
+    ///        USDG: premium 5_700_000 + strike 231_000_000 = 236_700_000 gross. The strike
+    ///          proceeds are fee-free, so fee = 5_700_000 * 500 / 10_000 = 285_000 (5% of the
+    ///          premium only), net = 236_700_000 - 285_000 = 236_415_000. Indexed over the
+    ///          pre-burn supply:
+    ///          delta = 236_415_000 * 1e27 / 12_222_222_222_222_222_221 = 19_343_045_454_545_454
+    ///          credited = delta * 12_222_222_222_222_222_221 / 1e27 = 236_414_999, so exactly
     ///          one base unit stays behind as usdgDust.
     ///        Escrow accrual (the queue's own share of the week it sat through):
-    ///          6_000_000_000_000_000_011 * 17_429_727_272_727_272 / 1e27 = 104_578_363.
+    ///          6_000_000_000_000_000_011 * 19_343_045_454_545_454 / 1e27 = 116_058_272.
+    ///        USDG drawdown of that accrual, same order:
+    ///          alice 116_058_272 * 5_000_000_000_000_000_001 / 6_000_000_000_000_000_011
+    ///                                              =  96_715_226
+    ///          bob   19_343_046 * 1_000_000_000_000_000_007 / 1_000_000_000_000_000_010
+    ///                                              =  19_343_045
+    ///          carol, last, takes the remainder    =           1
     ///        Drawdown, in order alice / bob / carol:
     ///          alice 5_509_090_909_090_909_100 * 5_000_000_000_000_000_001
     ///                / 6_000_000_000_000_000_011 = 4_590_909_090_909_090_909
@@ -1705,12 +1791,12 @@ contract VaultInvariantTest is BaseTest {
         assertEq(nvda.balanceOf(address(vault)), 11_222_222_222_222_222_221, "2e18 back, 1e18 assigned away");
         assertEq(vault.reservedAssets(), 5_509_090_909_090_909_100, "hand-checked epoch reserve");
 
-        assertEq(usdg.balanceOf(feeSafe), 23_670_000, "protocol fee: 10% of 236_700_000 harvested");
-        assertEq(vault.totalUsdgDistributed(), 213_029_999, "hand-checked credit");
+        assertEq(usdg.balanceOf(feeSafe), 285_000, "protocol fee: 5% of the 5_700_000 premium, none of the strike");
+        assertEq(vault.totalUsdgDistributed(), 236_414_999, "hand-checked credit");
         assertEq(vault.usdgDust(), 1, "the one base unit the index could not represent");
 
         uint256 reservedUsdg = vault.usdgReservedForQueue();
-        assertEq(reservedUsdg, 104_578_363, "hand-checked escrow accrual, paid with the redemption");
+        assertEq(reservedUsdg, 116_058_272, "hand-checked escrow accrual, paid with the redemption");
 
         // Drain the epoch. The order matters: carol goes last with three wei of shares.
         vm.prank(alice);
@@ -1724,8 +1810,8 @@ contract VaultInvariantTest is BaseTest {
         assertEq(bOut, 918_181_818_181_818_188, "bob's pro-rata slice");
         assertEq(cOut, 3, "carol, last, takes exactly what is left");
         assertEq(aOut + bOut + cOut, 5_509_090_909_090_909_100, "the epoch paid out every base unit");
-        assertEq(aUsdg, 87_148_635, "alice's slice of the escrow accrual");
-        assertEq(bUsdg, 17_429_727, "bob's slice");
+        assertEq(aUsdg, 96_715_226, "alice's slice of the escrow accrual");
+        assertEq(bUsdg, 19_343_045, "bob's slice");
         assertEq(cUsdg, 1, "carol's three wei of shares still earn one base unit");
         assertEq(aUsdg + bUsdg + cUsdg, reservedUsdg, "and every base unit of the escrow's USDG");
 
@@ -1734,12 +1820,16 @@ contract VaultInvariantTest is BaseTest {
         assertEq(vault.usdgReservedForQueue(), 0, "no USDG stranded in the settled epoch");
         assertEq(vault.queuedSharesOf(carol), 0, "carol's queue slot is closed");
 
-        // And the invariants still hold after an awkward, fully drained settlement.
+        // And the invariants still hold after an awkward, fully drained settlement. The fee
+        // bound is stated against the 5_700_000 of premium this test filled by hand, since the
+        // handler's ghost never saw it; 285_000 * 10_000 == 5_700_000 * 500, so it holds with
+        // equality while 231_000_000 of strike proceeds went through the same harvest.
         invariant_usdgBooksBalance();
         invariant_shareAccounting();
         invariant_noFreeShares();
         invariant_reservesAreReal();
         invariant_phaseSanity();
+        _assertFeeBoundedByPremium(5_700_000);
     }
 
     /*//////////////////////////////////////////////////////////////

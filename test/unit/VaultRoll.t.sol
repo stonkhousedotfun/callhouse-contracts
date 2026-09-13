@@ -763,11 +763,12 @@ contract VaultRollTest is BaseTest {
     ///        consideration[1] (Overcall) = 100_000   * 10         =  1_000_000
     ///        consideration[0] (vault)    = 1_900_000 * 10         = 19_000_000
     ///        gross the buyer pays        = 2_000_000 * 10         = 20_000_000
-    ///      At rollClose nothing is committed yet, so the harvest is the whole 19_000_000:
-    ///        protocol fee = 19_000_000 * 1_000 / 10_000           =  1_900_000
-    ///        net to depositors = 19_000_000 - 1_900_000           = 17_100_000
+    ///      At rollClose nothing is committed yet, so the harvest is the whole 19_000_000, all
+    ///      of it premium (nothing assigned, so no fee-free strike proceeds):
+    ///        protocol fee = 19_000_000 * 500 / 10_000             =    950_000
+    ///        net to depositors = 19_000_000 - 950_000             = 18_050_000
     ///      Alice is the only holder, so `claimableUsdg(alice)` is that whole net.
-    ///      Sum check: 1_000_000 + 1_900_000 + 17_100_000 = 20_000_000, the buyer's outlay.
+    ///      Sum check: 1_000_000 + 950_000 + 18_050_000 = 20_000_000, the buyer's outlay.
     function test_fullOtmCycleReturnsAllCollateral() public {
         _deposit(alice, 20e18);
         assertEq(nvda.balanceOf(alice), 10e18, "alice kept 10 of her 30");
@@ -797,11 +798,11 @@ contract VaultRollTest is BaseTest {
         assertEq(vault.lockedAssets(), 0);
         assertEq(vault.idleAssets(), 20e18);
 
-        // Cash side: Overcall's 5%, the protocol's 10% of the net, the rest to the depositor.
+        // Cash side: Overcall's 5%, the protocol's 5% of the premium, the rest to the depositor.
         assertEq(usdg.balanceOf(overcallFee), 1_000_000, "Overcall 5% of gross");
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "protocol 10% of the 19 harvested");
-        assertEq(usdg.balanceOf(address(vault)), 17_100_000, "the rest waits to be claimed");
-        assertEq(vault.claimableUsdg(alice), 17_100_000);
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "protocol 5% of the 19 of premium harvested");
+        assertEq(usdg.balanceOf(address(vault)), 18_050_000, "the rest waits to be claimed");
+        assertEq(vault.claimableUsdg(alice), 18_050_000);
         assertEq(usdg.balanceOf(buyer), 5_000_000_000 - 20_000_000, "buyer paid gross once");
 
         // Conservation: every cent that left the buyer sits in exactly one of the three

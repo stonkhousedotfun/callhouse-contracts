@@ -134,7 +134,7 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 | `maxOtmBps` | 1200 | ceiling 2500 |
 | `minPremiumBps` | 40 | floor 10 |
 | `maxUtilizationBps` | 9500 | ceiling 10000 |
-| `protocolFeeBps` | 1000 | ceiling 2000 |
+| `protocolFeeBps` | 500 (5% of premium) | ceiling 2000. The fee base is premium only: strike proceeds from assignment are excluded in `Vault._accrueHarvest`, at any setting |
 | `maxContractsCap` | 50 | must be non-zero |
 | `maxPriceAge` | 4 days | 1 hour to 7 days |
 | listings per cycle | 3 | constant |

@@ -38,7 +38,8 @@ contract VaultQueueTest is BaseTest {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Chosen so nothing divides evenly: 7 + 1 + 3.3333 = 11.3333 queued out of a 33.0
-    ///      supply, settled against a 28.0 asset pot and $1,179.70 of USDG.
+    ///      supply, settled against a 28.0 asset pot and $1,179.70 of gross USDG ($1,178.465
+    ///      net: the 5% fee touches only the $24.70 premium, never the $1,155 of strikes).
     uint256 internal constant Q_ALICE = 7e18;
     uint256 internal constant Q_BOB = 1e18;
     uint256 internal constant Q_CAROL = 3_333_300_000_000_000_000; // 3.3333
@@ -318,7 +319,9 @@ contract VaultQueueTest is BaseTest {
     ///      earn exactly his own share and not one cent of hers.
     ///
     ///      20e18 supply, 10 contracts at $2.00: gross $20, Overcall 5% -> $19 to the vault,
-    ///      protocol 10% -> $1.90, leaving $17.10 to spread over 20e18 shares.
+    ///      protocol 5% of that premium -> $0.95, leaving $18.05 to spread over 20e18 shares.
+    ///        indexDelta = 18_050_000 * 1e27 / 20e18 = 902_500_000_000_000, exact (no dust)
+    ///        escrow 5e18 -> 4_512_500   Alice 5e18 -> 4_512_500   Bob 10e18 -> 9_025_000
     function test_queuedSharesEarnTheWeeksPremiumNotTheStayers() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
@@ -331,23 +334,23 @@ contract VaultQueueTest is BaseTest {
         _closeCycle();
 
         assertEq(usdg.balanceOf(overcallFee), 1_000_000, "Overcall's 5%");
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "protocol 10% of the $19 net");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "protocol 5% of the $19 premium");
 
         (uint256 sharesR, uint256 assetsR, uint256 usdgR) = vault.epochs(1);
         assertEq(sharesR, 5e18, "epoch shares");
         assertEq(assetsR, 5e18, "expired OTM, so a quarter of the 20e18 pot");
-        assertEq(usdgR, 4_275_000, "the escrow's own quarter of $17.10");
+        assertEq(usdgR, 4_512_500, "the escrow's own quarter of $18.05");
 
-        assertEq(vault.claimableUsdg(bob), 8_550_000, "the stayer earns exactly his half, no windfall");
-        assertEq(vault.claimableUsdg(alice), 4_275_000, "Alice's un-queued quarter");
-        assertEq(vault.usdgReservedForQueue(), 4_275_000, "the escrow's accrual is ring-fenced");
+        assertEq(vault.claimableUsdg(bob), 9_025_000, "the stayer earns exactly his half, no windfall");
+        assertEq(vault.claimableUsdg(alice), 4_512_500, "Alice's un-queued quarter");
+        assertEq(vault.usdgReservedForQueue(), 4_512_500, "the escrow's accrual is ring-fenced");
 
         (uint256 pa, uint256 pu) = vault.previewCompleteRedeem(alice);
         assertEq(pa, 5e18, "preview assets");
-        assertEq(pu, 4_275_000, "preview usdg");
+        assertEq(pu, 4_512_500, "preview usdg");
 
         vm.expectEmit(true, true, false, true, address(vault));
-        emit CompleteRedeem(alice, alice, 5e18, 5e18, 4_275_000);
+        emit CompleteRedeem(alice, alice, 5e18, 5e18, 4_512_500);
         (uint256 assets, uint256 usdgOut) = _complete(alice);
         assertEq(assets, pa, "payout matches preview");
         assertEq(usdgOut, pu, "payout matches preview");
@@ -356,10 +359,10 @@ contract VaultQueueTest is BaseTest {
         vault.claimUsdg();
 
         // Both halves earned the same rate, and the total matches Bob's for equal exposure.
-        assertEq(usdg.balanceOf(alice), 8_550_000, "queued half + kept half == a full week's rate");
-        assertEq(vault.claimableUsdg(bob), 8_550_000, "stayer's share is exactly his own");
+        assertEq(usdg.balanceOf(alice), 9_025_000, "queued half + kept half == a full week's rate");
+        assertEq(vault.claimableUsdg(bob), 9_025_000, "stayer's share is exactly his own");
         assertEq(vault.usdgReservedForQueue(), 0, "ring-fence released");
-        assertEq(usdg.balanceOf(address(vault)), 8_550_000, "only Bob's claim is left behind");
+        assertEq(usdg.balanceOf(address(vault)), 9_025_000, "only Bob's claim is left behind");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -421,7 +424,7 @@ contract VaultQueueTest is BaseTest {
     /// @dev THE core queue invariant. Three holders queue amounts that share no common factor
     ///      with each other or with the pot, and the pot itself is awkward: a 33e18 supply
     ///      writes 13 contracts, 5 of which are assigned, so 28e18 of asset and $1,179.70 of
-    ///      USDG come back to be split 11.3333e18 ways.
+    ///      USDG ($1,178.465 after the premium-only fee) come back to be split 11.3333e18 ways.
     ///
     ///      A naive "everyone gets floor(pot * mine / total)" split strands dust in the vault
     ///      forever, once per epoch, for the life of the product. This proves the draw-down
@@ -498,14 +501,15 @@ contract VaultQueueTest is BaseTest {
         assertEq(vault.totalSupply(), 0, "every share burned at settlement");
         assertEq(vault.totalAssets(), 0, "NAV is zero: it all belongs to the epoch now");
         assertEq(vault.reservedAssets(), 20e18, "the whole pot is reserved");
+        // $19.00 premium, 5% protocol fee $0.95, $18.05 net indexed over the 20e18 escrow.
         (,, uint256 usdgR) = vault.epochs(1);
-        assertEq(usdgR, 17_100_000, "the whole net premium follows the queue out");
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "protocol fee still taken");
+        assertEq(usdgR, 18_050_000, "the whole net premium follows the queue out");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "protocol fee still taken");
 
         (uint256 aA, uint256 aU) = _complete(alice);
         (uint256 bA, uint256 bU) = _complete(bob);
         assertEq(aA + bA, 20e18, "all collateral out");
-        assertEq(aU + bU, 17_100_000, "all premium out");
+        assertEq(aU + bU, 18_050_000, "all premium out");
         assertEq(nvda.balanceOf(address(vault)), 0, "no asset stranded");
         assertEq(usdg.balanceOf(address(vault)), 0, "no USDG stranded");
 
@@ -522,7 +526,11 @@ contract VaultQueueTest is BaseTest {
     ///      than promising one asset unit per share and quietly going short.
     ///
     ///      20e18 supply, 10 written, 4 assigned at $231: 16e18 of asset survives, and $19 of
-    ///      premium plus $924 of strike proceeds land, less the 10% protocol fee.
+    ///      premium plus $924 of strike proceeds land. The 5% protocol fee is on the premium
+    ///      only; the strike proceeds are principal and reach holders fee-free.
+    ///        gross 943_000_000 | fee 19_000_000 * 5% = 950_000 | net 942_050_000
+    ///        indexDelta = 942_050_000 * 1e27 / 20e18 = 47_102_500_000_000_000, exact
+    ///        escrow 5e18 -> 235_512_500
     function test_assignedWeekPaysAMixOfAssetAndUsdg() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
@@ -534,15 +542,15 @@ contract VaultQueueTest is BaseTest {
 
         assertEq(nvda.balanceOf(buyer), 4e18, "buyer took delivery of 4 lots");
         assertEq(nvda.balanceOf(address(vault)), 16e18, "vault is 4e18 lighter");
-        assertEq(usdg.balanceOf(feeSafe), 94_300_000, "10% of $19 premium + $924 strike");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "5% of $19 premium, nothing on the $924 strike");
 
         (, uint256 assetsR, uint256 usdgR) = vault.epochs(1);
         assertEq(assetsR, 4e18, "a quarter of the 16e18 that survived, not the 5e18 queued");
-        assertEq(usdgR, 212_175_000, "a quarter of the $848.70 net");
+        assertEq(usdgR, 235_512_500, "a quarter of the $942.05 net");
 
         (uint256 assets, uint256 usdgOut) = _complete(alice);
         assertEq(assets, 4e18, "asset leg");
-        assertEq(usdgOut, 212_175_000, "USDG leg");
+        assertEq(usdgOut, 235_512_500, "USDG leg");
         assertLt(assets, 5e18, "NOT a 1:1 token promise against the shares queued");
 
         // The stayer takes the identical haircut; assignment is not dumped on the queue.
@@ -603,8 +611,9 @@ contract VaultQueueTest is BaseTest {
     /// @dev The auto-settle above must be visible off-chain: it moves real value out of an
     ///      epoch and into the owner's owed balances, and before the event existed an indexer
     ///      saw the epoch drain with no claim against it. 10 contracts filled at $2.00 gross
-    ///      pays the vault 19_000_000; the 1_000 bps protocol fee leaves 17_100_000 over 20
-    ///      whole shares, and the escrow's quarter of the supply accrues exactly 4_275_000.
+    ///      pays the vault 19_000_000; the 500 bps protocol fee on that premium (950_000) leaves
+    ///      18_050_000 over 20 whole shares, and the escrow's quarter of the supply accrues
+    ///      exactly 5e18 * (18_050_000 * 1e27 / 20e18) / 1e27 = 4_512_500.
     function test_queueEntrySettledIsEmittedWhenQueueingOverAStaleSlot() public {
         _deposit(alice, 20e18);
         _queue(alice, 5e18);
@@ -614,7 +623,7 @@ contract VaultQueueTest is BaseTest {
         _nextCycle();
 
         vm.expectEmit(true, true, true, true, address(vault));
-        emit QueueEntrySettled(alice, 1, 5e18, 5e18, 4_275_000);
+        emit QueueEntrySettled(alice, 1, 5e18, 5e18, 4_512_500);
         _queue(alice, 4e18);
 
         assertEq(vault.owedAssets(alice), 5e18);
@@ -838,8 +847,9 @@ contract VaultQueueTest is BaseTest {
     ///      remaining holders' collateral; under-payment strands it forever.
     ///
     ///      THE BOUNDS EARN THEIR KEEP. An earlier version of this test wrote a single contract
-    ///      and allowed a 1-wei queue. At a 50e18 supply one contract nets $17.10 of premium,
-    ///      so the escrow's accrual is floor(1 * 1_710_000 * 1e27 / 50e18 / 1e27) == 0 and every
+    ///      and allowed a 1-wei queue. At a 50e18 supply one contract nets $1.805 of premium
+    ///      after the 5% fee, so the escrow's accrual is
+    ///      floor(1 * (1_805_000 * 1e27 / 50e18) / 1e27) == 0 and every
     ///      USDG assertion below held trivially at 0 == 0. The contract count now scales with
     ///      the pot and the queue floor is 1e15, and `assertGt(usdgR, 0)` keeps it that way.
     function testFuzz_collectionsNeverExceedWhatWasReserved(
@@ -974,17 +984,24 @@ contract VaultQueueTest is BaseTest {
     ///        cycle 1  supply 40e18, held 40e18, Alice queues 10e18, nothing sold
     ///                 epoch1 = (10e18 shares, 40e18 * 10/40 = 10e18 assets, 0 USDG)
     ///                 reservedAssets 10e18 | supply 30e18 | NAV 40 - 10 = 30e18 | price 1.0
-    ///        cycle 2  Bob queues 10e18, 10 contracts fill at $2.00
-    ///                 gross $20.00, Overcall 5% = $1.00, so $19.00 reaches the vault
-    ///                 protocol 10% of $19.00 = $1.90 to feeSafe, $17.10 left to spread
-    ///                 $17.10 / 30e18 shares = $0.57 per 1e18 shares
-    ///                   escrow 10e18 -> 5_700_000   Alice 10e18 -> 5_700_000   Bob 10e18 -> 5_700_000
+    ///        cycle 2  Bob queues 10e18, 12 contracts fill at $2.00
+    ///                 gross $24.00, Overcall 5% = $1.20, so $22.80 reaches the vault
+    ///                 protocol 5% of the $22.80 premium = $1.14 to feeSafe, $21.66 to spread
+    ///                 indexDelta = 21_660_000 * 1e27 / 30e18 = 722_000_000_000_000, exact
+    ///                   escrow 10e18 -> 7_220_000   Alice 10e18 -> 7_220_000   Bob 10e18 -> 7_220_000
     ///                 idleAssets = 40e18 held - 10e18 reserved = 30e18   (NOT 40e18)
-    ///                 epoch2 = (10e18, 30e18 * 10/30 = 10e18, 5_700_000)
+    ///                 epoch2 = (10e18, 30e18 * 10/30 = 10e18, 7_220_000)
     ///                 reservedAssets 20e18 | supply 20e18 | NAV 20e18 | price still 1.0
     ///        A raw-balance settlement would have set epoch2's asset leg to
     ///        40e18 * 10/30 = 13.33e18 and put `reservedAssets` at 23.33e18 against a 40e18
     ///        balance that only has 20e18 of genuinely free collateral behind it.
+    ///
+    ///      WHY 12 CONTRACTS, NOT 10. The closing USDG checks below are exact: the vault holds
+    ///      precisely the stayers' claims, with no index dust. That needs the net to split into
+    ///      whole thirds. At 10 contracts the net is 18_050_000, which does not: the index floors
+    ///      to 601_666_666_666_666, each third accrues 6_016_666 and 1 unit is carried as
+    ///      `usdgDust`. 12 contracts (well inside 95% of the 30e18 idle) nets 21_660_000, which
+    ///      divides by 3 exactly, so the property is still stated with assertEq.
     function test_twoUncollectedEpochsReserveIndependently() public {
         _deposit(alice, 20e18);
         _deposit(bob, 20e18);
@@ -1001,15 +1018,15 @@ contract VaultQueueTest is BaseTest {
         // ---- cycle 2: Bob queues, the week fills ----
         _nextCycle();
         _queue(bob, 10e18);
-        _openAndFill(10);
+        _openAndFill(12);
         _closeCycle();
 
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "10% of the $19.00 that reached the vault");
+        assertEq(usdg.balanceOf(feeSafe), 1_140_000, "5% of the $22.80 premium that reached the vault");
 
         (uint256 s2, uint256 a2, uint256 u2) = vault.epochs(2);
         assertEq(s2, 10e18, "epoch 2 shares");
         assertEq(a2, 10e18, "priced off idleAssets 30e18, NOT the 40e18 raw balance");
-        assertEq(u2, 5_700_000, "the escrow's third of the $17.10 net");
+        assertEq(u2, 7_220_000, "the escrow's third of the $21.66 net");
 
         assertEq(vault.reservedAssets(), 20e18, "both epochs reserved, side by side");
         assertEq(nvda.balanceOf(address(vault)), 40e18, "and both are physically covered");
@@ -1020,7 +1037,7 @@ contract VaultQueueTest is BaseTest {
         // ---- both collect, in the wrong order, long after the fact ----
         (uint256 bA, uint256 bU) = _complete(bob);
         assertEq(bA, 10e18, "epoch 2 asset leg");
-        assertEq(bU, 5_700_000, "epoch 2 USDG leg");
+        assertEq(bU, 7_220_000, "epoch 2 USDG leg");
 
         (uint256 aA, uint256 aU) = _complete(alice);
         assertEq(aA, 10e18, "epoch 1 paid in full despite settling first and collecting last");
@@ -1034,11 +1051,11 @@ contract VaultQueueTest is BaseTest {
         assertEq(left1, 0, "epoch 1 drained to zero");
         assertEq(left2, 0, "epoch 2 drained to zero");
 
-        // $17.10 distributed, $5.70 walked out with Bob's queue, $11.40 owed to the stayers.
-        assertEq(vault.claimableUsdg(alice), 5_700_000, "Alice's un-queued half earned its own");
-        assertEq(vault.claimableUsdg(bob), 5_700_000, "so did Bob's");
-        assertEq(usdg.balanceOf(address(vault)), 11_400_000, "and the vault holds exactly that");
-        assertEq(vault.usdgOwed(), 11_400_000, "with nothing unaccounted for");
+        // $21.66 distributed, $7.22 walked out with Bob's queue, $14.44 owed to the stayers.
+        assertEq(vault.claimableUsdg(alice), 7_220_000, "Alice's un-queued half earned its own");
+        assertEq(vault.claimableUsdg(bob), 7_220_000, "so did Bob's");
+        assertEq(usdg.balanceOf(address(vault)), 14_440_000, "and the vault holds exactly that");
+        assertEq(vault.usdgOwed(), 14_440_000, "with nothing unaccounted for");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1085,10 +1102,11 @@ contract VaultQueueTest is BaseTest {
     ///      exit silently donates its back-premium to whoever stayed.
     ///
     ///      HAND ARITHMETIC  cycle 1: 10 contracts at $2.00 -> $20.00 gross, $1.00 to Overcall,
-    ///      $19.00 to the vault, $1.90 protocol fee, $17.10 spread over a 20e18 supply =
-    ///      $0.855 per 1e18 shares. Alice and Bob earn 8_550_000 each and neither claims.
+    ///      $19.00 to the vault, $0.95 protocol fee (5% of that premium), $18.05 spread over a
+    ///      20e18 supply = $0.9025 per 1e18 shares (indexDelta 902_500_000_000_000, exact).
+    ///      Alice and Bob earn 9_025_000 each and neither claims.
     ///      Cycle 2 is unsold, so the escrow itself earns nothing and the epoch's USDG leg is 0
-    ///      — which is precisely why Alice's 8_550_000 has to survive somewhere else.
+    ///      — which is precisely why Alice's 9_025_000 has to survive somewhere else.
     function test_aFullExitCarriesThePreviousWeeksUnclaimedPremium() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
@@ -1096,14 +1114,14 @@ contract VaultQueueTest is BaseTest {
         _openAndFill(10);
         _closeCycle();
 
-        assertEq(vault.claimableUsdg(alice), 8_550_000, "half of the $17.10 net");
-        assertEq(vault.claimableUsdg(bob), 8_550_000, "the other half");
+        assertEq(vault.claimableUsdg(alice), 9_025_000, "half of the $18.05 net");
+        assertEq(vault.claimableUsdg(bob), 9_025_000, "the other half");
 
         // ---- Alice exits 100%, without ever claiming ----
         _nextCycle();
         _queue(alice, 10e18);
         assertEq(vault.balanceOf(alice), 0, "no share balance left to accrue against");
-        assertEq(vault.claimableUsdg(alice), 8_550_000, "settled into her pot on the way into escrow");
+        assertEq(vault.claimableUsdg(alice), 9_025_000, "settled into her pot on the way into escrow");
 
         _rollOpen(5); // unsold week
         _closeCycle();
@@ -1118,15 +1136,15 @@ contract VaultQueueTest is BaseTest {
         assertEq(vault.totalSupply(), 10e18, "only Bob is left");
 
         // The old premium is still hers and still claimable with a zero share balance.
-        assertEq(vault.claimableUsdg(alice), 8_550_000, "a full exit did not burn her back-premium");
+        assertEq(vault.claimableUsdg(alice), 9_025_000, "a full exit did not burn her back-premium");
         vm.prank(alice);
-        assertEq(vault.claimUsdg(), 8_550_000, "and she can still draw it");
-        assertEq(usdg.balanceOf(alice), 8_550_000, "paid in full");
+        assertEq(vault.claimUsdg(), 9_025_000, "and she can still draw it");
+        assertEq(usdg.balanceOf(alice), 9_025_000, "paid in full");
         assertEq(nvda.balanceOf(alice), 30e18, "every NVDA token back as well");
 
-        assertEq(vault.claimableUsdg(bob), 8_550_000, "the stayer got his own share and not one cent of hers");
-        assertEq(usdg.balanceOf(address(vault)), 8_550_000, "exactly Bob's claim is left behind");
-        assertEq(vault.usdgOwed(), 8_550_000, "and the ledger agrees with the balance");
+        assertEq(vault.claimableUsdg(bob), 9_025_000, "the stayer got his own share and not one cent of hers");
+        assertEq(usdg.balanceOf(address(vault)), 9_025_000, "exactly Bob's claim is left behind");
+        assertEq(vault.usdgOwed(), 9_025_000, "and the ledger agrees with the balance");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1189,12 +1207,12 @@ contract VaultQueueTest is BaseTest {
         vm.prank(alice);
         (uint256 assets, uint256 usdgOut) = vault.completeRedeem(carol);
 
-        // 20e18 supply, 10 contracts: $19.00 to the vault, $1.90 fee, $17.10 over 20e18.
-        // Alice's escrowed 5e18 is a quarter of that supply -> $4.275.
+        // 20e18 supply, 10 contracts: $19.00 to the vault, $0.95 fee (5% of premium), $18.05
+        // over 20e18. Alice's escrowed 5e18 is a quarter of that supply -> $4.5125.
         assertEq(assets, 5e18, "asset leg");
-        assertEq(usdgOut, 4_275_000, "USDG leg");
+        assertEq(usdgOut, 4_512_500, "USDG leg");
         assertEq(nvda.balanceOf(carol), carolNvdaBefore + 5e18, "asset routed to the receiver");
-        assertEq(usdg.balanceOf(carol), 4_275_000, "USDG routed to the same receiver");
+        assertEq(usdg.balanceOf(carol), 4_512_500, "USDG routed to the same receiver");
         assertEq(nvda.balanceOf(alice), aliceNvdaBefore, "owner's asset balance untouched");
         assertEq(usdg.balanceOf(alice), aliceUsdgBefore, "owner's USDG balance untouched");
 
@@ -1223,11 +1241,13 @@ contract VaultQueueTest is BaseTest {
     ///      HAND ARITHMETIC — supply is 20e18 when the order fills and when Carol's deposit
     ///      forces the checkpoint.
     ///        10 contracts at $2.00  -> $20.00 gross, Overcall 5% = $1.00, $19.00 to the vault
-    ///        protocol 10% of $19.00 = $1.90, leaving $17.10 to index over 20e18 shares
-    ///          Alice (5e18, kept)   -> 4_275_000
-    ///          escrow (5e18)        -> 4_275_000   <- must survive Carol's arrival intact
-    ///          Bob   (10e18)        -> 8_550_000
+    ///        protocol 5% of the $19.00 premium = $0.95, leaving $18.05 to index over 20e18
+    ///        indexDelta = 18_050_000 * 1e27 / 20e18 = 902_500_000_000_000, exact
+    ///          Alice (5e18, kept)   -> 4_512_500
+    ///          escrow (5e18)        -> 4_512_500   <- must survive Carol's arrival intact
+    ///          Bob   (10e18)        -> 9_025_000
     ///          Carol (10e18, after) ->         0
+    ///      The fee is taken once, at Carol's checkpoint, and swept at the close.
     ///      Carol then joins the ASSET pot, so settlement pays the escrow
     ///      30e18 * 5/30 = 5e18 — the same 1.0 per share everyone else holds.
     function test_aLateDepositorDoesNotDiluteAQueuedPositionsPremium() public {
@@ -1243,26 +1263,26 @@ contract VaultQueueTest is BaseTest {
 
         _closeCycle();
 
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "10% of the $19.00 that reached the vault");
+        assertEq(usdg.balanceOf(feeSafe), 950_000, "5% of the $19.00 premium that reached the vault");
         assertEq(vault.pendingFeeUsdg(), 0, "and the accrued fee actually left at the close");
 
         (uint256 sharesR, uint256 assetsR, uint256 usdgR) = vault.epochs(1);
         assertEq(sharesR, 5e18, "epoch shares");
-        assertEq(usdgR, 4_275_000, "the escrow's quarter of the $17.10, undiluted by Carol");
+        assertEq(usdgR, 4_512_500, "the escrow's quarter of the $18.05, undiluted by Carol");
         assertEq(assetsR, 5e18, "and its sixth of the 30e18 asset pot Carol did join");
 
-        assertEq(vault.claimableUsdg(alice), 4_275_000, "her kept half earned the same rate");
-        assertEq(vault.claimableUsdg(bob), 8_550_000, "the stayer earned exactly his own");
+        assertEq(vault.claimableUsdg(alice), 4_512_500, "her kept half earned the same rate");
+        assertEq(vault.claimableUsdg(bob), 9_025_000, "the stayer earned exactly his own");
         assertEq(vault.claimableUsdg(carol), 0, "and the latecomer still earns nothing");
         assertEq(
             vault.claimableUsdg(alice) + vault.claimableUsdg(bob) + usdgR,
-            17_100_000,
+            18_050_000,
             "every cent of the net premium is accounted for"
         );
 
         (uint256 assets, uint256 usdgOut) = _complete(alice);
         assertEq(assets, 5e18, "asset leg");
-        assertEq(usdgOut, 4_275_000, "USDG leg");
+        assertEq(usdgOut, 4_512_500, "USDG leg");
 
         assertEq(vault.totalSupply(), 25e18, "5e18 burned at settlement");
         assertEq(vault.totalAssets(), 25e18, "and the asset pot follows it exactly");

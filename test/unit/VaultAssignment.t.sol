@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BaseTest} from "../Base.t.sol";
-import {Policy} from "../../src/Policy.sol";
+import {Policy, PolicyParams} from "../../src/Policy.sol";
 import {MockClear} from "../../src/mocks/MockClear.sol";
 import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 
@@ -18,15 +18,18 @@ import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 ///        Overcall fee per contract  5% of 2.00   =   100_000   (floored PER CONTRACT)
 ///        vault premium per contract 2.00 - 0.10  = 1_900_000
 ///        strike per contract        $231.00      = 231_000_000
-///        protocol fee               1_000 bps of the whole harvest (Policy.launchDefaults)
-///      So a 10-contract week that fully fills pays the vault 19_000_000 of premium and
-///      Overcall 1_000_000, and every assigned contract adds 231_000_000 on top.
+///        protocol fee               500 bps of the PREMIUM only (Policy.launchDefaults);
+///                                   strike proceeds are credited to holders fee-free
+///      So a 10-contract week that fully fills pays the vault 19_000_000 of premium (fee
+///      950_000) and Overcall 1_000_000, and every assigned contract adds 231_000_000 on top,
+///      none of which is fee'd.
 contract VaultAssignmentTest is BaseTest {
     /// @dev Re-declared so {vm.expectEmit} has a shape to match. Must stay byte-identical to
     ///      the declaration in {Vault}.
     event RollClose(
         uint32 indexed cycleNumber, uint256 assetsReturned, uint256 usdgFromAssignment, uint256 contractsAssignedCount
     );
+    event Harvest(uint32 indexed cycleNumber, uint256 grossUsdg, uint256 feeUsdg, uint256 netUsdg);
 
     uint256 internal constant STRIKE = 231_000_000; // RUNG_PICK, USDG 6dp per contract
 
@@ -36,11 +39,14 @@ contract VaultAssignmentTest is BaseTest {
 
     /// @dev Harvest of a fully filled, fully assigned 10-contract week.
     ///        gross = 10 * 231_000_000 + 19_000_000 = 2_329_000_000
-    ///        fee   = gross * 1000 / 10000          =   232_900_000
-    ///        net   = gross - fee                   = 2_096_100_000
+    ///        fee   = 19_000_000 * 500 / 10000      =       950_000   (premium only)
+    ///        net   = gross - fee                   = 2_328_050_000
     uint256 internal constant FULL_ASSIGN_GROSS = 2_329_000_000;
-    uint256 internal constant FULL_ASSIGN_FEE = 232_900_000;
-    uint256 internal constant FULL_ASSIGN_NET = 2_096_100_000;
+    uint256 internal constant FULL_ASSIGN_FEE = 950_000;
+    uint256 internal constant FULL_ASSIGN_NET = 2_328_050_000;
+
+    /// @dev The fee on a fully filled 10-contract week, assigned or not: 5% of 19_000_000.
+    uint256 internal constant PREMIUM_FEE_10 = 950_000;
 
     /*//////////////////////////////////////////////////////////////
                           FULL ASSIGNMENT
@@ -57,8 +63,8 @@ contract VaultAssignmentTest is BaseTest {
     ///        vault NVDA at the end  10e18 idle + 0 returned    = 10e18
     ///        USDG in                10 x 231_000_000 strike    = 2_310_000_000
     ///                             +      19_000_000 premium    = 2_329_000_000 gross
-    ///        protocol fee           2_329_000_000 * 10%        =   232_900_000
-    ///        to depositors          2_329_000_000 - fee        = 2_096_100_000
+    ///        protocol fee           19_000_000 premium * 5%    =       950_000
+    ///        to depositors          2_329_000_000 - fee        = 2_328_050_000
     function test_fullAssignment_allTenExercised() public {
         _deposit(alice, 20e18);
         assertEq(vault.totalAssets(), 20e18, "start flat at 20 NVDA");
@@ -96,10 +102,10 @@ contract VaultAssignmentTest is BaseTest {
 
         assertEq(10 * STRIKE + PREMIUM_TO_VAULT_10, FULL_ASSIGN_GROSS, "strike proceeds plus premium");
         assertEq(FULL_ASSIGN_FEE + FULL_ASSIGN_NET, FULL_ASSIGN_GROSS, "the split accounts for every cent");
-        assertEq(usdg.balanceOf(feeSafe), FULL_ASSIGN_FEE, "protocol fee is 10% of the whole harvest");
+        assertEq(usdg.balanceOf(feeSafe), FULL_ASSIGN_FEE, "protocol fee is 5% of the premium, nothing on the strikes");
         assertEq(usdg.balanceOf(address(vault)), FULL_ASSIGN_NET, "the rest is held for depositors");
         assertEq(vault.claimableUsdg(alice), FULL_ASSIGN_NET, "and all of it is alice's");
-        assertEq(vault.usdgDust(), 0, "2_096_100_000 over 20e18 shares indexes exactly");
+        assertEq(vault.usdgDust(), 0, "2_328_050_000 over 20e18 shares indexes exactly");
         assertEq(usdg.balanceOf(overcallFee), PREMIUM_TO_OVERCALL_10, "Overcall's 5% of the premium only");
 
         // The buyer paid strike + premium and nothing else.
@@ -115,12 +121,46 @@ contract VaultAssignmentTest is BaseTest {
         assertTrue(vault.canRedeemInstantly(), "flat again, so no queue");
     }
 
-    /// @dev The fee is charged on the WHOLE USDG balance, and on an assigned week most of that
-    ///      balance is the sale price of the depositors' own collateral, not yield. Split out
-    ///      here because the number is easy to miss inside a bigger test: 231.00 of the 232.90
-    ///      fee is 10% of returned principal. Contrast test_zeroAssignment_despiteFullFill,
-    ///      where the identical week with nothing exercised pays a fee of 1_900_000.
-    function test_protocolFeeIsChargedOnStrikeProceedsNotJustPremium() public {
+    /// @dev REGRESSION GUARD. The fee is charged on the PREMIUM only. On an assigned week most of
+    ///      the USDG that arrives is the strike price of the depositors' own called-away stock:
+    ///      principal changing form, not yield. An earlier draft fee'd the whole inflow, so this
+    ///      exact week paid 232_900_000, of which 231_000_000 was 10% of returned principal and
+    ///      more than twelve times the entire premium. Now the assigned week pays exactly what
+    ///      the identical unassigned week pays (test_zeroAssignment_despiteFullFill).
+    function test_protocolFeeIsChargedOnPremiumOnlyNeverOnStrikeProceeds() public {
+        _deposit(alice, 20e18);
+        uint256 oid = _rollOpen(10);
+        OrderComponents memory c = _approveListing(oid, 10, _okUnitPrice());
+        _fill(c, 10);
+        _warpToExercise();
+        vault.lockBook();
+        _exercise(oid, 10);
+        _warpToExpiry();
+
+        // The terminal Harvest still reports the whole inflow as gross; only the fee changed.
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit Harvest(1, FULL_ASSIGN_GROSS, PREMIUM_FEE_10, FULL_ASSIGN_GROSS - PREMIUM_FEE_10);
+        _rollClose();
+
+        assertEq(usdg.balanceOf(feeSafe), (PREMIUM_TO_VAULT_10 * 500) / 10_000, "5% of the premium");
+        assertEq(usdg.balanceOf(feeSafe), PREMIUM_FEE_10, "the same fee as the unassigned week");
+        assertLt(usdg.balanceOf(feeSafe), PREMIUM_TO_VAULT_10, "a cut of the yield, never more than it");
+        assertEq(
+            vault.claimableUsdg(alice),
+            10 * STRIKE + PREMIUM_TO_VAULT_10 - PREMIUM_FEE_10,
+            "every strike dollar reaches holders"
+        );
+    }
+
+    /// @dev The admin's whole fee lever, pulled all the way, still cannot reach principal. A
+    ///      compromised Safe can raise `protocolFeeBps` to the compiled-in 2_000 ceiling; on an
+    ///      assigned week that used to mean 20% of the strike proceeds. Now it is 20% of premium.
+    function test_maxFeeCeilingOnAnAssignedWeekTakesOnlyPremium() public {
+        PolicyParams memory p = Policy.launchDefaults();
+        p.protocolFeeBps = 2_000;
+        vm.prank(admin);
+        vault.setPolicy(p);
+
         _deposit(alice, 20e18);
         uint256 oid = _rollOpen(10);
         OrderComponents memory c = _approveListing(oid, 10, _okUnitPrice());
@@ -131,15 +171,31 @@ contract VaultAssignmentTest is BaseTest {
         _warpToExpiry();
         _rollClose();
 
-        uint256 feeOnPremium = PREMIUM_TO_VAULT_10 / 10; // 1_900_000, the fee on actual yield
-        uint256 feeOnPrincipal = (10 * STRIKE) / 10; // 231_000_000, the fee on returned principal
-        assertEq(usdg.balanceOf(feeSafe), feeOnPremium + feeOnPrincipal, "the fee decomposes exactly");
+        assertEq(usdg.balanceOf(feeSafe), 3_800_000, "20% of 19_000_000 premium, nothing of 2_310_000_000 strikes");
+        assertEq(vault.claimableUsdg(alice), 10 * STRIKE + PREMIUM_TO_VAULT_10 - 3_800_000, "strikes intact");
+    }
 
-        // The sharp version of the same fact: the protocol took more out of this week than the
-        // entire premium the vault was paid for writing the calls. Everything above
-        // PREMIUM_TO_VAULT_10 is a haircut on the depositors' own called-away stock.
-        assertGt(usdg.balanceOf(feeSafe), PREMIUM_TO_VAULT_10, "the fee exceeds 100% of the week's yield");
-        assertEq(usdg.balanceOf(feeSafe) - feeOnPremium, feeOnPrincipal, "and the excess is exactly 10% of principal");
+    /// @dev A premium checkpointed by a mid-week deposit is fee'd once, at the checkpoint, and
+    ///      the close then sees only strike proceeds: fee 0 at the close, and the week's total
+    ///      fee is still exactly 5% of premium.
+    function test_checkpointedPremiumThenAssignment_feeIsStillPremiumOnly() public {
+        _deposit(alice, 20e18);
+        uint256 oid = _rollOpen(10);
+        OrderComponents memory c = _approveListing(oid, 10, _okUnitPrice());
+        _fill(c, 10);
+        _deposit(bob, 10e18); // checkpoints the 19_000_000 premium
+        assertEq(vault.pendingFeeUsdg(), PREMIUM_FEE_10, "fee accrued at the checkpoint");
+
+        _warpToExercise();
+        vault.lockBook();
+        _exercise(oid, 10);
+        _warpToExpiry();
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit Harvest(1, 10 * STRIKE, 0, 10 * STRIKE);
+        _rollClose();
+
+        assertEq(usdg.balanceOf(feeSafe), PREMIUM_FEE_10, "one fee for the week, on premium only");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -152,8 +208,8 @@ contract VaultAssignmentTest is BaseTest {
     ///      ARITHMETIC, BY HAND:
     ///        vault NVDA at the end  10e18 never written out + 6e18 returned = 16e18
     ///        USDG in                4 x 231_000_000 + 19_000_000 = 943_000_000 gross
-    ///        protocol fee           943_000_000 * 10%            =  94_300_000
-    ///        to depositors                                       = 848_700_000
+    ///        protocol fee           19_000_000 premium * 5%      =     950_000
+    ///        to depositors                                       = 942_050_000
     function test_partialAssignment_fourOfTen() public {
         _deposit(alice, 20e18);
 
@@ -180,9 +236,9 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(nvda.balanceOf(address(clear)), 0, "the clearinghouse kept nothing back");
 
         assertEq(4 * STRIKE + PREMIUM_TO_VAULT_10, 943_000_000, "four strikes plus premium");
-        assertEq(usdg.balanceOf(feeSafe), 94_300_000, "10% fee");
-        assertEq(usdg.balanceOf(address(vault)), 848_700_000, "90% held for depositors");
-        assertEq(vault.claimableUsdg(alice), 848_700_000, "and all of it is claimable");
+        assertEq(usdg.balanceOf(feeSafe), PREMIUM_FEE_10, "5% of premium, none on the four strikes");
+        assertEq(usdg.balanceOf(address(vault)), 942_050_000, "the rest held for depositors");
+        assertEq(vault.claimableUsdg(alice), 942_050_000, "and all of it is claimable");
     }
 
     /// @dev Valorem assigns incrementally against the same claim, so a week can be assigned in
@@ -219,8 +275,8 @@ contract VaultAssignmentTest is BaseTest {
         // 10e18 idle + 4e18 returned; 6 x 231.00 strike + 19.00 premium = 1_405_000_000 gross.
         assertEq(nvda.balanceOf(address(vault)), 14e18, "collateral back is (10 - 6) lots");
         assertEq(usdg.balanceOf(feeSafe) + usdg.balanceOf(address(vault)), 6 * STRIKE + PREMIUM_TO_VAULT_10, "gross");
-        assertEq(usdg.balanceOf(feeSafe), 140_500_000, "10% of 1,405.00");
-        assertEq(vault.claimableUsdg(alice), 1_264_500_000, "90% of 1,405.00");
+        assertEq(usdg.balanceOf(feeSafe), PREMIUM_FEE_10, "5% of the 19.00 premium only");
+        assertEq(vault.claimableUsdg(alice), 1_404_050_000, "1,405.00 less the 0.95 fee");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -252,10 +308,10 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(nvda.balanceOf(buyer), 0, "buyer took no delivery");
         assertEq(vault.convertToAssets(1e18), 1e18, "share price untouched by a clean week");
 
-        // Premium still earned, minus the 10% protocol fee on it. Compare
-        // test_protocolFeeIsChargedOnStrikeProceedsNotJustPremium: identical week, 232_900_000.
-        assertEq(usdg.balanceOf(feeSafe), 1_900_000, "10% of 19 USDG");
-        assertEq(vault.claimableUsdg(alice), 17_100_000, "90% of 19 USDG");
+        // Premium still earned, minus the 5% protocol fee on it. Compare
+        // test_protocolFeeIsChargedOnPremiumOnlyNeverOnStrikeProceeds: identical fee.
+        assertEq(usdg.balanceOf(feeSafe), PREMIUM_FEE_10, "5% of 19 USDG");
+        assertEq(vault.claimableUsdg(alice), 18_050_000, "95% of 19 USDG");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -371,17 +427,17 @@ contract VaultAssignmentTest is BaseTest {
     ///        alice 20e18 -> 20e18 shares; write 10 (10e18 locked, 10e18 idle)
     ///        fill 10 at $2.00 -> vault takes 19_000_000 premium
     ///        bob's deposit CHECKPOINTS first, over supply 20e18:
-    ///          fee 10% = 1_900_000 (pending), net 17_100_000
-    ///          indexDelta = 17_100_000 * 1e27 / 20e18 = 855e12, exact
-    ///          alice += 20e18 * 855e12 / 1e27 = 17_100_000; bob starts from that index
+    ///          fee 5% = 950_000 (pending), net 18_050_000
+    ///          indexDelta = 18_050_000 * 1e27 / 20e18 = 902_500e9, exact
+    ///          alice += 20e18 * 902_500e9 / 1e27 = 18_050_000; bob starts from that index
     ///        bob then deposits 10e18 -> 10e18 * (20e18+1)/(20e18+1) = 10e18 shares
     ///        all ten assigned -> 10 * 231_000_000 = 2_310_000_000 strike proceeds at the close
-    ///        close harvests over supply 30e18:
-    ///          fee 10% = 231_000_000, net 2_079_000_000
-    ///          indexDelta = 2_079_000_000 * 1e27 / 30e18 = 69_300e12, exact
-    ///          bob   = 10e18 * 69_300e12 / 1e27 =   693_000_000
-    ///          alice = 17_100_000 + 20e18 * 69_300e12 / 1e27 = 1_403_100_000
-    ///        1_403_100_000 + 693_000_000 = 2_096_100_000 = FULL_ASSIGN_NET, to the unit.
+    ///        close harvests over supply 30e18, and all of it is strike proceeds:
+    ///          fee 0 (strike proceeds are fee-free), net 2_310_000_000
+    ///          indexDelta = 2_310_000_000 * 1e27 / 30e18 = 77_000e12, exact
+    ///          bob   = 10e18 * 77_000e12 / 1e27 =   770_000_000
+    ///          alice = 18_050_000 + 20e18 * 77_000e12 / 1e27 = 1_558_050_000
+    ///        1_558_050_000 + 770_000_000 = 2_328_050_000 = FULL_ASSIGN_NET, to the unit.
     ///        vault NVDA 20e18, supply 30e18
     ///        bob's stake = 10e18 * (20e18 + 1) / (30e18 + 1) = 6_666_666_666_666_666_666
     function test_lateDepositorDuringListed_isNotWrittenAgainstButSharesTheAssignment() public {
@@ -411,12 +467,12 @@ contract VaultAssignmentTest is BaseTest {
         // Bob shares the ASSIGNMENT pro-rata even though his collateral was not written: the
         // book he owns a third of is the one the assignment shrank.
         assertEq(vault.convertToAssets(bobShares), 6_666_666_666_666_666_666, "bob owns 1/3 of the smaller book");
-        assertEq(vault.claimableUsdg(bob), 693_000_000, "a third of the 2_079_000_000 net strike proceeds");
+        assertEq(vault.claimableUsdg(bob), 770_000_000, "a third of the 2_310_000_000 strike proceeds");
 
         // He shares none of the PREMIUM, which was earned and indexed before his shares
-        // existed. Alice keeps all 17_100_000 of it on top of her two thirds of the proceeds.
-        assertEq(vault.claimableUsdg(alice), 1_403_100_000, "two thirds of the proceeds plus the whole premium");
-        assertEq(vault.claimableUsdg(alice) - 2 * 693_000_000, 17_100_000, "and that surplus is exactly the premium");
+        // existed. Alice keeps all 18_050_000 of it on top of her two thirds of the proceeds.
+        assertEq(vault.claimableUsdg(alice), 1_558_050_000, "two thirds of the proceeds plus the whole premium");
+        assertEq(vault.claimableUsdg(alice) - 2 * 770_000_000, 18_050_000, "and that surplus is exactly the premium");
 
         assertEq(
             vault.claimableUsdg(alice) + vault.claimableUsdg(bob),
@@ -440,7 +496,9 @@ contract VaultAssignmentTest is BaseTest {
     ///        supply at settlement   30e18, of which 10e18 is escrowed
     ///        idle NVDA at settlement 20e18 (the claim returned nothing)
     ///        epoch assets           20e18 * 10e18 / 30e18 = 6_666_666_666_666_666_666
-    ///        epoch USDG             2_096_100_000 / 3     =       698_700_000
+    ///        index                  floor(2_328_050_000 * 1e27 / 30e18) = 77_601_666_666_666_666
+    ///        epoch USDG             floor(10e18 * index / 1e27)          =         776_016_666
+    ///        (three ten-lot stakes floor to 2_328_049_998; the 2 base units ride as dust)
     function test_queuedRedeemerThroughAnAssignedWeek_getsNvdaAndUsdg() public {
         _deposit(alice, 20e18);
         _deposit(bob, 10e18);
@@ -462,11 +520,11 @@ contract VaultAssignmentTest is BaseTest {
         _warpToExpiry();
         _rollClose();
 
-        assertEq(vault.claimableUsdg(alice), 698_700_000, "alice's remaining 10e18 shares");
-        assertEq(vault.claimableUsdg(bob), 698_700_000, "bob's 10e18 shares");
+        assertEq(vault.claimableUsdg(alice), 776_016_666, "alice's remaining 10e18 shares");
+        assertEq(vault.claimableUsdg(bob), 776_016_666, "bob's 10e18 shares");
 
         // The escrow's third was taken out of the index and reserved for the epoch instead.
-        assertEq(vault.usdgReservedForQueue(), 698_700_000, "escrow accrual is reserved, not left behind");
+        assertEq(vault.usdgReservedForQueue(), 776_016_666, "escrow accrual is reserved, not left behind");
         assertEq(vault.totalSupply(), 20e18, "escrowed shares burned at settlement");
 
         uint256 expectedAssets = 6_666_666_666_666_666_666;
@@ -478,18 +536,18 @@ contract VaultAssignmentTest is BaseTest {
 
         (uint256 previewAssets, uint256 previewUsdg) = vault.previewCompleteRedeem(alice);
         assertEq(previewAssets, expectedAssets, "preview matches");
-        assertEq(previewUsdg, 698_700_000, "preview matches");
+        assertEq(previewUsdg, 776_016_666, "preview matches");
 
         uint256 nvdaBefore = nvda.balanceOf(alice);
         vm.prank(alice);
         (uint256 gotAssets, uint256 gotUsdg) = vault.completeRedeem(alice);
 
         assertEq(gotAssets, expectedAssets, "a MIX: the NVDA half");
-        assertEq(gotUsdg, 698_700_000, "a MIX: the USDG half");
+        assertEq(gotUsdg, 776_016_666, "a MIX: the USDG half");
         assertGt(gotAssets, 0, "not paid purely in USDG");
         assertGt(gotUsdg, 0, "not paid purely in NVDA");
         assertEq(nvda.balanceOf(alice) - nvdaBefore, expectedAssets, "NVDA actually delivered");
-        assertEq(usdg.balanceOf(alice), 698_700_000, "USDG actually delivered");
+        assertEq(usdg.balanceOf(alice), 776_016_666, "USDG actually delivered");
 
         // The last (here only) claimant of an epoch drains it exactly.
         assertEq(vault.reservedAssets(), 0, "no assets stranded");
@@ -503,17 +561,19 @@ contract VaultAssignmentTest is BaseTest {
     ///      one base unit of USDG would be stranded in the vault every single epoch, forever.
     ///
     ///      ARITHMETIC, BY HAND:
-    ///        alice queues 7_777_777_777_777_777_777 = 7 * 1_111_111_111_111_111_111
-    ///        bob   queues 3_333_333_333_333_333_333 = 3 * 1_111_111_111_111_111_111
-    ///        queued total 11_111_111_111_111_111_110 -> the split is exactly 7/10 and 3/10
-    ///        epoch assets 20e18 * Q / 30e18            = 7_407_407_407_407_407_406
-    ///          alice 7/10 -> floor(...* 7 / 10)        = 5_185_185_185_185_185_184  (rem 2)
-    ///          bob        -> takes the remainder       = 2_222_222_222_222_222_222
-    ///          (bob's own floor would be              2_222_222_222_222_222_221, so 1 wei
+    ///        k = 1_111_111_112_111_111_111 (chosen so BOTH legs leave a unit of remainder)
+    ///        alice queues 7_777_777_784_777_777_777 = 7k
+    ///        bob   queues 3_333_333_336_333_333_333 = 3k
+    ///        queued total 11_111_111_121_111_111_110 -> the split is exactly 7/10 and 3/10
+    ///        epoch assets 20e18 * Q / 30e18            = 7_407_407_414_074_074_073
+    ///          alice 7/10 -> floor(...* 7 / 10)        = 5_185_185_189_851_851_851
+    ///          bob        -> takes the remainder       = 2_222_222_224_222_222_222
+    ///          (bob's own floor would be              2_222_222_224_222_222_221, so 1 wei
     ///           would strand if the last claimant were not given the balance)
-    ///        epoch USDG   floor(Q * index)             =         776_333_333
-    ///          alice 7/10 -> floor(776_333_333*7/10)   =         543_433_333
-    ///          bob        -> takes the remainder       =         232_900_000
+    ///        index        floor(2_328_050_000 * 1e27 / 30e18) = 77_601_666_666_666_666
+    ///        epoch USDG   floor(Q * index / 1e27)      =         862_240_741
+    ///          alice 7/10 -> floor(862_240_741*7/10)   =         603_568_518
+    ///          bob        -> takes the remainder       =         258_672_223  (floor 258_672_222)
     function test_twoQueuedRedeemersThroughAnAssignedWeek_leaveZeroDust() public {
         _deposit(alice, 20e18);
         _deposit(bob, 10e18);
@@ -522,8 +582,8 @@ contract VaultAssignmentTest is BaseTest {
         OrderComponents memory c = _approveListing(oid, 10, _okUnitPrice());
         _fill(c, 10);
 
-        uint256 aliceQ = 7_777_777_777_777_777_777;
-        uint256 bobQ = 3_333_333_333_333_333_333;
+        uint256 aliceQ = 7_777_777_784_777_777_777;
+        uint256 bobQ = 3_333_333_336_333_333_333;
         vm.prank(alice);
         vault.queueRedeem(aliceQ);
         vm.prank(bob);
@@ -536,8 +596,8 @@ contract VaultAssignmentTest is BaseTest {
         _warpToExpiry();
         _rollClose();
 
-        uint256 epochAssets = 7_407_407_407_407_407_406;
-        uint256 epochUsdg = 776_333_333;
+        uint256 epochAssets = 7_407_407_414_074_074_073;
+        uint256 epochUsdg = 862_240_741;
         assertEq(vault.reservedAssets(), epochAssets, "epoch assets, floored");
         assertEq(vault.usdgReservedForQueue(), epochUsdg, "epoch USDG, floored");
         (uint256 sharesRem, uint256 assetsRem, uint256 usdgRem) = vault.epochs(1);
@@ -548,8 +608,8 @@ contract VaultAssignmentTest is BaseTest {
         // First claimant: strict floor of the proportional share.
         vm.prank(alice);
         (uint256 aliceAssets, uint256 aliceUsdg) = vault.completeRedeem(alice);
-        assertEq(aliceAssets, 5_185_185_185_185_185_184, "floor(epochAssets * 7/10)");
-        assertEq(aliceUsdg, 543_433_333, "floor(epochUsdg * 7/10)");
+        assertEq(aliceAssets, 5_185_185_189_851_851_851, "floor(epochAssets * 7/10)");
+        assertEq(aliceUsdg, 603_568_518, "floor(epochUsdg * 7/10)");
 
         // Last claimant: takes exactly what remains, which is one unit MORE than her own
         // proportional floor on both legs. That one unit is the dust that never strands.
@@ -557,8 +617,8 @@ contract VaultAssignmentTest is BaseTest {
         uint256 bobUsdgFloor = (epochUsdg * bobQ) / (aliceQ + bobQ);
         vm.prank(bob);
         (uint256 bobAssets, uint256 bobUsdg) = vault.completeRedeem(bob);
-        assertEq(bobAssets, 2_222_222_222_222_222_222, "the balance, not the floor");
-        assertEq(bobUsdg, 232_900_000, "the balance, not the floor");
+        assertEq(bobAssets, 2_222_222_224_222_222_222, "the balance, not the floor");
+        assertEq(bobUsdg, 258_672_223, "the balance, not the floor");
         assertEq(bobAssets - bobAssetsFloor, 1, "exactly one wei of NVDA would otherwise strand");
         assertEq(bobUsdg - bobUsdgFloor, 1, "exactly one base unit of USDG would otherwise strand");
 
@@ -654,8 +714,8 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(nvda.balanceOf(address(clear)), 0, "the clearinghouse is holding nothing of ours");
 
         // Premium from the partial fill: 19.00 x 6/10 = 11.40 USDG gross to the vault.
-        assertEq(usdg.balanceOf(feeSafe), 1_140_000, "10% of 11.40");
-        assertEq(vault.claimableUsdg(alice), 10_260_000, "90% of 11.40");
+        assertEq(usdg.balanceOf(feeSafe), 570_000, "5% of 11.40");
+        assertEq(vault.claimableUsdg(alice), 10_830_000, "95% of 11.40");
 
         // And the vault is flat, so redemption is instant again. Leftovers block nothing.
         assertTrue(vault.canRedeemInstantly(), "leftover inventory does not pin the vault");
@@ -677,8 +737,8 @@ contract VaultAssignmentTest is BaseTest {
     ///        NVDA         20e18 - 10e18 written = 10e18 idle; claim returns (10-3) = 7e18
     ///                     -> 17e18, buyer holds 3e18
     ///        USDG gross   11_400_000 + 3 * 231_000_000 = 704_400_000
-    ///        fee 10%                                    =  70_440_000
-    ///        to depositors                              = 633_960_000
+    ///        fee 5% of the 11_400_000 premium only      =     570_000
+    ///        to depositors                              = 703_830_000
     function test_partialFillAndPartialAssignment() public {
         _deposit(alice, 20e18);
 
@@ -706,10 +766,10 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(nvda.balanceOf(buyer), 3e18, "three lots delivered");
 
         assertEq(11_400_000 + 3 * STRIKE, 704_400_000, "premium plus three strikes");
-        assertEq(usdg.balanceOf(feeSafe), 70_440_000, "10% fee");
-        assertEq(usdg.balanceOf(address(vault)), 633_960_000, "exact USDG the vault ends with");
-        assertEq(vault.claimableUsdg(alice), 633_960_000, "all of it claimable, to the cent");
-        assertEq(vault.usdgDust(), 0, "633.96 over 20e18 shares indexes exactly");
+        assertEq(usdg.balanceOf(feeSafe), 570_000, "5% of premium, none on the three strikes");
+        assertEq(usdg.balanceOf(address(vault)), 703_830_000, "exact USDG the vault ends with");
+        assertEq(vault.claimableUsdg(alice), 703_830_000, "all of it claimable, to the cent");
+        assertEq(vault.usdgDust(), 0, "703.83 over 20e18 shares indexes exactly");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -760,12 +820,13 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(nvda.balanceOf(address(clear)), 0, "the clearinghouse kept nothing back");
 
         // Everything harvested is either in the vault for depositors or in the fee safe, so
-        // their sum is the gross take. Subtract the known premium and what is left is the
-        // assignment proceeds.
+        // their sum is the gross take. The fee is 5% of the premium alone, floored, whatever
+        // was assigned.
         uint256 gross = premiumToVault + uint256(x) * STRIKE;
+        uint256 fee = (premiumToVault * 500) / 10_000;
         assertEq(usdg.balanceOf(address(vault)) + usdg.balanceOf(feeSafe), gross, "gross take");
-        assertEq(usdg.balanceOf(feeSafe), (gross * 1_000) / 10_000, "protocol fee floors at 10% of gross");
-        assertEq(usdg.balanceOf(address(vault)), gross - (gross * 1_000) / 10_000, "the remainder is depositors'");
+        assertEq(usdg.balanceOf(feeSafe), fee, "protocol fee floors at 5% of premium, none on strikes");
+        assertEq(usdg.balanceOf(address(vault)), gross - fee, "the remainder is depositors'");
 
         assertEq(vault.contractsWritten(), 0, "position cleared");
         assertEq(_phase(), 0, "back to Idle");

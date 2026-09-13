@@ -16,7 +16,8 @@ struct PolicyParams {
     uint16 minPremiumBps;
     /// @dev Share of idle asset that may be locked into a write, in bps. Launch: 9500 (95%).
     uint16 maxUtilizationBps;
-    /// @dev Protocol fee taken from harvested USDG, in bps. Launch: 1000 (10%). Ceiling 2000.
+    /// @dev Protocol fee on harvested PREMIUM, in bps. Launch: 500 (5%). Ceiling 2000.
+    ///      Strike proceeds from assignment are principal and never fee'd (Vault._accrueHarvest).
     uint16 protocolFeeBps;
     /// @dev Absolute cap on contracts written per cycle, in whole 1e18 lots. Launch: 50.
     uint64 maxContractsCap;
@@ -55,7 +56,7 @@ library Policy {
     /// @dev Utilization can never exceed 100% of idle.
     uint16 internal constant MAX_UTILIZATION_CEIL_BPS = BPS;
 
-    /// @dev Protocol fee can never exceed 20% of harvested USDG.
+    /// @dev Protocol fee can never exceed 20% of harvested premium.
     uint16 internal constant PROTOCOL_FEE_CEIL_BPS = 2_000;
 
     /// @dev At most three signed listings per cycle (README "Policy (launch)").
@@ -123,7 +124,7 @@ library Policy {
             maxOtmBps: 1_200,
             minPremiumBps: 40,
             maxUtilizationBps: 9_500,
-            protocolFeeBps: 1_000,
+            protocolFeeBps: 500,
             maxContractsCap: 50
         });
     }
@@ -240,10 +241,10 @@ library Policy {
                                 FEES
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Splits harvested USDG into the protocol fee and the depositors' net.
-    /// @dev Fee is charged only on a positive harvest. An unfilled week harvests 0 and is
-    ///      therefore free, which is the behaviour README promises: "10% of USDG harvested
-    ///      (filled weeks only)".
+    /// @notice Splits a fee-bearing USDG amount into the protocol fee and the depositors' net.
+    /// @dev Fee is charged only on a positive amount. An unfilled week harvests 0 and is
+    ///      therefore free. The vault passes premium only: strike proceeds are excluded
+    ///      before this is called, so the fee is "5% of premium" and never a cut of principal.
     function splitHarvest(uint256 grossUsdg, PolicyParams memory p)
         internal
         pure

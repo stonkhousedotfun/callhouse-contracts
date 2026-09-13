@@ -106,7 +106,7 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice Governance-settable bounds, always inside {Policy}'s hard caps.
     PolicyParams public policy;
 
-    /// @notice Receives the protocol fee on harvested USDG.
+    /// @notice Receives the protocol fee on harvested premium.
     address public feeRecipient;
 
     /// @notice Maximum asset base units the vault will hold from deposits.
@@ -776,6 +776,7 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     }
 
     /// @notice Redeem the claim, harvest the premium, settle the redeem queue, return to Idle.
+    /// @dev Strike proceeds from the claim are credited to holders fee-free; see {_accrueHarvest}.
     /// @dev Callable by the keeper from expiry, and by anyone an hour later. The vault must
     ///      not depend on a hot key staying alive for depositors to get their money back.
     function rollClose() external nonReentrant {
@@ -800,7 +801,7 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         (uint256 assetsReturned, uint256 usdgFromAssignment) = _redeemClaim(asset, usdg);
         emit RollClose(cycleNumber, assetsReturned, usdgFromAssignment, assignedCount);
 
-        _harvest();
+        _harvest(usdgFromAssignment);
         _settleQueue();
 
         phase = Phase.Idle;
@@ -815,8 +816,17 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      it is safe to run from inside a deposit.
     ///
     ///      Everything in the USDG balance that is not already owed to someone is this week's
-    ///      take: premium that filled, plus strike proceeds from any assignment.
-    function _accrueHarvest() private returns (uint256 gross, uint256 feeUsdg, uint256 netUsdg) {
+    ///      take: premium that filled, plus strike proceeds from any assignment. All of it is
+    ///      credited to holders, but the fee is charged on the premium only.
+    ///
+    ///      WHY `feeFree`: strike proceeds are not yield. They are the assigned depositors'
+    ///      principal, sold at the strike, and they have already given up the upside above it.
+    ///      An earlier draft fee'd the whole inflow, which on an assigned week took 10% of
+    ///      returned principal (a fee over 100 times the premium it was meant to be a cut of).
+    ///      `rollClose` passes the measured claim redemption here; the deposit checkpoint
+    ///      passes 0, and can, because strike proceeds sit inside the Valorem claim until
+    ///      `rollClose` redeems it.
+    function _accrueHarvest(uint256 feeFree) private returns (uint256 gross, uint256 feeUsdg, uint256 netUsdg) {
         uint256 balance = usdg.balanceOf(address(this));
         uint256 accounted = usdgAccounted;
         gross = balance > accounted ? balance - accounted : 0;
@@ -824,7 +834,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         _markUsdgAccounted(balance);
         if (gross == 0) return (0, 0, 0);
 
-        (feeUsdg, netUsdg) = Policy.splitHarvest(gross, policy);
+        (feeUsdg,) = Policy.splitHarvest(gross > feeFree ? gross - feeFree : 0, policy);
+        netUsdg = gross - feeUsdg;
         if (feeUsdg != 0) pendingFeeUsdg += feeUsdg;
         _distributeUsdg(netUsdg);
     }
@@ -837,14 +848,17 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      accrual into the index first fixes the index in place, and the new shares then start
     ///      from it.
     function _checkpointHarvest() private {
-        (uint256 gross, uint256 feeUsdg, uint256 netUsdg) = _accrueHarvest();
+        (uint256 gross, uint256 feeUsdg, uint256 netUsdg) = _accrueHarvest(0);
         if (gross != 0) emit Harvest(cycleNumber, gross, feeUsdg, netUsdg);
     }
 
     /// @dev The end-of-cycle harvest. Always emits, including the honest zero of an unfilled
     ///      week, and this is where the accumulated protocol fee actually leaves the vault.
-    function _harvest() private {
-        (uint256 gross, uint256 feeUsdg, uint256 netUsdg) = _accrueHarvest();
+    ///      `usdgFromAssignment` is credited fee-free (see {_accrueHarvest}), so on an assigned
+    ///      week `Harvest.grossUsdg` still includes the strike proceeds while `feeUsdg` is
+    ///      charged on `grossUsdg - RollClose.usdgFromAssignment` alone.
+    function _harvest(uint256 usdgFromAssignment) private {
+        (uint256 gross, uint256 feeUsdg, uint256 netUsdg) = _accrueHarvest(usdgFromAssignment);
 
         // Try to pay the protocol fee, but NEVER let it revert this call.
         //
