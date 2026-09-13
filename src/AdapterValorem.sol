@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IValoremClear} from "./interfaces/IValoremClear.sol";
-import {IOvercallRegistry} from "./interfaces/IOvercallRegistry.sol";
 import {ValoremLib} from "./lib/ValoremLib.sol";
 
 /// @title AdapterValorem
@@ -112,22 +111,18 @@ abstract contract AdapterValorem {
                             WRITE / REDEEM
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Locks `n * cyc.lotSize` of `asset` into Valorem and mints `n` option tokens plus one
-    ///      claim NFT to this contract. All validation lives in {ValoremLib.writeCalls}.
-    function _writeCalls(
-        IERC20 asset,
-        address exerciseAsset,
-        uint256 optionId_,
-        uint112 n,
-        IOvercallRegistry.Cycle memory cyc,
-        bool feeAccepted
-    ) internal returns (uint256 collateral) {
-        uint256 key;
-        (key, collateral) = ValoremLib.writeCalls(clear, asset, exerciseAsset, optionId_, n, cyc, feeAccepted);
-
+    /// @dev Record a write that {ValoremLib.write} has already validated and executed. A fresh
+    ///      claim and a top-up land here alike: `contractsWritten` ACCUMULATES, and `claimKey` is
+    ///      unchanged by a top-up because the library refuses any other id coming back.
+    ///
+    ///      THE CLAIM VIEWS ALREADY COVER TRANCHES. {lockedAssets}, {claimedExerciseProceeds} and
+    ///      {contractsAssigned} read Valorem's own `position(claimKey)` / `claim(claimKey)`, and
+    ///      upstream sums both over every claim index (one per bucket written into) of the claim.
+    ///      Nothing here needs to know how many tranches a claim holds.
+    function _recordWrite(uint256 optionId_, uint256 key, uint112 n, uint256 collateral) internal {
         optionId = optionId_;
         claimKey = key;
-        contractsWritten = n;
+        contractsWritten += n;
 
         emit CallsWritten(optionId_, key, n, collateral);
     }

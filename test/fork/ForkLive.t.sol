@@ -471,6 +471,58 @@ contract ForkLiveTest is Test {
         console2.log("listed", uint256(n), "contracts for USDG", unitPrice * n);
     }
 
+    /// @dev F2 tranche writes against the REAL clearinghouse: passing our claim id back to
+    ///      `clear.write` must add to that claim and return the same id, and Valorem's summed
+    ///      `claim`/`position` must be what the vault's views read. A mock cannot prove that.
+    function test_fork_writeMoreTopsUpTheLiveClaim() public onlyFork {
+        IOvercallRegistry.Cycle memory c = reg.cycle();
+        if (c.number == 0 || c.optionIds.length == 0 || !reg.isWritingOpen()) {
+            console2.log("no writable cycle at this block");
+            return;
+        }
+        (uint256 lo, uint256 hi) = Policy.strikeBand(vault.spotUsdg(), _policy());
+        uint256 chosen = type(uint256).max;
+        for (uint256 i; i < c.optionIds.length; i++) {
+            uint256 k = reg.strikePerContract(c.optionIds[i]);
+            if (k >= lo && k <= hi) {
+                chosen = c.optionIds[i];
+                break;
+            }
+        }
+        if (chosen == type(uint256).max) {
+            console2.log("no rung inside the OTM band at this spot");
+            return;
+        }
+        try this.dealNvda(alice, 4e18) {}
+        catch {
+            console2.log("deal() could not locate the NVDA balance slot; skipping");
+            return;
+        }
+        vm.startPrank(alice);
+        IERC20(NVDA).approve(address(vault), 4e18);
+        vault.deposit(4e18, alice);
+        vm.stopPrank();
+
+        vm.prank(keeper);
+        vault.rollOpen(chosen, 2);
+        uint256 key = vault.claimKey();
+
+        vm.prank(keeper);
+        vault.writeMore(1);
+
+        assertEq(vault.claimKey(), key, "live Clear topped up the same claim");
+        assertEq(vault.contractsWritten(), 3);
+        assertEq(clear.balanceOf(address(vault), chosen), 3, "three option tokens");
+        assertEq(clear.balanceOf(address(vault), key), 1, "one claim NFT");
+        assertEq(clear.claim(key).amountWritten, 3e18, "Valorem sums the claim's indices");
+        assertEq(vault.lockedAssets(), 3e18, "position() sums them too");
+        assertEq(vault.totalAssets(), 4e18, "no value moved");
+
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(Policy.ContractsAboveUtilization.selector, 4, 3));
+        vault.writeMore(1);
+    }
+
     /// @dev A rung outside the OTM band must be refused even against the live ladder.
     function test_fork_outOfBandRungIsRefused() public onlyFork {
         IOvercallRegistry.Cycle memory c = reg.cycle();

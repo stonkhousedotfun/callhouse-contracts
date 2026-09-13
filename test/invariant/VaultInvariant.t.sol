@@ -119,6 +119,9 @@ contract VaultHandler is Test {
     uint256 public cExercise;
     uint256 public cLock;
     uint256 public cClose;
+    uint256 public cWriteMore;
+    uint256 public cSettleQueue;
+    uint256 public cStaleKill;
 
     /// @notice Cycles that ended with at least one contract assigned.
     uint256 public cAssignedCycles;
@@ -563,10 +566,6 @@ contract VaultHandler is Test {
             _skip();
             return;
         }
-        if (vault.listingsThisCycle() >= 3) {
-            _skip();
-            return;
-        }
 
         uint40 endTime = vault.cycleExerciseTs();
         if (block.timestamp >= endTime) {
@@ -581,12 +580,24 @@ contract VaultHandler is Test {
             return;
         }
 
-        uint256 spot = _refreshSpot(spotSeed);
+        // approveListing re-checks the band's lower bound at live spot, so keep spot at or below
+        // the highest price whose band floor still admits the written strike.
+        (uint16 minOtmBps,, uint16 minPremiumBps,,,) = vault.policy();
+        uint256 maxSpot = (vault.cycleStrikeUsdg() * BPS) / (BPS + minOtmBps);
+        if (maxSpot > 232_000_000) maxSpot = 232_000_000;
+        uint256 spot = bound(spotSeed, maxSpot < 215_000_000 ? maxSpot : 215_000_000, maxSpot);
+        feed.setAnswer(int256(spot * 100));
         uint256 amount = bound(amountSeed, 1, available);
         // Clear the 0.40%-of-spot floor per contract, and stay under the strike.
-        (,, uint16 minPremiumBps,,,) = vault.policy();
         uint256 floorUnit = (spot * minPremiumBps) / BPS + 1;
         uint256 unitPrice = bound(priceSeed, floorUnit, floorUnit * 6);
+        // Slots count price CUTS. Once three are spent, only a listing at or above the lowest
+        // price authorised this cycle is legal, so lift the price to it rather than skip. The
+        // lowest cleared some earlier floor and the strike ceiling, and lifting a price that
+        // already clears today's floor keeps it clear.
+        if (vault.listingsThisCycle() >= 3 && unitPrice < vault.lowestListedUnitUsdg()) {
+            unitPrice = vault.lowestListedUnitUsdg();
+        }
 
         listingNonce += 1;
         OrderComponents memory c = _buildOrder(optionId, amount, unitPrice, endTime, listingNonce);
@@ -604,6 +615,97 @@ contract VaultHandler is Test {
             cList++;
         } catch (bytes memory err) {
             _reverted("approveListing", err);
+        }
+    }
+
+    /// @dev A tranche top-up of this cycle's claim. Spot is set INSIDE the band for the written
+    ///      strike (one base unit clear of either edge), because the gate re-checks the band at
+    ///      live spot and a random spot would mostly skip. Size is bounded on the claim's total.
+    function writeMore(uint256 sizeSeed, uint256 spotSeed) external {
+        attempted++;
+        if (uint8(vault.phase()) != 1 || vault.writesHalted() || block.timestamp >= vault.cycleExerciseTs()) {
+            _skip();
+            return;
+        }
+
+        (uint16 minOtmBps, uint16 maxOtmBps,, uint16 util,, uint64 cap) = vault.policy();
+        uint256 k = vault.cycleStrikeUsdg();
+        uint256 spot = bound(spotSeed, (k * BPS) / (BPS + maxOtmBps) + 1, (k * BPS) / (BPS + minOtmBps) - 1);
+        feed.setAnswer(int256(spot * 100));
+
+        uint256 byUtil = ((vault.idleAssets() + vault.lockedAssets()) * util) / BPS / LOT;
+        uint256 maxTotal = byUtil < cap ? byUtil : cap;
+        uint256 written = vault.contractsWritten();
+        if (maxTotal <= written) {
+            _skip();
+            return;
+        }
+        uint112 n = uint112(bound(sizeSeed, 1, maxTotal - written));
+
+        uint256 key = vault.claimKey();
+        uint256 total = vault.totalAssets();
+        try vault.writeMore(n) {
+            assertEq(vault.claimKey(), key, "a top-up opened a second claim");
+            assertEq(vault.contractsWritten(), written + n, "contractsWritten did not accumulate");
+            assertEq(vault.totalAssets(), total, "a top-up moved the share price");
+            succeeded++;
+            cWriteMore++;
+        } catch (bytes memory err) {
+            _reverted("writeMore", err);
+        }
+    }
+
+    /// @dev Anyone may settle a queue made while flat. It must pay the instant-redeem price of
+    ///      the escrow (virtual share included) and move no tokens.
+    function settleQueue(uint256 whoSeed) external {
+        attempted++;
+        uint256 q = vault.queuedShares();
+        if (uint8(vault.phase()) != 0 || q == 0) {
+            _skip();
+            return;
+        }
+
+        uint256 e = vault.epochId();
+        // Priced like instant redeem, virtual share included (`_settleQueue`).
+        uint256 expected = (q * (vault.idleAssets() + 1)) / (vault.totalSupply() + 1);
+        uint256 before = nvda.balanceOf(address(vault));
+        vm.prank(address(uint160(uint256(keccak256(abi.encode(whoSeed, "settler"))))));
+        try vault.settleQueue() {
+            (uint256 sharesR, uint256 assetsR,) = vault.epochs(e);
+            assertEq(sharesR, q, "the whole queue settled");
+            assertEq(assetsR, expected, "settled at something other than the flat pro-rata slice");
+            assertEq(vault.queuedShares(), 0, "queue not emptied");
+            assertEq(nvda.balanceOf(address(vault)), before, "settleQueue moved asset");
+            succeeded++;
+            cSettleQueue++;
+        } catch (bytes memory err) {
+            _reverted("settleQueue", err);
+        }
+    }
+
+    /// @dev A stranger kills a listing the policy would no longer authorise at a fresh spot.
+    function invalidateStaleListing(uint256 spotSeed) external {
+        attempted++;
+        if (vault.listingHash() == bytes32(0)) {
+            _skip();
+            return;
+        }
+        uint256 spot = _refreshSpot(spotSeed);
+        (uint16 minOtmBps,, uint16 minPremiumBps,,,) = vault.policy();
+        bool stale = vault.cycleStrikeUsdg() < (spot * (BPS + minOtmBps)) / BPS
+            || vault.listingGrossUsdg() < (spot * vault.listingAmount() * minPremiumBps) / BPS;
+        if (!stale) {
+            _skip();
+            return;
+        }
+
+        vm.prank(address(uint160(uint256(keccak256(abi.encode(spotSeed, "sniper-guard"))))));
+        try vault.invalidateStaleListing() {
+            live.active = false;
+            succeeded++;
+            cStaleKill++;
+        } catch (bytes memory err) {
+            _reverted("invalidateStaleListing", err);
         }
     }
 
@@ -1032,7 +1134,7 @@ contract VaultInvariantTest is BaseTest {
 
         holders = [alice, bob, carol, buyer, address(vault)];
 
-        bytes4[] memory selectors = new bytes4[](17);
+        bytes4[] memory selectors = new bytes4[](20);
         selectors[0] = VaultHandler.deposit.selector;
         selectors[1] = VaultHandler.mintShares.selector;
         selectors[2] = VaultHandler.instantRedeem.selector;
@@ -1050,6 +1152,9 @@ contract VaultInvariantTest is BaseTest {
         selectors[14] = VaultHandler.lockBook.selector;
         selectors[15] = VaultHandler.warpAhead.selector;
         selectors[16] = VaultHandler.toggleHalt.selector;
+        selectors[17] = VaultHandler.writeMore.selector;
+        selectors[18] = VaultHandler.settleQueue.selector;
+        selectors[19] = VaultHandler.invalidateStaleListing.selector;
 
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
@@ -1359,6 +1464,9 @@ contract VaultInvariantTest is BaseTest {
         emit log_named_uint("exercises", handler.cExercise());
         emit log_named_uint("books locked", handler.cLock());
         emit log_named_uint("rollCloses", handler.cClose());
+        emit log_named_uint("tranche top-ups", handler.cWriteMore());
+        emit log_named_uint("flat queue settlements", handler.cSettleQueue());
+        emit log_named_uint("stale listings killed", handler.cStaleKill());
         emit log_named_uint("cycles with assignment", handler.cAssignedCycles());
 
         emit log_named_uint("index rounding allowance (usdg base units)", handler.maxIndexRoundingDrift());
@@ -1502,6 +1610,39 @@ contract VaultInvariantTest is BaseTest {
         invariant_reservesAreReal();
         invariant_phaseSanity();
         invariant_feeNeverTouchesStrikeProceeds();
+    }
+
+    /// @notice Proves the handler reaches the three audit-fix actions: a tranche top-up, a stale
+    ///         listing killed by a stranger, and a queue settled while flat.
+    function test_handlerReachesTranchesStaleKillsAndFlatSettlement() public {
+        handler.deposit(0, type(uint256).max);
+        handler.deposit(1, type(uint256).max);
+        handler.rollOpen(0, 0, 0); // one contract, leaving room for a tranche
+        handler.writeMore(0, 0);
+        assertGt(handler.cWriteMore(), 0, "writeMore");
+
+        handler.approveListing(0, 0, 0); // priced on the floor at $215 spot
+        handler.invalidateStaleListing(type(uint256).max); // $232 spot: the floor has risen past it
+        assertGt(handler.cStaleKill(), 0, "invalidateStaleListing");
+
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.rollClose(1);
+        assertEq(uint8(vault.phase()), 0, "should be back to Idle");
+
+        handler.queueRedeem(0, 1);
+        handler.settleQueue(0);
+        assertGt(handler.cSettleQueue(), 0, "settleQueue");
+        handler.completeRedeem(0);
+        assertGt(handler.cComplete(), 0, "completeRedeem after a flat settlement");
+        assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
+
+        invariant_assetConservation();
+        invariant_usdgBooksBalance();
+        invariant_reservesAreReal();
+        invariant_phaseSanity();
     }
 
     /// @notice The redeem queue takes a whole position, which is what the handler assumes
@@ -1731,8 +1872,9 @@ contract VaultInvariantTest is BaseTest {
     ///        claim returns 2e18 of asset and 231_000_000 of strike proceeds:
     ///          asset balance = 12_222_222_222_222_222_221 - 3e18 + 2e18
     ///                        = 11_222_222_222_222_222_221
-    ///        payoutAssets = 11_222_222_222_222_222_221 * 6_000_000_000_000_000_011
-    ///                       / 12_222_222_222_222_222_221 = 5_509_090_909_090_909_100
+    ///        payoutAssets, priced like instant redeem (virtual share included):
+    ///                       6_000_000_000_000_000_011 * (11_222_222_222_222_222_221 + 1)
+    ///                       / (12_222_222_222_222_222_221 + 1) = 5_509_090_909_090_909_101
     ///        USDG: premium 5_700_000 + strike 231_000_000 = 236_700_000 gross. The strike
     ///          proceeds are fee-free, so fee = 5_700_000 * 500 / 10_000 = 285_000 (5% of the
     ///          premium only), net = 236_700_000 - 285_000 = 236_415_000. Indexed over the
@@ -1749,12 +1891,12 @@ contract VaultInvariantTest is BaseTest {
     ///                                              =  19_343_045
     ///          carol, last, takes the remainder    =           1
     ///        Drawdown, in order alice / bob / carol:
-    ///          alice 5_509_090_909_090_909_100 * 5_000_000_000_000_000_001
-    ///                / 6_000_000_000_000_000_011 = 4_590_909_090_909_090_909
+    ///          alice 5_509_090_909_090_909_101 * 5_000_000_000_000_000_001
+    ///                / 6_000_000_000_000_000_011 = 4_590_909_090_909_090_910
     ///          bob                                 =   918_181_818_181_818_188
     ///          carol, last, takes the remainder    =                         3
-    ///          4_590_909_090_909_090_909 + 918_181_818_181_818_188 + 3
-    ///                                              = 5_509_090_909_090_909_100. Nothing left.
+    ///          4_590_909_090_909_090_910 + 918_181_818_181_818_188 + 3
+    ///                                              = 5_509_090_909_090_909_101. Nothing left.
     function test_queueEpochDrawsDownToZeroDust() public {
         uint256 aDep = 7_777_777_777_777_777_777;
         uint256 bDep = 3_333_333_333_333_333_331;
@@ -1789,7 +1931,7 @@ contract VaultInvariantTest is BaseTest {
         _rollClose();
 
         assertEq(nvda.balanceOf(address(vault)), 11_222_222_222_222_222_221, "2e18 back, 1e18 assigned away");
-        assertEq(vault.reservedAssets(), 5_509_090_909_090_909_100, "hand-checked epoch reserve");
+        assertEq(vault.reservedAssets(), 5_509_090_909_090_909_101, "hand-checked epoch reserve");
 
         assertEq(usdg.balanceOf(feeSafe), 285_000, "protocol fee: 5% of the 5_700_000 premium, none of the strike");
         assertEq(vault.totalUsdgDistributed(), 236_414_999, "hand-checked credit");
@@ -1806,10 +1948,10 @@ contract VaultInvariantTest is BaseTest {
         vm.prank(carol);
         (uint256 cOut, uint256 cUsdg) = vault.completeRedeem(carol);
 
-        assertEq(aOut, 4_590_909_090_909_090_909, "alice's pro-rata slice");
+        assertEq(aOut, 4_590_909_090_909_090_910, "alice's pro-rata slice");
         assertEq(bOut, 918_181_818_181_818_188, "bob's pro-rata slice");
         assertEq(cOut, 3, "carol, last, takes exactly what is left");
-        assertEq(aOut + bOut + cOut, 5_509_090_909_090_909_100, "the epoch paid out every base unit");
+        assertEq(aOut + bOut + cOut, 5_509_090_909_090_909_101, "the epoch paid out every base unit");
         // USDG is paid per entry by the index growth each entry's shares sat through in escrow
         // (all three queued at index 0, settled at 19_343_045_454_545_454): floor(shares * index / 1e27).
         // alice 96_715_227.27 -> 96_715_227; bob 19_343_045.59 -> 19_343_045; carol, last, takes the

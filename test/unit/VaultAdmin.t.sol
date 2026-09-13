@@ -580,9 +580,9 @@ contract VaultAdminTest is BaseTest {
     ///      refuses to write while it is switched on. Acceptance is governance's call, and it
     ///      has to be a real one: the switch must move the vault from "refuses" to "writes".
     ///
-    ///      REGRESSION GUARD. The gate lives in two places — `Vault.rollOpen` checks
-    ///      `feesEnabled() && !valoremFeeAccepted`, and `AdapterValorem._writeCalls` is handed
-    ///      `feeAccepted` and applies the same pair. An earlier draft had the adapter revert on
+    ///      REGRESSION GUARD. The gate lives in `ValoremLib.write` (shared by `rollOpen` and
+    ///      `writeMore`), which is handed `feeAccepted` and reverts only on
+    ///      `feesEnabled() && !feeAccepted`. An earlier draft had the adapter revert on
     ///      `clear.feesEnabled()` alone, which made the acceptance decorative: it changed only
     ///      which error came back. Both halves of the switch are asserted below.
     function test_acceptValoremFee_gatesWritingWhileEngineFeesAreOn() public {

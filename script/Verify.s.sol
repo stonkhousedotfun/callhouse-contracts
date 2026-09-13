@@ -124,7 +124,17 @@ contract VerifyVault is Script {
         (bytes memory want, bool[] memory mask, uint256 linksOk, uint256 linksSeen) =
             _expectedWithLinks(vaultJson, address(vault).code, solName, sol, vlName, vl);
         _maskImmutables(vaultJson, mask);
-        _check(linksSeen == 5 && linksOk == 5, "vault: all 5 library link sites hold the expected addresses");
+        // The expected count comes from the artifact's own linkReferences, never a hard-coded
+        // number: every new library call site in Vault adds one, and a stale constant would make
+        // a byte-perfect deployment FAIL (and train operators to ignore this line). Requiring at
+        // least one site per library keeps a swapped or missing library a FAIL.
+        uint256 solSites = _linkSites(vaultJson, "src/lib/SeaportOrderLib.sol", "SeaportOrderLib");
+        uint256 vlSites = _linkSites(vaultJson, "src/lib/ValoremLib.sol", "ValoremLib");
+        uint256 wantLinks = solSites + vlSites;
+        _check(
+            solSites != 0 && vlSites != 0 && linksSeen == wantLinks && linksOk == wantLinks,
+            string.concat("vault: all ", vm.toString(wantLinks), " library link sites hold the expected addresses")
+        );
         _check(
             _equalMasked(address(vault).code, want, mask),
             "vault: runtime == compiled Vault, outside link/immutable slots"
@@ -204,6 +214,13 @@ contract VerifyVault is Script {
                 if (address(bytes20(_word(deployed, offsets[n]))) == expect[n]) ok++;
             }
         }
+    }
+
+    /// @dev Number of link sites the artifact records for one library in the Vault runtime.
+    function _linkSites(string memory json, string memory file, string memory lib) internal view returns (uint256) {
+        string memory key = string.concat(".deployedBytecode.linkReferences['", file, "'].", lib);
+        if (!vm.keyExistsJson(json, key)) return 0;
+        return abi.decode(vm.parseJson(json, key), (Ref[])).length;
     }
 
     function _placeholderTag(string memory fullyQualified) internal pure returns (bytes memory tag) {

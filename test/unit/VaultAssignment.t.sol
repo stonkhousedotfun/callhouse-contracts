@@ -416,9 +416,10 @@ contract VaultAssignmentTest is BaseTest {
         assertEq(vault.totalAssets(), 0, "the vault is empty and nothing was stranded");
     }
 
-    /// @dev A depositor who arrives during Listed is NOT added to the open short - the write
-    ///      size is fixed at rollOpen - but he is still a pro-rata owner of the pool when that
-    ///      short is assigned. The two legs of the USDG take are split differently, and that
+    /// @dev A depositor who arrives during Listed buys into the open short. Here no tranche is
+    ///      written after he arrives (`writeMore` could have written against his stock), but he
+    ///      is still a pro-rata owner of the pool when that short is assigned: the loss reaches
+    ///      him through the share price. The two legs of the USDG take are split differently, and that
     ///      is the point of this test: the PREMIUM was earned before he arrived and is fixed
     ///      into the index by the checkpoint inside his own deposit, while the ASSIGNMENT
     ///      proceeds arrive at the close and are shared by everyone holding shares then.
@@ -440,7 +441,7 @@ contract VaultAssignmentTest is BaseTest {
     ///        1_558_050_000 + 770_000_000 = 2_328_050_000 = FULL_ASSIGN_NET, to the unit.
     ///        vault NVDA 20e18, supply 30e18
     ///        bob's stake = 10e18 * (20e18 + 1) / (30e18 + 1) = 6_666_666_666_666_666_666
-    function test_lateDepositorDuringListed_isNotWrittenAgainstButSharesTheAssignment() public {
+    function test_lateDepositorDuringListed_sharesTheAssignmentThroughTheSharePrice() public {
         _deposit(alice, 20e18);
 
         uint256 oid = _rollOpen(10);
@@ -450,8 +451,9 @@ contract VaultAssignmentTest is BaseTest {
         uint256 bobShares = _deposit(bob, 10e18);
         assertEq(bobShares, 10e18, "bob bought in at par: NAV per share is still 1.0");
 
-        // The short did not grow to cover bob's money.
-        assertEq(vault.contractsWritten(), 10, "write size is fixed at rollOpen");
+        // No tranche was written after bob arrived, so in THIS week his stock sits idle. That is
+        // a keeper choice, not a guarantee: `writeMore` could have written against it.
+        assertEq(vault.contractsWritten(), 10, "no tranche written after the deposit");
         assertEq(vault.lockedAssets(), 10e18, "bob's stock was never posted as collateral");
         assertEq(vault.idleAssets(), 20e18, "it sits idle instead");
 

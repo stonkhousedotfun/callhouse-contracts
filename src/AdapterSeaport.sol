@@ -68,14 +68,31 @@ abstract contract AdapterSeaport {
     /// @notice Option contracts the live listing offers.
     uint256 public listingAmount;
 
-    /// @notice Listings authorised this cycle. Capped to stop a keeper from ratcheting the
-    ///         price down all week.
+    /// @notice PRICE LEVELS spent this cycle: how many listings set a new lowest unit price.
+    ///         Capped at {Policy.MAX_LISTINGS_PER_CYCLE} to stop a keeper ratcheting the price
+    ///         down all week.
+    /// @dev The name is kept for ABI stability; it no longer counts every authorisation.
+    ///
+    ///      WHY SLOTS COUNT PRICE CUTS. The cap used to count every approval, and a cancel never
+    ///      refunded one. After a mid-week rally the keeper's honest move is to reprice UP, or to
+    ///      relist a bigger tranche after {Vault.writeMore}; each of those burned a slot, so three
+    ///      repricings left the vault unable to list at all while a stale listing sat on the book.
+    ///      The threat the cap exists for is a ratchet DOWN. So the first listing of a cycle, and
+    ///      any listing whose unit price (gross / amount) is strictly below the lowest authorised
+    ///      so far, spends a slot and becomes the new lowest; a listing at or above the lowest is
+    ///      free. That still allows at most three descending price levels per cycle.
     uint8 public listingsThisCycle;
+
+    /// @notice The lowest gross unit price (USDG base units per contract) authorised this cycle.
+    ///         Zero before the first listing of a cycle.
+    uint256 public lowestListedUnitUsdg;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev `seq` is {listingsThisCycle} after this approval: the number of price levels spent,
+    ///      NOT a running count of authorisations. Two listings can share a `seq`.
     event ListingApproved(
         bytes32 indexed orderHash, uint256 indexed optionId, uint256 amount, uint256 grossUsdg, uint8 seq
     );
@@ -161,9 +178,6 @@ abstract contract AdapterSeaport {
         uint256 strikeUsdg
     ) internal returns (bytes32 orderHash, uint256 grossUsdg, uint256 amount) {
         if (listingHash != bytes32(0)) revert PreviousListingLive(listingHash);
-        if (listingsThisCycle >= Policy.MAX_LISTINGS_PER_CYCLE) {
-            revert TooManyListings(listingsThisCycle, Policy.MAX_LISTINGS_PER_CYCLE);
-        }
 
         (orderHash, grossUsdg, amount) = SeaportOrderLib.approve(
             seaport,
@@ -181,14 +195,21 @@ abstract contract AdapterSeaport {
             })
         );
 
+        // The library already refused a gross that is not an exact multiple of `amount`.
+        uint256 unitPrice = grossUsdg / amount;
+        uint256 lowest = lowestListedUnitUsdg;
+        uint8 used = listingsThisCycle;
+        if (lowest == 0 || unitPrice < lowest) {
+            if (used >= Policy.MAX_LISTINGS_PER_CYCLE) revert TooManyListings(used, Policy.MAX_LISTINGS_PER_CYCLE);
+            listingsThisCycle = ++used;
+            lowestListedUnitUsdg = unitPrice;
+        }
+
         listingHash = orderHash;
         listingGrossUsdg = grossUsdg;
         listingAmount = amount;
-        unchecked {
-            listingsThisCycle += 1;
-        }
 
-        emit ListingApproved(orderHash, expectedOptionId, amount, grossUsdg, listingsThisCycle);
+        emit ListingApproved(orderHash, expectedOptionId, amount, grossUsdg, used);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -227,6 +248,7 @@ abstract contract AdapterSeaport {
     /// @dev Reset the per-cycle listing budget. Called on roll open.
     function _resetListingBudget() internal {
         listingsThisCycle = 0;
+        lowestListedUnitUsdg = 0;
     }
 
     /*//////////////////////////////////////////////////////////////

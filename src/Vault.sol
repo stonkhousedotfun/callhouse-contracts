@@ -17,6 +17,7 @@ import {IOvercallRegistry} from "./interfaces/IOvercallRegistry.sol";
 import {IStockToken} from "./interfaces/IStockToken.sol";
 import {IChainlinkFeed} from "./interfaces/IChainlinkFeed.sol";
 import {ISeaport, OrderComponents} from "./interfaces/ISeaport.sol";
+import {ValoremLib} from "./lib/ValoremLib.sol";
 
 /// @title Vault
 /// @notice A pooled covered-call account for one Robinhood Chain Stock Token.
@@ -84,18 +85,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     uint32 internal constant MIN_PRICE_AGE = 1 hours;
     uint32 internal constant MAX_PRICE_AGE_CEIL = 7 days;
 
-    /// @dev The longest cycle this vault will ever underwrite, measured from the moment of the
-    ///      write. Overcall's cycles are seven days with a 24-hour exercise window.
-    ///
-    ///      WHY A COMPILED-IN CONSTANT, NOT A POLICY FIELD. The registry that sets the cycle is
-    ///      owned by a single third-party EOA, and its `setCycle` bounds the expiry only from
-    ///      below (`exerciseAt + MIN_EXERCISE_WINDOW`). Nothing stops it setting an expiry years
-    ///      out, by malice or by fat finger. The vault snapshots that expiry and `rollClose`
-    ///      then refuses to run until it passes, so collateral would be locked in Valorem for
-    ///      the whole tenor with no redemption path for anyone. A skipped week is strictly
-    ///      better than a decade-long lock on depositor principal, and making this
-    ///      admin-settable would reintroduce the single-key dependency it exists to remove.
-    uint40 internal constant MAX_CYCLE_TENOR = 21 days;
+    // The longest cycle the vault will underwrite (21 days from the write) is compiled into
+    // {ValoremLib.MAX_CYCLE_TENOR}, next to the write gate that enforces it.
 
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
@@ -112,7 +103,7 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice Maximum asset base units the vault will hold from deposits.
     uint256 public depositCap;
 
-    /// @notice When true, `rollOpen` and `approveListing` are blocked. Nothing else is.
+    /// @notice When true, `rollOpen`, `writeMore` and `approveListing` are blocked. Nothing else is.
     bool public writesHalted;
 
     /// @notice Governance has looked at the Valorem engine fee and accepted paying it.
@@ -257,6 +248,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      The two timestamps tell you which.
     error BadCycleWindow(uint40 exerciseTs, uint40 expiryTs);
     error DepositsClosedForCycle(uint40 exerciseTs);
+    error WriteWindowClosed(uint40 exerciseTs);
+    error ListingStillValid();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -439,9 +432,21 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Deposit `assets` and receive shares.
-    /// @dev Allowed in Idle and Listed. New money lands in the idle balance and is not added
-    ///      to a short that is already open, so a late depositor cannot be assigned against a
-    ///      call they were never part of writing.
+    /// @dev Allowed in Idle and Listed (until `cycleExerciseTs`; see {_requireDepositPhase}).
+    ///
+    ///      A DEPOSIT DURING LISTED BUYS INTO THE OPEN SHORT. Shares are priced on {totalAssets},
+    ///      which values the short call at zero, so a deposit made while a call is open pays
+    ///      par-style NAV for a book that is already short that call. If the week ends assigned,
+    ///      the loss is socialised through the share price to EVERY share, the late ones
+    ///      included: the depositor cannot be assigned "against their own collateral" only, and
+    ///      nothing here pretends otherwise. On top of that, {writeMore} lets the keeper write a
+    ///      further tranche against idle balance that includes the new deposit, so late money
+    ///      can also be written against directly. What a late depositor does NOT get is premium
+    ///      indexed before their shares existed ({_checkpointHarvest}).
+    ///
+    ///      This is intended, and it is why the deposit window shuts at `cycleExerciseTs`: before
+    ///      that nothing can be assigned, so the NAV a late depositor pays is not yet marked down
+    ///      by an assignment whose strike proceeds are still inside Valorem.
     function deposit(uint256 assets, address receiver) external nonReentrant returns (uint256 shares) {
         if (assets == 0) revert ZeroAssets();
         _requireDepositPhase();
@@ -561,6 +566,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      Never blocked by a halt or by the phase. If the issuer freezes the Stock Token
     ///      this still succeeds; only the payout at settlement would fail, which is the
     ///      honest place for that failure to surface.
+    ///
+    ///      An entry settles at the next `rollClose`, or, while the vault is Idle, whenever
+    ///      anyone calls {settleQueue}. The second path is what stops a queue made while flat
+    ///      from waiting on a `rollOpen` that may never come.
     function queueRedeem(uint256 shares) external nonReentrant returns (uint256 queuedEpoch) {
         if (shares == 0) revert ZeroShares();
 
@@ -705,53 +714,79 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @param contractsCount Whole lots to write.
     function rollOpen(uint256 optionId_, uint112 contractsCount) external onlyRole(KEEPER_ROLE) nonReentrant {
         if (phase != Phase.Idle) revert WrongPhase(Phase.Idle, phase);
-        if (writesHalted) revert WritesAreHalted();
 
-        // The registry's own gate. `isWritingOpen()` is false both before the first cycle is
-        // set and after the write deadline passes.
-        if (!registry.isWritingOpen()) revert WritingNotOpen();
+        (uint256 strikeUsdg, uint32 number, uint40 exerciseTs, uint40 expiryTs) = _write(optionId_, contractsCount);
 
-        IOvercallRegistry.Cycle memory cyc = registry.cycle();
-        if (cyc.number == 0) revert NoCycle();
-        if (!registry.isApproved(optionId_)) revert OptionNotApproved(optionId_);
-
-        uint32 optCycle = registry.cycleOf(optionId_);
-        if (optCycle != cyc.number) revert OptionNotInCurrentCycle(optionId_, optCycle, cyc.number);
-
-        // Refuse an absurd cycle before any collateral moves. The registry's owner is a single
-        // third-party EOA and its `setCycle` bounds the expiry only from below, so a hostile or
-        // mistaken cycle could otherwise lock the vault's collateral until that expiry passed.
-        if (cyc.expiryTimestamp <= cyc.exerciseTimestamp) {
-            revert BadCycleWindow(cyc.exerciseTimestamp, cyc.expiryTimestamp);
-        }
-        if (cyc.expiryTimestamp > uint40(block.timestamp) + MAX_CYCLE_TENOR) {
-            revert BadCycleWindow(cyc.exerciseTimestamp, cyc.expiryTimestamp);
-        }
-
-        // Valorem's engine fee is 15 bps of notional, which on a weekly out-of-the-money call
-        // is a large slice of the premium. Writing through it is a governance decision, not a
-        // keeper decision.
-        if (clear.feesEnabled() && !valoremFeeAccepted) revert ValoremFeeNotAccepted(clear.feeBps());
-
-        _requireOracleLive();
-
-        uint256 strikeUsdg = uint256(registry.strikePerContract(optionId_));
-        uint256 spot = _spotUsdg();
-
-        PolicyParams memory p = policy;
-        Policy.checkStrike(strikeUsdg, spot, p);
-        Policy.checkContracts(contractsCount, idleAssets(), p);
-
-        _writeCalls(asset, address(usdg), optionId_, contractsCount, cyc, valoremFeeAccepted);
-
-        cycleNumber = cyc.number;
-        cycleExerciseTs = cyc.exerciseTimestamp;
-        cycleExpiryTs = cyc.expiryTimestamp;
+        cycleNumber = number;
+        cycleExerciseTs = exerciseTs;
+        cycleExpiryTs = expiryTs;
         cycleStrikeUsdg = strikeUsdg;
         _resetListingBudget();
         phase = Phase.Listed;
 
-        emit RollOpen(cyc.number, optionId_, contractsCount, strikeUsdg);
+        emit RollOpen(number, optionId_, contractsCount, strikeUsdg);
+    }
+
+    /// @notice Write another tranche of this cycle's option into the SAME Valorem claim.
+    /// @dev WHY THIS EXISTS. Valorem assigns exercise across EVERY writer of an option id, pro
+    ///      rata by what each wrote (upstream 6436c82 puts every write before the first exercise
+    ///      into one bucket, and a claim's share of a bucket's assignment is its share of the
+    ///      bucket's writes). It does not care who SOLD. A vault that wrote 50 and sold 10, next
+    ///      to other writers who wrote 50 and sold all of it, expects 30 assigned on an
+    ///      in-the-money expiry while only 10 of its contracts ever earned a premium. The unsold
+    ///      inventory is pure exposure. Writing in tranches sized to each listing bounds that
+    ///      exposure by the live listing's unfilled part instead of the whole week's size.
+    ///
+    ///      Passing the existing claim id to `clear.write` adds to the claim rather than opening
+    ///      a second one, so `claimKey`, the settlement path and every claim view are unchanged:
+    ///      `rollClose` still redeems exactly one claim, whatever it holds.
+    ///
+    ///      Every check a fresh write makes is re-run at today's state (see {ValoremLib.write}):
+    ///      halt, the registry's write window and approval, the live cycle still being this
+    ///      vault's cycle, the Valorem fee, the oracle, the strike band AT LIVE SPOT, and size
+    ///      on the claim's TOTAL against idle plus locked. Additionally no tranche may be written
+    ///      once `cycleExerciseTs` is reached, because the deposit gate rests on nothing being
+    ///      assignable before then.
+    /// @param n Whole lots to add.
+    function writeMore(uint112 n) external onlyRole(KEEPER_ROLE) nonReentrant {
+        if (phase != Phase.Listed) revert WrongPhase(Phase.Listed, phase);
+        _write(optionId, n);
+    }
+
+    /// @dev The shared tail of {rollOpen} and {writeMore}. Passes storage as it stands: in Idle
+    ///      `claimKey` is zero, which is what tells the library this is a fresh claim and makes it
+    ///      ignore the previous cycle's `cycleNumber`, `cycleExerciseTs` and `cycleStrikeUsdg`.
+    ///      Sizing is on {totalAssets} = idle + locked, which in Idle is just idle.
+    function _write(uint256 optionId_, uint112 n)
+        private
+        returns (uint256 strikeUsdg, uint32 number, uint40 exerciseTs, uint40 expiryTs)
+    {
+        if (writesHalted) revert WritesAreHalted();
+
+        uint256 key;
+        uint256 collateral;
+        (key, collateral, strikeUsdg, number, exerciseTs, expiryTs) = ValoremLib.write(
+            clear,
+            ValoremLib.Write({
+                registry: registry,
+                feed: priceFeed,
+                asset: asset,
+                exerciseAsset: address(usdg),
+                optionId: optionId_,
+                claimId: claimKey,
+                strikeUsdg: cycleStrikeUsdg,
+                sizingAssets: totalAssets(),
+                written: contractsWritten,
+                n: n,
+                cycleNumber: cycleNumber,
+                cycleExerciseTs: cycleExerciseTs,
+                maxPriceAge: maxPriceAge,
+                feeAccepted: valoremFeeAccepted
+            }),
+            policy
+        );
+
+        _recordWrite(optionId_, key, n, collateral);
     }
 
     /// @notice Authorise a Seaport listing for this cycle's option tokens.
@@ -768,10 +803,42 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
             components, optionId, available, address(usdg), address(clear), cycleExerciseTs, cycleStrikeUsdg
         );
 
-        // The economic floor is checked here rather than in the adapter because it needs the
-        // live spot, and the adapter is deliberately free of oracle knowledge.
+        // The economic floors are checked here rather than in the adapter because they need the
+        // live spot, and the adapter is deliberately free of oracle knowledge. They are the SAME
+        // two floors {invalidateStaleListing} reads (see {_listingFloors}): the strike must still
+        // clear the band floor at live spot (a rally must not let the keeper sell a rung that is
+        // now near the money, exactly as {writeMore} refuses to write more of it) and the gross
+        // must clear the premium floor. Only the band's LOWER bound: after a sell-off the strike
+        // sits above the band ceiling, which makes the call safer to sell, not riskier.
         _requireOracleLive();
-        Policy.checkPremium(grossUsdg, _spotUsdg(), amount, policy);
+        (uint256 minStrike, uint256 minGross) = _listingFloors(amount);
+        if (cycleStrikeUsdg < minStrike) revert Policy.StrikeBelowBand(cycleStrikeUsdg, minStrike);
+        if (grossUsdg < minGross) revert Policy.PremiumBelowMinimum(grossUsdg, minGross);
+    }
+
+    /// @notice Kill the live listing once the policy would no longer authorise it. Anyone.
+    /// @dev WHY THIS EXISTS. A listing is a fixed price that lives until `cycleExerciseTs`. After
+    ///      a mid-week rally the strike can sit inside the band floor and the premium below the
+    ///      floor for the new spot, and a buyer can fill at the stale price one second before the
+    ///      exercise window opens and exercise straight away. The keeper can reprice, but with a
+    ///      dead keeper only the guardian could stop it.
+    ///
+    ///      So anybody may bump the Seaport counter, but ONLY when {approveListing} would refuse
+    ///      this exact listing at live spot: the cycle's strike is below the band floor, or the
+    ///      listing's gross is below the premium floor for its size. Both paths read those floors
+    ///      from the one {_listingFloors}, so a listing {approveListing} has just accepted cannot
+    ///      be killed at the same spot (it refuses a strike below the band floor too, not only a
+    ///      thin premium). A paused Stock Token oracle
+    ///      counts as stale (a fresh approval would revert `OraclePaused`); a stale feed reverts,
+    ///      because with no price nobody can show the listing is mispriced. Nobody can kill a
+    ///      listing the policy would still authorise, so this is not a griefing lever.
+    function invalidateStaleListing() external nonReentrant {
+        if (listingHash == bytes32(0)) revert NoLiveListing();
+        if (!_oraclePaused()) {
+            (uint256 minStrike, uint256 minGross) = _listingFloors(listingAmount);
+            if (cycleStrikeUsdg >= minStrike && listingGrossUsdg >= minGross) revert ListingStillValid();
+        }
+        _invalidateAllListings();
     }
 
     /// @notice Cancel the live listing on Seaport.
@@ -836,6 +903,27 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         _settleQueue();
 
         phase = Phase.Idle;
+    }
+
+    /// @notice Settle the redeem queue while the vault is flat. Anyone.
+    /// @dev WHY THIS EXISTS. Queueing is allowed in every phase and there is no dequeue, but the
+    ///      queue used to settle only inside `rollClose`, which needs a `rollOpen` first. Anything
+    ///      that stops the next write (a halt nobody lifts, a registry lot other than one token,
+    ///      a Valorem fee not accepted, a stale or paused oracle, or simply less than one lot
+    ///      idle, e.g. the last holder with half a token) froze a queuer's shares indefinitely
+    ///      while everyone who had not queued could still redeem instantly.
+    ///
+    ///      While Idle the vault is flat (`rollClose` clears `contractsWritten` on the way in), so
+    ///      {idleAssets} is the whole NAV and settling now pays exactly what an instant redemption
+    ///      of the same shares would, virtual share included (see {_settleQueue}). The harvest checkpoint first folds any USDG that arrived
+    ///      since the last close into the index, so the escrow's accrual is paid to the queuers.
+    ///      It moves no tokens, so it works under an issuer freeze and while halted; the payout
+    ///      is `completeRedeem`, as always.
+    function settleQueue() external nonReentrant {
+        if (phase != Phase.Idle) revert WrongPhase(Phase.Idle, phase);
+        if (queuedShares == 0) revert NothingQueued();
+        _checkpointHarvest();
+        _settleQueue();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -922,8 +1010,13 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         uint256 escrowUsdg = _takeAccrued(address(this));
         _epochAccUsdgPerShare[epochId] = accUsdgPerShare;
 
-        uint256 supply = totalSupply();
-        uint256 payoutAssets = supply == 0 ? 0 : (idleAssets() * q) / supply;
+        // Priced exactly like an instant redemption, virtual share included: `q <= supply`, so
+        // this never exceeds `idleAssets()`. An earlier draft paid `idle * q / supply` with no
+        // +1/+1. Once `settleQueue` made the queue an atomic, permissionless exit while flat,
+        // that turned first-depositor inflation from a donation-bounded grief into a profit:
+        // seed 3 wei, donate, let a victim round down to one share, then queue and settle out
+        // with part of the victim's deposit. The virtual share now keeps its slice on both paths.
+        uint256 payoutAssets = q.mulDiv(idleAssets() + 1, totalSupply() + 1);
 
         queuedShares = 0;
         _burn(address(this), q);
@@ -949,13 +1042,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
                                 ORACLE
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Spot for one lot in USDG base units. Gate and display only.
-    ///      This is the single seam where the price comes from; nothing downstream of a write
-    ///      decision ever calls it.
+    /// @dev Spot for one lot in USDG base units. Gate and display only. The implementation lives
+    ///      in {ValoremLib.spotUsdg}, beside the write gate that is its main consumer.
     function _spotUsdg() internal view returns (uint256) {
-        (, int256 answer,, uint256 updatedAt,) = priceFeed.latestRoundData();
-        if (block.timestamp - updatedAt > maxPriceAge) revert StalePrice(updatedAt, maxPriceAge);
-        return Policy.normalizeSpot(answer, priceFeed.decimals());
+        return ValoremLib.spotUsdg(priceFeed, maxPriceAge);
     }
 
     /// @notice Spot used by the policy gate, for the UI.
@@ -964,12 +1054,24 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     }
 
     /// @dev The Stock Token can halt its own oracle. When it does, the vault holds spot and
-    ///      writes nothing. Probed with a staticcall so a token without the function is not a
-    ///      permanent brick.
+    ///      writes nothing. See {ValoremLib.oraclePaused}.
+    function _oraclePaused() private view returns (bool) {
+        return ValoremLib.oraclePaused(asset);
+    }
+
     function _requireOracleLive() private view {
-        (bool ok, bytes memory data) =
-            address(asset).staticcall(abi.encodeWithSelector(IStockToken.oraclePaused.selector));
-        if (ok && data.length == 32 && abi.decode(data, (bool))) revert OraclePaused();
+        if (_oraclePaused()) revert OraclePaused();
+    }
+
+    /// @dev The two live-spot floors a listing of `amount` contracts must clear: the band's lower
+    ///      strike bound and the gross premium floor. ONE function so {approveListing} (refuses
+    ///      below either) and {invalidateStaleListing} (kills below either) can never disagree
+    ///      about what the policy would still authorise. A stale feed reverts inside {_spotUsdg}.
+    function _listingFloors(uint256 amount) private view returns (uint256 minStrike, uint256 minGross) {
+        uint256 spot = _spotUsdg();
+        PolicyParams memory p = policy;
+        (minStrike,) = Policy.strikeBand(spot, p);
+        minGross = Policy.minPremium(spot, amount, p);
     }
 
     /// @notice ERC-8056 display multiplier, or 1e18 when the token does not expose one.
@@ -1035,8 +1137,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
                              HALT / ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Block `rollOpen` and `approveListing`. Never blocks redemptions, claims,
-    ///         `cancelListing`, `lockBook` or `rollClose`.
+    /// @notice Block `rollOpen`, `writeMore` and `approveListing`. Never blocks redemptions,
+    ///         claims, `settleQueue`, `cancelListing`, `lockBook` or `rollClose`.
     function haltWrites() external {
         if (!hasRole(GUARDIAN_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
             revert AccessControlUnauthorizedAccount(msg.sender, GUARDIAN_ROLE);

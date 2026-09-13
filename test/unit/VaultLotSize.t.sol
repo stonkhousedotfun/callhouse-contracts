@@ -16,7 +16,7 @@ import {ValoremLib} from "../../src/lib/ValoremLib.sol";
 ///      premium floor, exercised, and took ~$4,879 out of an $11,000 book. Any lot above ~1.03e18
 ///      passed the band with an in-the-money strike; a lot above 1/0.95 with cap sizing also locked
 ///      assets already reserved for settled redeemers.
-///      THE FIX. `ValoremLib.writeCalls` reverts `UnexpectedLotSize(1e18, lotSize)` unless the cycle's
+///      THE FIX. `ValoremLib.write` reverts `UnexpectedLotSize(1e18, lotSize)` unless the cycle's
 ///      lot is exactly 1e18. A lot change now costs a skipped week, which is the worst case
 ///      SECURITY.md claims for the registry owner.
 contract VaultLotSizeTest is BaseTest {

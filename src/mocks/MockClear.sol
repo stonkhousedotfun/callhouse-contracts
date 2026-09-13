@@ -13,6 +13,12 @@ import {IValoremClear} from "../interfaces/IValoremClear.sol";
 ///      - `redeem` only works after expiry and only for the claim's owner
 ///      - partial assignment: 0..n of a claim may be exercised, and redeem pays a mix of
 ///        leftover underlying plus strike proceeds
+///      - top-up: `write(claimId, n)` adds to a claim the caller owns and returns the same id, as
+///        upstream `valorem-labs-inc/clear` @ 6436c823 does. Upstream records a claim index per
+///        bucket written into (a new bucket only once the option type's last bucket has been
+///        exercised, so every pre-exercise write shares one bucket) and `claim`/`position` sum
+///        over the claim's indices. The mock keeps one running total per claim, which is that
+///        sum, so the vault's claim views see exactly what upstream reports for a topped-up claim.
 ///      Not modelled: bucketed fair assignment across many writers, the URI generator, fee
 ///      sweeping. The vault does not read any of those.
 contract MockClear is IValoremClear {
@@ -138,6 +144,7 @@ contract MockClear is IValoremClear {
     //////////////////////////////////////////////////////////////*/
 
     function write(uint256 tokenId, uint112 amount) external returns (uint256 claimId) {
+        if (tokenId & type(uint96).max != 0) return _topUp(tokenId, amount);
         uint256 typeId = (tokenId >> 96) << 96;
         OptionType storage o = optionTypes[typeId];
         if (!o.exists) revert UnknownOption();
@@ -169,6 +176,34 @@ contract MockClear is IValoremClear {
         emit TransferSingle(msg.sender, address(0), msg.sender, typeId, amount);
         emit TransferSingle(msg.sender, address(0), msg.sender, claimId, 1);
         emit OptionsWritten(typeId, msg.sender, claimId, amount);
+    }
+
+    /// @dev Upstream's add-to-an-existing-claim branch: zero amount, an unknown or expired option
+    ///      and a caller who does not hold the claim NFT all revert; the fee is charged as on a
+    ///      fresh write; only option tokens are minted; the claim id passed in is returned.
+    function _topUp(uint256 claimId, uint112 amount) internal returns (uint256) {
+        if (amount == 0) revert AmountWrittenCannotBeZero();
+        ClaimData storage c = claims[claimId];
+        OptionType storage o = optionTypes[c.optionId];
+        if (!o.exists) revert UnknownOption();
+        if (block.timestamp >= o.expiryTimestamp) revert Expired();
+        if (_balances[msg.sender][claimId] != 1 || c.redeemed) revert CallerDoesNotOwnClaimId(claimId);
+
+        uint256 pull = uint256(amount) * uint256(o.underlyingAmount);
+        if (_feesEnabled) {
+            uint256 fee = (pull * uint256(_feeBps)) / 10_000;
+            if (fee == 0) fee = 1;
+            pull += fee;
+            emit FeeAccrued(c.optionId, o.underlyingAsset, msg.sender, fee);
+        }
+        IERC20(o.underlyingAsset).safeTransferFrom(msg.sender, address(this), pull);
+
+        c.written += amount;
+        _balances[msg.sender][c.optionId] += amount;
+
+        emit TransferSingle(msg.sender, address(0), msg.sender, c.optionId, amount);
+        emit OptionsWritten(c.optionId, msg.sender, claimId, amount);
+        return claimId;
     }
 
     /*//////////////////////////////////////////////////////////////

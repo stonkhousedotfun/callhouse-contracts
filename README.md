@@ -16,7 +16,7 @@ leekzor/callhouse and mounts this repository as a git submodule at `contracts/`.
 |---|---|
 | [`docs/AUDIT-SCOPE.md`](docs/AUDIT-SCOPE.md) | the audit scope: what is in and out, the properties to break, the areas of concern, build instructions. Auditors start here |
 | [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) | the money maths: two ledgers, the accrual index, the redeem queue, fees. Read it before changing anything in `src/` |
-| [`SECURITY.md`](SECURITY.md) | the threat model, the properties enforced in bytecode, the 2026-09-12 internal review, reporting |
+| [`SECURITY.md`](SECURITY.md) | the threat model (including what a compromised keeper or admin can leak through pricing), the properties enforced in bytecode, the 2026-09-12 internal review and the 2026-09-13 findings, reporting |
 
 Paths in this repository's docs resolve from its root. A path followed by (leekzor/callhouse)
 lives in the app repository and resolves from that repository's root; a marker after a list
@@ -35,7 +35,7 @@ src/
   AdapterValorem.sol        write, redeem, claim and position accounting
   AdapterSeaport.sol        listing lifecycle, EIP-1271, the conduit approval
   lib/SeaportOrderLib.sol   order shape validation and Seaport's three encoders  (LINKED LIBRARY)
-  lib/ValoremLib.sol        the write/redeem path against Valorem, option-window check  (LINKED LIBRARY)
+  lib/ValoremLib.sol        the one write gate (rollOpen, writeMore), write/redeem against Valorem, oracle read  (LINKED LIBRARY)
   interfaces/               IValoremClear, IOvercallRegistry, ISeaport, IStockToken, IChainlinkFeed
   mocks/                    MockClear, MockRegistry, MockSeaport, MockStockToken, MockERC20, MockFeed
 test/
@@ -83,7 +83,8 @@ FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
 profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
 verbosity.
 
-Current state: **319 unit and invariant tests across 14 suites, 21 fork tests, all passing**.
+Current state: **349 unit and invariant tests across 15 suites, 22 fork tests, all passing**
+(measured 2026-09-13 on the uncommitted second-pass fixes over `634bf55`).
 
 ### CI, and why the local gate is the gate
 
@@ -98,10 +99,12 @@ that is fixed CI proves nothing, and the gate is the four commands above run loc
 
 ## Four things that will bite you
 
-**1. `Vault` has about 0.96 KB of headroom** under the EIP-170 24,576-byte runtime limit (23,618 B
-used, 958 B margin, after the 2026-09-13 queue-fairness fix). via-IR is already on and BOTH `SeaportOrderLib` and `ValoremLib` are
-already extracted — the second extraction paid for the deposit-gate and cycle-window checks from
-the 2026-09-12 review. Optimiser runs were measured from 1 to 200 and move the figure by under
+**1. `Vault` has about 1.7 KB of headroom** under the EIP-170 24,576-byte runtime limit (22,854 B
+used, 1,722 B margin, after the 2026-09-13 second-pass fixes moved the write gate, the spot read
+and the oracle-pause probe into `ValoremLib`; it was 23,618 B before them). via-IR is already on
+and BOTH `SeaportOrderLib` and `ValoremLib` are already extracted — the second extraction paid for
+the deposit-gate and cycle-window checks from the 2026-09-12 review, and the move into it paid for
+`writeMore`, `settleQueue` and `invalidateStaleListing`. Optimiser runs were measured from 1 to 200 and move the figure by under
 200 bytes, so if you run out of room the answer is another library extraction, not another
 setting.
 
@@ -195,13 +198,18 @@ proxy that injects one so `forge verify-contract` works.
 | Role | Holder | Powers |
 |---|---|---|
 | `DEFAULT_ADMIN_ROLE` | 2/3 Safe | set the keeper, the fee recipient, the policy inside hard caps, the deposit cap, `maxPriceAge`, accept the Valorem fee, unhalt |
-| `KEEPER_ROLE` | hot wallet | `rollOpen`, `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
+| `KEEPER_ROLE` | hot wallet | `rollOpen`, `writeMore` (a further tranche into this cycle's claim, `Listed` and before the exercise timestamp), `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
 | `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites`, `cancelListing`, `invalidateAllListings` |
-| anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `sweepFee` whenever a fee is pending |
+| anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `sweepFee` whenever a fee is pending; `settleQueue` while `Idle` with shares queued; `invalidateStaleListing` when the live listing's strike is below the band floor or its gross below the premium floor at live spot, or the Stock Token oracle is paused |
 
-A halt blocks `rollOpen` and `approveListing` **only**. `queueRedeem`, `completeRedeem`,
-`claimUsdg`, `cancelListing`, `lockBook` and `rollClose` all keep working, because a halt must
-never trap a depositor.
+The keeper cannot move a token, but it sets the sale price inside policy, and a compromised keeper
+(or the bootstrap admin, which can loosen policy and grant itself the keeper role) can sell at the
+floor to itself. SECURITY.md §3 has the bound per week.
+
+A halt blocks `rollOpen`, `writeMore` and `approveListing` **only**. `queueRedeem`,
+`settleQueue`, `completeRedeem`, `claimUsdg`, `cancelListing`, `invalidateAllListings`,
+`invalidateStaleListing`, `lockBook` and `rollClose` all keep working, because a halt must never
+trap a depositor.
 
 Deposits close on the cycle's exercise **timestamp**, whether or not anyone calls `lockBook`:
 after it, `deposit`/`mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0.
@@ -222,8 +230,8 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 | `protocolFeeBps` | 500 (5% of premium) | ceiling 2000. The fee base is premium only: strike proceeds from assignment are excluded in `Vault._accrueHarvest`, at any setting |
 | `maxContractsCap` | 50 | must be non-zero |
 | `maxPriceAge` | 4 days | 1 hour to 7 days |
-| listings per cycle | 3 | constant |
-| cycle tenor | 7 days (Overcall's) | **ceiling 21 days**, `MAX_CYCLE_TENOR` — a bad cycle from the registry EOA skips a week, it cannot lock collateral for years |
+| listing price cuts per cycle | 3 | constant; the first listing and each strictly lower unit price spend one, a relist at or above the lowest price is free (`listingsThisCycle` counts cuts) |
+| cycle tenor | 7 days (Overcall's) | **ceiling 21 days**, `ValoremLib.MAX_CYCLE_TENOR` — a bad cycle from the registry EOA skips a week, it cannot lock collateral for years |
 
 ---
 

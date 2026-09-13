@@ -3,6 +3,16 @@ pragma solidity 0.8.28;
 
 import {BaseTest} from "../Base.t.sol";
 import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
+import {Vault} from "../../src/Vault.sol";
+import {VerifyVault} from "../../script/Verify.s.sol";
+
+/// @dev Runs Verify.s.sol's bytecode section against the test fixture's own deployment.
+contract VerifyBytecodeHarness is VerifyVault {
+    function bytecode(Vault vault, address sol, address vl) external returns (uint256, uint256) {
+        _bytecode(vault, sol, vl);
+        return (failures, passes);
+    }
+}
 
 /// @notice Proves the shared fixture wires up and one clean cycle runs end to end.
 contract SmokeTest is BaseTest {
@@ -63,5 +73,36 @@ contract SmokeTest is BaseTest {
         vm.prank(alice);
         vault.redeem(20e18, alice, alice);
         assertEq(nvda.balanceOf(alice), 30e18, "all collateral back");
+    }
+
+    /// @dev Regression: Verify.s.sol hard-coded 5 Vault link sites, so once the fixes added library
+    ///      call sites a byte-perfect deployment FAILED the post-deploy gate. The expected count now
+    ///      comes from the artifact, and the fixture's deployment (libraries read back from the
+    ///      link sites themselves) passes every bytecode check.
+    function test_verifyScript_acceptsAByteForByteDeployment() public {
+        bytes memory code = address(vault).code;
+        string memory json = vm.readFile("out/Vault.sol/Vault.json");
+        uint256 vlOff =
+            vm.parseJsonUint(json, ".deployedBytecode.linkReferences['src/lib/ValoremLib.sol'].ValoremLib[0].start");
+        uint256 solOff = vm.parseJsonUint(
+            json, ".deployedBytecode.linkReferences['src/lib/SeaportOrderLib.sol'].SeaportOrderLib[0].start"
+        );
+        address vl = address(bytes20(_slice20(code, vlOff)));
+        address sol = address(bytes20(_slice20(code, solOff)));
+
+        VerifyBytecodeHarness h = new VerifyBytecodeHarness();
+        (uint256 failures, uint256 passes) = h.bytecode(vault, sol, vl);
+        assertEq(failures, 0, "a correct deployment passes the bytecode section");
+        assertEq(passes, 6, "link sites, vault runtime, and two checks per library");
+
+        // Teeth: swapped library addresses still fail.
+        (failures,) = new VerifyBytecodeHarness().bytecode(vault, vl, sol);
+        assertGt(failures, 0, "swapped libraries fail");
+    }
+
+    function _slice20(bytes memory b, uint256 off) internal pure returns (bytes20 w) {
+        assembly {
+            w := mload(add(add(b, 32), off))
+        }
     }
 }

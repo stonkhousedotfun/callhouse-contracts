@@ -100,7 +100,8 @@ ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false \
 Every line `ok`, ending `VERIFY PASSED` (55 checks in the rehearsal). What it covers:
 
 - chain id; vault and both libraries **byte for byte** against `out/`, with only link sites (each
-  checked to hold the right library), immutables (each checked by value) and a library's own address
+  checked to hold the right library; how many there are is read from the artifact's `linkReferences`,
+  7 at this commit, never hard-coded), immutables (each checked by value) and a library's own address
   word masked — this is what proves the compiled-in hard caps and all logic are this commit's;
 - every immutable: asset, USDG, clearinghouse, Seaport, the NVDA registry (not JUGGERNAUT), price
   feed, Overcall fee recipient, zero conduit key, zero zone, the ERC-1155 approval target and the

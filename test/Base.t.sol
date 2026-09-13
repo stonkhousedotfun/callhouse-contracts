@@ -168,6 +168,12 @@ abstract contract BaseTest is Test {
         vault.rollOpen(optionId, n);
     }
 
+    /// @dev Top this cycle's claim up by `n` contracts as the keeper.
+    function _writeMore(uint112 n) internal {
+        vm.prank(keeper);
+        vault.writeMore(n);
+    }
+
     /// @dev Build an order in exactly the shape Overcall publishes.
     ///      zone 0, zoneHash 0, conduitKey 0, orderType PARTIAL_OPEN, startTime 0, endTime =
     ///      the cycle's exercise timestamp, and the 5% fee rounded PER CONTRACT.

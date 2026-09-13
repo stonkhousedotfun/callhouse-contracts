@@ -1288,4 +1288,167 @@ contract VaultQueueTest is BaseTest {
         assertEq(vault.totalAssets(), 25e18, "and the asset pot follows it exactly");
         assertEq(vault.convertToAssets(1e18), 1e18, "so nobody's price moved at all");
     }
+
+    /*//////////////////////////////////////////////////////////////
+                 F1: SETTLING A QUEUE MADE WHILE FLAT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev The PoC that used to trap alice. She queues while Idle, the guardian halts writes and
+    ///      nobody lifts it: no `rollOpen`, so no `rollClose`, so no settlement, while bob (who
+    ///      never queued) walks out instantly. A year later she was still stuck. Now anyone can
+    ///      settle the flat queue, and she is paid what an instant redemption would have paid.
+    function test_settleQueue_freesSharesQueuedWhileIdleUnderAHaltNobodyLifts() public {
+        uint256 aliceStart = nvda.balanceOf(alice);
+        uint256 bobStart = nvda.balanceOf(bob);
+        _deposit(alice, 10e18);
+        _deposit(bob, 10e18);
+        _queue(alice, 10e18);
+        vm.prank(guardian);
+        vault.haltWrites();
+
+        vm.prank(bob);
+        vault.redeem(10e18, bob, bob);
+        assertEq(nvda.balanceOf(bob), bobStart, "the holder who did not queue exits instantly");
+
+        vm.warp(block.timestamp + 365 days);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Vault.EpochNotSettled.selector, 1, 1));
+        vault.completeRedeem(alice);
+        vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Exercisable, Vault.Phase.Idle));
+        vault.rollClose();
+
+        // A stranger settles; the vault is still halted, and that does not matter.
+        vm.prank(makeAddr("stranger"));
+        vault.settleQueue();
+        assertTrue(vault.writesHalted(), "still halted");
+        assertEq(vault.epochId(), 2, "epoch 1 settled");
+
+        (uint256 assets, uint256 usdgOut) = _complete(alice);
+        assertEq(assets, 10e18, "alice gets her whole position back");
+        assertEq(usdgOut, 0, "no USDG ever arrived");
+        assertEq(nvda.balanceOf(alice), aliceStart, "measured as a balance delta, to the wei");
+        assertEq(vault.totalSupply(), 0, "and the vault is empty");
+    }
+
+    /// @dev The second PoC: the sole holder with half a lot. Nothing can ever be written, so the
+    ///      queue could never settle through a roll.
+    function test_settleQueue_freesTheLastHolderBelowOneLot() public {
+        uint256 start = nvda.balanceOf(carol);
+        _deposit(carol, 0.5e18);
+        _queue(carol, 0.5e18);
+
+        uint256 id = optionIds[RUNG_PICK];
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(Policy.ContractsAboveUtilization.selector, 1, 0));
+        vault.rollOpen(id, 1);
+
+        vault.settleQueue();
+        (uint256 assets,) = _complete(carol);
+        assertEq(assets, 0.5e18, "carol's half lot comes back");
+        assertEq(nvda.balanceOf(carol), start, "to the wei");
+    }
+
+    /// @dev USDG that reaches the vault while it is flat (a late settlement from elsewhere, or a
+    ///      donation) is folded into the index by the checkpoint before settlement, so the
+    ///      escrow's share of it leaves with the queuer instead of staying behind.
+    function test_settleQueue_paysTheEscrowsAccrualToTheQueuer() public {
+        _deposit(alice, 10e18);
+        _deposit(bob, 30e18);
+        _queue(alice, 10e18);
+        usdg.mint(address(vault), 4_000_000); // $4.00 fee-bearing inflow, $3.80 net of 5%
+
+        vault.settleQueue();
+        (uint256 assets, uint256 usdgOut) = _complete(alice);
+        assertEq(assets, 10e18, "asset leg");
+        assertEq(usdgOut, 950_000, "a quarter of the $3.80 net: the escrow held 10 of 40 shares");
+        assertEq(vault.claimableUsdg(bob), 2_850_000, "and bob keeps exactly his three quarters");
+    }
+
+    /// @dev Settling a flat queue must pay what an instant redemption of the same shares pays at
+    ///      the same moment, so nobody gains by queueing instead of redeeming or by forcing a
+    ///      settlement on somebody else. Awkward numbers: an assigned week leaves 28 - 3 = 25
+    ///      NVDA against a 28-share supply.
+    function test_settleQueue_paysWhatAnInstantRedeemWouldHave() public {
+        _deposit(alice, 7e18);
+        _deposit(bob, 21e18);
+        uint256 oid = _openAndFill(5);
+        _closeCycleAssigned(oid, 3);
+        _nextCycle();
+
+        uint256 q = 3_333_333_333_333_333_333;
+        uint256 instant = vault.previewRedeem(q);
+        uint256 bobBefore = vault.convertToAssets(vault.balanceOf(bob));
+        _queue(alice, q);
+        vault.settleQueue();
+
+        (uint256 assets,) = _complete(alice);
+        assertEq(assets, instant, "the queue pays the instant price exactly, virtual share included");
+        assertApproxEqAbs(
+            vault.convertToAssets(vault.balanceOf(bob)), bobBefore, 1, "and moves no value onto or off the stayers"
+        );
+    }
+
+    /// @dev Review round 2 PoC. `_settleQueue` used to pay `idle * q / supply` with no virtual
+    ///      share, and `settleQueue` made that an atomic exit while flat (halted or not). bob seeds
+    ///      3 wei into the empty vault and donates 20 NVDA; alice's 9.8 rounds down to ONE share;
+    ///      bob queues and settles out. Unfixed he took 22.35 NVDA for 20 NVDA + 3 wei, a 2.35
+    ///      profit carved out of alice. Now the queue prices exactly like instant redeem, so the
+    ///      donation is a loss to him again (the grief stays bounded, as
+    ///      `test_inflationGriefIsBoundedByTheDonation` expects) and alice's queue exit is her
+    ///      instant exit.
+    function test_settleQueue_doesNotMakeDonationInflationProfitable() public {
+        vm.prank(guardian);
+        vault.haltWrites();
+        uint256 bobStart = nvda.balanceOf(bob);
+        _deposit(bob, 3);
+        vm.prank(bob);
+        nvda.transfer(address(vault), 20e18);
+        assertEq(_deposit(alice, 9.8e18), 1, "alice rounds down to one share");
+
+        uint256 instant = vault.previewRedeem(3);
+        _queue(bob, 3);
+        vault.settleQueue();
+        (uint256 got,) = _complete(bob);
+        assertEq(got, instant, "the queue exit pays the instant price");
+        assertEq(got, 17.88e18 + 2, "3 * (29.8e18 + 3 + 1) / (4 + 1)");
+        assertLt(nvda.balanceOf(bob), bobStart, "the donation is a loss, not a profit");
+
+        instant = vault.previewRedeem(1);
+        _queue(alice, 1);
+        vault.settleQueue();
+        (got,) = _complete(alice);
+        assertEq(got, instant, "and alice's queue exit is her instant exit");
+    }
+
+    function test_settleQueue_revertsOutsideIdleAndWhenNothingIsQueued() public {
+        vm.expectRevert(Vault.NothingQueued.selector);
+        vault.settleQueue();
+
+        _deposit(alice, 10e18);
+        _rollOpen(5);
+        _queue(alice, 1e18);
+        vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Idle, Vault.Phase.Listed));
+        vault.settleQueue();
+
+        _warpToExercise();
+        vault.lockBook();
+        vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Idle, Vault.Phase.Exercisable));
+        vault.settleQueue();
+    }
+
+    /// @dev Pure bookkeeping, so an issuer freeze cannot stop it; only the payout waits.
+    function test_settleQueue_worksUnderAnIssuerFreeze() public {
+        _deposit(alice, 10e18);
+        _queue(alice, 4e18);
+        nvda.setFrozen(true);
+
+        vault.settleQueue();
+        vm.prank(alice);
+        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vault.completeRedeem(alice);
+
+        nvda.setFrozen(false);
+        (uint256 assets,) = _complete(alice);
+        assertEq(assets, 4e18, "paid once the freeze lifts");
+    }
 }

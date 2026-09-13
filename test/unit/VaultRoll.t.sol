@@ -96,13 +96,14 @@ contract VaultRollTest is BaseTest {
         uint256 id = _rollOpen(5);
 
         // Only one order may be live at a time, so cancel between approvals.
-        OrderComponents memory c1 = _approveListing(id, 5, _okUnitPrice());
+        // Slots count price CUTS, so each approval is priced below the last.
+        OrderComponents memory c1 = _approveListing(id, 5, _okUnitPrice() + 2);
         vm.prank(keeper);
         vault.cancelListing(c1);
         OrderComponents memory c2 = _approveListing(id, 5, _okUnitPrice() + 1);
         vm.prank(keeper);
         vault.cancelListing(c2);
-        _approveListing(id, 5, _okUnitPrice() + 2);
+        _approveListing(id, 5, _okUnitPrice());
         assertEq(vault.listingsThisCycle(), 3, "budget fully spent this cycle");
 
         _warpToExpiry();
@@ -115,6 +116,7 @@ contract VaultRollTest is BaseTest {
 
         _rollOpen(5);
         assertEq(vault.listingsThisCycle(), 0, "a new cycle starts with a full budget");
+        assertEq(vault.lowestListedUnitUsdg(), 0, "and with no lowest price, so the first listing spends a slot");
     }
 
     /// @dev Writing moves collateral into Valorem; it must not move the share price by a wei.
@@ -479,14 +481,13 @@ contract VaultRollTest is BaseTest {
 
     /// @dev The governance switch has to actually switch something. `acceptValoremFee(true)`
     ///      is spec'd (plan 4.11 #9) as the lever that lets the vault write while Valorem's
-    ///      engine fee is on, and BOTH gates have to honour it: `Vault.rollOpen` checks the
-    ///      flag and the acceptance, and `AdapterValorem._writeCalls` now takes `feeAccepted`
-    ///      and only reverts when the fee is on AND governance has not accepted it.
+    ///      engine fee is on, and the gate has to honour it: `ValoremLib.write` takes
+    ///      `feeAccepted` and only reverts when the fee is on AND governance has not accepted it.
     ///
     ///      REGRESSION GUARD. An earlier draft had the adapter re-check `clear.feesEnabled()`
     ///      unconditionally, so accepting the fee changed only WHICH error came back and the
     ///      switch was decorative. If that guard is ever restored, this test reverts with
-    ///      `AdapterValorem.ValoremFeesEnabled` and fails here.
+    ///      `ValoremFeeNotAccepted` and fails here.
     function test_rollOpen_shouldWriteOnceGovernanceAcceptsTheValoremFee() public {
         _deposit(alice, 20e18);
         uint256 id = optionIds[RUNG_PICK];

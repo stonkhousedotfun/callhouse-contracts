@@ -635,16 +635,21 @@ contract VaultListingTest is BaseTest {
         vm.prank(keeper);
         vault.approveListing(second);
         assertEq(vault.listingHash(), seaport.getOrderHash(second), "the replacement is live");
-        assertEq(vault.listingsThisCycle(), 2, "both count against the cycle budget");
+        // The replacement is priced ABOVE the first, so it is a reprice up and spends no slot.
+        assertEq(vault.listingsThisCycle(), 1, "only the first listing spent a price level");
     }
 
     /// @dev T-07. The cap exists so a compromised or panicking keeper cannot ratchet the price
-    ///      down all week. Three authorisations per cycle, cancelled or not.
-    function test_threeListingsPerCycleThenNoMore() public {
-        (uint256 optionId, OrderComponents memory a) = _openAndBuild();
-        OrderComponents memory b = _buildOrder(optionId, N, _okUnitPrice() + 100_000);
-        OrderComponents memory c3 = _buildOrder(optionId, N, _okUnitPrice() + 200_000);
-        OrderComponents memory d = _buildOrder(optionId, N, _okUnitPrice() + 300_000);
+    ///      down all week: three descending price levels per cycle, cancelled or not. CHANGED
+    ///      BEHAVIOUR: slots used to count every authorisation; they now count price cuts (the
+    ///      first listing, then each strictly lower unit price), so this walks the price DOWN.
+    function test_threePriceCutsPerCycleThenNoMore() public {
+        (uint256 optionId,) = _openAndBuild();
+        uint256 p = _okUnitPrice();
+        OrderComponents memory a = _buildOrder(optionId, N, p + 300_000);
+        OrderComponents memory b = _buildOrder(optionId, N, p + 200_000);
+        OrderComponents memory c3 = _buildOrder(optionId, N, p + 100_000);
+        OrderComponents memory d = _buildOrder(optionId, N, p);
 
         vm.startPrank(keeper);
         vault.approveListing(a);
@@ -656,9 +661,62 @@ contract VaultListingTest is BaseTest {
         vm.stopPrank();
 
         assertEq(vault.listingsThisCycle(), 3, "budget spent");
+        assertEq(vault.lowestListedUnitUsdg(), p + 100_000, "the third cut is the lowest price authorised");
         assertEq(vault.listingHash(), bytes32(0), "nothing live, so this is the cap and not the live-listing guard");
 
         _rejects(d, abi.encodeWithSelector(AdapterSeaport.TooManyListings.selector, uint8(3), uint8(3)));
+    }
+
+    /// @dev F5(a). With the budget spent, a relist AT the lowest price or above it is still free,
+    ///      any number of times, including a bigger tranche after `writeMore`. Only a fourth cut
+    ///      is refused.
+    function test_relistAtOrAboveTheLowestPriceIsFreeEvenWithTheBudgetSpent() public {
+        (uint256 optionId,) = _openAndBuild();
+        uint256 p = _okUnitPrice();
+        for (uint256 i; i < 3; i++) {
+            OrderComponents memory cut = _approveListing(optionId, N, p - i * 100_000);
+            vm.prank(keeper);
+            vault.cancelListing(cut);
+        }
+        assertEq(vault.listingsThisCycle(), 3, "three cuts spent the budget");
+
+        // Same price as the lowest: free.
+        OrderComponents memory same = _approveListing(optionId, N, p - 200_000);
+        vm.prank(keeper);
+        vault.cancelListing(same);
+        // Up: free, and again, and a different size.
+        OrderComponents memory up = _approveListing(optionId, N, p + 500_000);
+        vm.prank(keeper);
+        vault.cancelListing(up);
+        _writeMore(5);
+        _approveListing(optionId, N + 5, p + 500_000);
+        assertEq(vault.listingsThisCycle(), 3, "no relist at or above the lowest spent a slot");
+        assertEq(vault.lowestListedUnitUsdg(), p - 200_000, "and none of them moved the lowest");
+
+        vm.prank(keeper);
+        vault.invalidateAllListings();
+
+        OrderComponents memory fourthCut = _buildOrder(optionId, N, p - 300_000);
+        _rejects(fourthCut, abi.encodeWithSelector(AdapterSeaport.TooManyListings.selector, uint8(3), uint8(3)));
+    }
+
+    /// @dev Review round 2 PoC, pinned for the off-chain keeper. Three authorisations at ONE price,
+    ///      each cancelled, spend one slot; a fourth at that price succeeds and the counter still
+    ///      reads 1. The keeper used to take `seq` from `listingsThisCycle + 1` and to expect
+    ///      TooManyListings(3,3) here (callhouse keeper/src/dryrun-extended.ts); it now keeps its
+    ///      own sequence and mirrors the price-cut rule (keeper/src/policy.ts listingSlotRefused).
+    function test_relistsAtOnePriceSpendOneSlot() public {
+        (uint256 optionId,) = _openAndBuild();
+        uint256 p = _okUnitPrice();
+        for (uint256 i; i < 3; i++) {
+            OrderComponents memory c = _approveListing(optionId, N, p);
+            vm.prank(guardian);
+            vault.cancelListing(c);
+        }
+        assertEq(vault.listingsThisCycle(), 1, "three authorisations at one price spend ONE slot");
+        _approveListing(optionId, N, p);
+        assertEq(vault.listingsThisCycle(), 1, "and a fourth at that price is free");
+        assertEq(vault.lowestListedUnitUsdg(), p, "the lowest price is the one price listed");
     }
 
     /// @dev The budget is per cycle. A new write reopens it, or the vault would be unlistable
@@ -669,7 +727,7 @@ contract VaultListingTest is BaseTest {
         OrderComponents memory a = _approveListing(optionId, N, _okUnitPrice());
         vm.prank(keeper);
         vault.cancelListing(a);
-        _approveListing(optionId, N, _okUnitPrice() + 100_000);
+        _approveListing(optionId, N, _okUnitPrice() - 100_000);
         assertEq(vault.listingsThisCycle(), 2, "two of three used this cycle");
 
         // Close the week out unfilled, then install next week's cycle.
@@ -685,6 +743,113 @@ contract VaultListingTest is BaseTest {
 
         _rollOpen(N);
         assertEq(vault.listingsThisCycle(), 0, "fresh budget for the new cycle");
+        assertEq(vault.lowestListedUnitUsdg(), 0, "and no lowest price carried over from last week");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    F5(b): PERMISSIONLESS STALE-LISTING KILL
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev List the N contracts at `unitPrice` and hand back the stranger who will try to kill it.
+    function _listForStaleTest(uint256 unitPrice) internal returns (address stranger) {
+        _deposit(alice, 30e18);
+        uint256 optionId = _rollOpen(N);
+        _approveListing(optionId, N, unitPrice);
+        stranger = makeAddr("stranger");
+    }
+
+    function _assertKilledBy(address who) internal {
+        uint256 counterBefore = seaport.getCounter(address(vault));
+        vm.prank(who);
+        vault.invalidateStaleListing();
+        assertEq(vault.listingHash(), bytes32(0), "the stale listing is dead");
+        assertEq(seaport.getCounter(address(vault)), counterBefore + 1, "by a Seaport counter bump");
+    }
+
+    /// @dev A rally to $225 lifts the band floor to 231.75, above the 231 strike written at $220.
+    function test_invalidateStaleListing_afterARallyPastTheBandFloor() public {
+        address stranger = _listForStaleTest(_okUnitPrice());
+        feed.setAnswer(225_00000000);
+        _assertKilledBy(stranger);
+    }
+
+    /// @dev Listed exactly on the $220 floor (8_800_000 for ten). At $221 the floor is 8_840_000
+    ///      and the band floor 227.63 still admits the 231 strike, so only the premium is stale.
+    function test_invalidateStaleListing_whenTheFloorRisesAboveTheListingGross() public {
+        address stranger = _listForStaleTest(880_000);
+        feed.setAnswer(221_00000000);
+        _assertKilledBy(stranger);
+    }
+
+    /// @dev A paused Stock Token oracle means a fresh approval would revert, so the listing counts
+    ///      as stale even though its price is still fine.
+    function test_invalidateStaleListing_whileTheOracleIsPaused() public {
+        address stranger = _listForStaleTest(_okUnitPrice());
+        nvda.setOraclePaused(true);
+        _assertKilledBy(stranger);
+    }
+
+    /// @dev Nobody may kill a listing the policy would still authorise, which is what keeps this
+    ///      from being a griefing lever. $224 moves the floor to 8_960_000 and the band floor to
+    ///      230.72: a $2.00 listing of a 231 strike is still valid. A dead feed proves nothing.
+    function test_invalidateStaleListing_revertsWhileStillValidOrWithoutAPrice() public {
+        address stranger = _listForStaleTest(_okUnitPrice());
+        feed.setAnswer(224_00000000);
+
+        vm.prank(stranger);
+        vm.expectRevert(Vault.ListingStillValid.selector);
+        vault.invalidateStaleListing();
+
+        vm.warp(block.timestamp + MAX_PRICE_AGE + 1);
+        vm.prank(stranger);
+        vm.expectRevert();
+        vault.invalidateStaleListing();
+        assertTrue(vault.listingHash() != bytes32(0), "the listing survives both");
+    }
+
+    /// @dev Regression (review round 1): approveListing used to check only the premium floor, so
+    ///      after a rally to $225 (band floor 231.75 > the 231 strike) it still accepted a $2.00
+    ///      listing that any stranger could kill in the same block, round after round, keeping the
+    ///      written inventory unsold but assignable. The keeper now cannot list it at all.
+    function test_approveListing_refusesAStrikeBelowTheLiveBandFloor() public {
+        _deposit(alice, 30e18);
+        uint256 optionId = _rollOpen(N);
+        feed.setAnswer(225_00000000);
+        _rejects(
+            _buildOrder(optionId, N, _okUnitPrice()),
+            abi.encodeWithSelector(Policy.StrikeBelowBand.selector, uint256(231_000_000), uint256(231_750_000))
+        );
+        assertEq(vault.listingHash(), bytes32(0), "nothing listed for a griefer to kill");
+        assertEq(vault.listingsThisCycle(), 0);
+    }
+
+    /// @dev The two paths read one set of floors, so at any spot where approveListing accepts a
+    ///      listing, invalidateStaleListing refuses to kill it. $224.27 is the last cent at which
+    ///      the band floor (230.9981) still admits the 231 strike.
+    function test_invalidateStaleListing_cannotKillWhatApproveListingJustAccepted() public {
+        _deposit(alice, 30e18);
+        uint256 optionId = _rollOpen(N);
+        address stranger = makeAddr("stranger");
+        int256[3] memory spots = [int256(220_00000000), 223_00000000, 224_27000000];
+        for (uint256 i; i < spots.length; i++) {
+            feed.setAnswer(spots[i]);
+            OrderComponents memory c = _approveListing(optionId, N, _okUnitPrice());
+            vm.prank(stranger);
+            vm.expectRevert(Vault.ListingStillValid.selector);
+            vault.invalidateStaleListing();
+            assertTrue(vault.listingHash() != bytes32(0), "the accepted listing survives");
+            vm.prank(keeper);
+            vault.cancelListing(c); // the keeper's own reprice, to relist at the next spot
+        }
+        assertEq(vault.listingsThisCycle(), 1, "same-price relists stay free");
+    }
+
+    function test_invalidateStaleListing_revertsWithNoLiveListing() public {
+        _deposit(alice, 30e18);
+        _rollOpen(N);
+        feed.setAnswer(225_00000000);
+        vm.expectRevert(AdapterSeaport.NoLiveListing.selector);
+        vault.invalidateStaleListing();
     }
 
     /*//////////////////////////////////////////////////////////////

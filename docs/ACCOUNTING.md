@@ -53,7 +53,7 @@ and the strike proceeds went to the USDG ledger instead.
 | `assets`, `idleAssets()`, `lockedAssets()`, `reservedAssets` | asset base units, 18 dp | `1e18` = 1.0000 NVDA |
 | shares (`cNVDA`) | 18 dp | 1 share = 1 NVDA at launch |
 | `spotUsdg`, `strikeUsdg`, every premium | USDG base units, 6 dp | `226_000_000` = $226.00 |
-| `contracts` | whole lots | 1 contract covers exactly `lotSize` = `1e18` of asset; `rollOpen` refuses a cycle with any other lot |
+| `contracts` | whole lots | 1 contract covers exactly `lotSize` = `1e18` of asset; a write (`rollOpen` or `writeMore`) refuses a cycle with any other lot |
 | every `*Bps` | basis points | `300` = 3% |
 | `accUsdgPerShare` | USDG per share, scaled `1e27` | see §4 |
 
@@ -61,6 +61,28 @@ Valorem is the one place that breaks the pattern: `Claim.amountWritten` and
 `Claim.amountExercised` are **1e18-scaled scalars**, not contract counts. `contractsAssigned()`
 divides them back down. Getting this wrong reports a 10-contract assignment as
 `10_000_000_000_000_000_000`.
+
+### Contracts across tranches
+
+A week can be written in more than one tranche: `rollOpen` opens the Valorem claim and
+`writeMore(n)` adds `n` contracts to that same claim while the vault is `Listed` and before
+`cycleExerciseTs`. There is still exactly one claim per week, so:
+
+| Quantity | What it counts after tranches |
+|---|---|
+| `contractsWritten` | the running total of every tranche written into this week's claim; zeroed by `rollClose` |
+| `CallsWritten(optionId, claimKey, contractsCount, collateral)` | **one tranche**: that write's count and that write's collateral, never the running total. Sum them per `claimKey` |
+| `RollOpen.contractsCount` | the opening tranche only. The week's size is `contractsWritten`, or the sum of its `CallsWritten` |
+| `lockedAssets()`, `claimedExerciseProceeds()`, `contractsAssigned()` | read `clear.position(claimKey)` / `clear.claim(claimKey)`, which upstream sums over every claim index (one per bucket written into), so they already cover every tranche |
+| `contractsRemaining()`, `contractsSold()` | live `clear.balanceOf(vault, optionId)` against `contractsWritten`; a tranche raises both the balance and the total |
+
+Sizing is on the total: a write passes only if `contractsWritten + n` is within
+`maxContractsCap` and within `maxUtilizationBps` of `idleAssets() + lockedAssets()`. Before the
+first write that is just idle, which is what `rollOpen` always measured; checking each tranche
+against idle alone would let repeated tranches creep towards 100%. A tranche moves asset from
+idle into Valorem one for one, so it never moves `totalAssets()` or the share price, except by the
+Valorem engine fee when governance has accepted it (15 bps of the tranche's notional, charged on
+every tranche as on the opening write).
 
 ---
 
@@ -150,11 +172,40 @@ the strike proceeds sit in the claim, and minting against that gap was the one c
 of the 2026-09-12 review. The checkpoint above is the companion rule for the premium side of the
 same week.
 
+### Depositing while a call is open
+
+A deposit in `Listed` (allowed until `cycleExerciseTs`) buys into a book that is already short
+this week's call. Stated plainly, because an earlier NatSpec on `deposit` said the opposite:
+
+- **The price ignores the short.** Shares are minted at `totalAssets()`, which values the written
+  call at zero (§1). A late depositor pays the same NAV per share as if no call were open.
+- **Assignment reaches every share.** If the week ends assigned, collateral leaves at the strike
+  and the share price falls for all holders, the late shares included; the strike proceeds are
+  credited through the index to everyone holding shares at `rollClose`, the late holder included.
+  There is no per-depositor tracking of whose collateral was written.
+- **Late money can be written against directly.** `writeMore` sizes on idle plus locked, so a
+  tranche written after the deposit can lock the depositor's own stock
+  (`test_writeMore_sizesOnTheTotalAndCountsLateDeposits`).
+- **Premium already indexed is not theirs.** The checkpoint inside their deposit fixes every fill
+  before it into the index; fills after it are shared, including fills of tranches written before
+  they arrived.
+- **They cannot leave instantly.** Until the week closes the only exit is the queue, which settles
+  at `rollClose`.
+
+Worked through to the base unit in
+`test_lateDepositorDuringListed_sharesTheAssignmentThroughTheSharePrice` (`VaultAssignment.t.sol`).
+The window shuts at `cycleExerciseTs` because nothing can be assigned before it, so the NAV a late
+depositor pays is never already marked down by an assignment whose strike proceeds are still in
+the claim. The web deposit form warns in `Listed`, and more strongly once live spot is at or above
+`strike × (1 − minOtmBps)`.
+
 ---
 
 ## 5. The redeem queue
 
-While a call is open, redemptions are queued. The mechanics:
+Instant `redeem`/`withdraw` work only while the vault is flat (`phase == Idle && contractsWritten
+== 0`). Otherwise, and whenever a holder chooses to, redemptions are queued: `queueRedeem` is
+allowed in every phase. The mechanics:
 
 ```
 queueRedeem(shares)      shares move into ESCROW on the vault.
@@ -163,10 +214,14 @@ queueRedeem(shares)      shares move into ESCROW on the vault.
   debt[owner] += shares * accUsdgPerShare          the index these shares enter escrow at
                                                    (summed if the owner queues again in the epoch)
 
-_settleQueue()           runs inside rollClose, AFTER the harvest.
+_settleQueue()           runs inside rollClose, AFTER the harvest, or from the permissionless
+                         settleQueue() while Idle, AFTER a harvest checkpoint (below).
   escrowUsdg  = the escrow's own accrual over the cycle  (belongs to the queuers, not the stayers)
   epochIndex[epochId] = accUsdgPerShare            the index the epoch closed at
-  payoutAsset = idleAssets() * queuedShares / totalSupply
+  payoutAsset = queuedShares * (idleAssets() + 1) / (totalSupply + 1)
+                 the instant-redeem price, virtual share included. Without the +1/+1 a
+                 flat settleQueue exit would pay the attacker of a donation inflation more
+                 than instant redeem does and make the grief profitable
   burn the escrowed shares
   record Epoch{sharesRemaining, assetsRemaining, usdgRemaining}
   reservedAssets += payoutAsset ;  usdgReservedForQueue += escrowUsdg
@@ -176,6 +231,37 @@ completeRedeem(to)       settles the owner's entry out of their epoch (below) an
 
 `debt` is the private `_queueAccDebt`, `epochIndex` the private `_epochAccUsdgPerShare`. Neither is
 in the public ABI.
+
+### Settling while flat: `settleQueue()`
+
+The queue used to settle only inside `rollClose`, which needs a `rollOpen` first. A queue made
+while `Idle` therefore waited for a write that might never come: a halt nobody lifts, a registry
+lot other than one token, an unaccepted Valorem fee, a stale or paused oracle, or less than one lot
+idle (the last holder with half a token). Holders who had not queued could still redeem instantly.
+
+```
+settleQueue()            anyone; reverts WrongPhase unless phase == Idle, NothingQueued if queuedShares == 0
+  _checkpointHarvest()   USDG that arrived since the last close is indexed first, so the escrow's
+                         accrual on it goes to the queuers and not to the stayers
+  _settleQueue()         exactly as above
+```
+
+While `Idle` the vault holds no claim, so `idleAssets()` is `totalAssets()` and
+`payoutAsset = q × (totalAssets() + 1) / (totalSupply + 1)` is to the base unit what `redeem(q)`
+would pay at that moment (`test_settleQueue_paysWhatAnInstantRedeemWouldHave`). Nothing moves: the
+shares are burnt, the payout is reserved, and `completeRedeem` pays it as for any epoch, so it
+works while halted and under an issuer freeze (`test_settleQueue_worksUnderAnIssuerFreeze`).
+
+The +1/+1 in `payoutAsset` is load-bearing here. The first draft paid `idleAssets() × q /
+totalSupply` with no virtual share, which is more than the instant price whenever `idle > supply`.
+Once the settlement was atomic and permissionless, that turned first-depositor inflation back into a
+profit: seed 3 wei, donate 20 NVDA, let a 9.8 NVDA deposit round down to one share, then queue and
+settle out with 22.35 NVDA for 20 NVDA + 3 wei. Priced with the offset, the same exit pays 17.88
+(`test_settleQueue_doesNotMakeDonationInflationProfitable`).
+
+A queue made while a call is open still settles at `rollClose`: `settleQueue` refuses `Listed` and
+`Exercisable`. The asset leg is priced on `idleAssets()`, which is the whole NAV only when nothing
+is locked in Valorem.
 
 ### What each entry is paid
 
@@ -195,7 +281,7 @@ _settleEpochEntry(owner)
 ```
 
 **Why the two legs are split differently.** The asset leg is a snapshot: `payoutAsset` is fixed at
-settlement from `idleAssets()` at that moment, and every escrowed share has the same claim on it
+settlement from `idleAssets()` and the supply at that moment, and every escrowed share has the same claim on it
 however long it sat in escrow, so dividing by shares is exact. The USDG leg is not a snapshot. The
 escrow is one account holding everyone's queued shares, and its accrual grows tranche by tranche,
 each time premium is indexed (every deposit or mint checkpoint, and the harvest at the close), on
@@ -425,6 +511,31 @@ allowance at all (invariant 6), because they are the obligations that must be ba
 With `rollClose` passing 0 instead of the claim redemption to the harvest (the pre-2026-09-13 fee
 rule, §6), invariant 8 failed with a counterexample that shrinks to seven calls: mint shares, roll open
 (3 contracts), approve a listing, fill, exercise 1, warp, roll close.
+
+**Tranches, flat settlement and stale-listing kills (2026-09-13 second pass).** The handler now
+registers 20 actions; the three new ones are `writeMore`, `settleQueue` and
+`invalidateStaleListing`. No formula above changed: invariant 6's `lockedAssets() ==
+(contractsWritten − contractsAssigned()) × 1e18` holds with `contractsWritten` as the running total
+of a multi-tranche claim, and invariant 7 still requires `Idle ⇒ claimKey == 0`, which is why
+`settleQueue` may only run in `Idle`. What the new actions add is asserted inline on every
+successful call, not by a new `invariant_*` function:
+
+```
+writeMore(n)             claimKey unchanged; contractsWritten == before + n; totalAssets() unchanged
+settleQueue()            epoch.sharesRemaining == queuedShares before
+                         epoch.assetsRemaining == q * (idleAssets() + 1) / (totalSupply + 1)   (before)
+                         queuedShares == 0; asset.balanceOf(vault) unchanged
+invalidateStaleListing() called only when the handler's own arithmetic says the listing is stale;
+                         any revert fails the run
+```
+
+The handler's `approveListing` keeps spot at or below the highest price whose band floor still
+admits the written strike (the vault now refuses a listing below it), and once three price cuts
+are spent it lifts its price to `lowestListedUnitUsdg` instead of skipping.
+`test_handlerReachesTranchesStaleKillsAndFlatSettlement` proves each of the three is reachable
+with no reverted call. The handler never sets the Valorem fee on, so the fee exception to
+"a tranche never moves `totalAssets()`" is covered by `test_writeMore_honoursTheValoremFeeSwitch`
+only.
 
 The per-entry USDG split of §5 changes no formula above: an entry's `usdgOut` is still drawn out of
 `ep.usdgRemaining` and capped by it, so invariants 2 and 6 hold as written. None of the eight checks
