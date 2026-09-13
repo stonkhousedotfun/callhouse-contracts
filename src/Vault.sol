@@ -112,7 +112,7 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice Maximum asset base units the vault will hold from deposits.
     uint256 public depositCap;
 
-    /// @notice When true, `rollOpen` is blocked. Nothing else is.
+    /// @notice When true, `rollOpen` and `approveListing` are blocked. Nothing else is.
     bool public writesHalted;
 
     /// @notice Governance has looked at the Valorem engine fee and accepted paying it.
@@ -949,10 +949,6 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     }
 
     /*//////////////////////////////////////////////////////////////
-                             HALT / ADMIN
-    //////////////////////////////////////////////////////////////*/
-
-    /*//////////////////////////////////////////////////////////////
                               FEE SWEEP
     //////////////////////////////////////////////////////////////*/
 
@@ -1006,7 +1002,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
                              HALT / ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Block `rollOpen`. Never blocks redemptions, claims, or `rollClose`.
+    /// @notice Block `rollOpen` and `approveListing`. Never blocks redemptions, claims,
+    ///         `cancelListing`, `lockBook` or `rollClose`.
     function haltWrites() external {
         if (!hasRole(GUARDIAN_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
             revert AccessControlUnauthorizedAccount(msg.sender, GUARDIAN_ROLE);

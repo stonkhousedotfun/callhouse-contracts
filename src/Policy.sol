@@ -70,9 +70,6 @@ library Policy {
     ///      is exactly 1.0000 Stock Token per contract.
     uint256 internal constant LOT = 1e18;
 
-    /// @dev USDG base units per whole USDG.
-    uint256 internal constant USDG_ONE = 1e6;
-
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/

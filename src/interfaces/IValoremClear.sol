@@ -1,29 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Valorem Labs Inc. (c) 2023. Interface and NatSpec transcribed from valorem-labs-inc/clear
 // @ 6436c82. That tree's LICENSE is BUSL 1.1 with Change Date 2026-02-01 (passed) and Change
-// License GPL-2.0-or-later, so the vendored code — and this transcription of it — is GPL now.
+// License GPL-2.0-or-later, so the upstream code — and this transcription of it — is GPL now.
 // The Overcall-authored additions in this file are released under the same licence.
 pragma solidity ^0.8.28;
 
 /// @title IValoremClear
-/// @notice A faithful SUBSET of the Valorem Clear clearinghouse ABI, for Overcall's tests, scripts
-///         and front-end ABI export.
-/// @dev Mirrors `valorem-labs-inc/clear` at commit `6436c82` — the exact tree vendored under
-///      `lib/clear` and deployed byte-for-byte by `script/lib/ValoremDeployer.sol`. Every struct,
-///      enum, event, error and function signature below is transcribed from
-///      `lib/clear/src/interfaces/IValoremOptionsClearinghouse.sol` and
-///      `lib/clear/lib/solmate/src/tokens/ERC1155.sol`, preserving field names, types, declaration
-///      order and `indexed` flags. Whenever `lib/clear` moves, re-transcribe rather than adapt.
+/// @notice A faithful SUBSET of the Valorem Clear clearinghouse ABI.
+/// @dev PROVENANCE, AS IT APPLIES TO THIS REPOSITORY. This file is a verbatim copy of
+///      `src/interfaces/IValoremClear.sol` from the Blockscout-verified source of Overcall's NVDA
+///      registry on chain 4663 (`0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA`; recon R1 in
+///      leekzor/callhouse `ops/recon/`, which keeps the same file under `ops/abis/`). Overcall wrote
+///      this interface as a hand transcription of Valorem's clearinghouse at upstream commit
+///      `6436c82` (`valorem-labs-inc/valorem-core` `6436c823f560af493af119d6148fb3237037aca4`; recon
+///      R4 recompiled that commit and matched the deployed Clear
+///      `0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0`). Comments only have changed from the verified
+///      copy: this provenance paragraph, and wording that pointed at files in Overcall's tree.
+///      Those files — a vendored `lib/clear` tree, `script/lib/ValoremDeployer.sol`,
+///      `src/vendor/ValoremArtifacts.sol`, `test/e2e/ValoremLifecycle.t.sol` — belong to Overcall's
+///      non-public repository and do not exist here, so "vendored" now reads "upstream".
 ///
-///      This file is deliberately a hand copy and imports nothing from `clear/`. Valorem is pinned to
-///      `pragma solidity 0.8.16`; Overcall is `^0.8.28`. The two must never enter the same
-///      compilation unit, so the vendored interface cannot be imported here — see
-///      `src/vendor/ValoremArtifacts.sol` for how the 0.8.16 artifacts are produced.
+///      Every struct, enum, event, error and function signature below was transcribed from
+///      upstream `src/interfaces/IValoremOptionsClearinghouse.sol` and
+///      `lib/solmate/src/tokens/ERC1155.sol`, preserving field names, types, declaration order and
+///      `indexed` flags. If Valorem's deployment ever moves, re-transcribe rather than adapt.
 ///
-///      Two deviations, both ABI-identical to the vendored declarations:
+///      This file is deliberately a hand copy and imports nothing from Valorem. Valorem is pinned
+///      to `pragma solidity 0.8.16`; this codebase is `^0.8.28`. The two must never enter the same
+///      compilation unit, so the upstream interface cannot be imported here.
+///
+///      Two deviations, both ABI-identical to the upstream declarations:
 ///        - `tokenURIGenerator()` returns `address` rather than `ITokenURIGenerator`, so that the
 ///          0.8.16 `ITokenURIGenerator` need not be copied as well.
-///        - `sweepFees(address[])` is declared `calldata` here; the vendored interface says `memory`
+///        - `sweepFees(address[])` is declared `calldata` here; the upstream interface says `memory`
 ///          and the implementation says `calldata`. Location does not affect the external selector.
 ///
 ///      ## Token id encoding
@@ -47,14 +56,14 @@ pragma solidity ^0.8.28;
 ///          ))));
 ///          uint256 optionId = uint256(optionKey) << 96;
 ///
-///      SIX fields, not eight. The vendored `IValoremOptionsClearinghouse.sol` NatSpec documents an
+///      SIX fields, not eight. The upstream `IValoremOptionsClearinghouse.sol` NatSpec documents an
 ///      eight-field encode that also hashes `settlementSeed` and `nextClaimKey` as
 ///      `uint160(0), uint96(0)`; that comment is STALE and does not match the code it annotates.
-///      `ValoremOptionsClearinghouse.newOptionType` (lines 341-354 of the vendored implementation)
+///      `ValoremOptionsClearinghouse.newOptionType` (lines 341-354 of the upstream implementation)
 ///      hashes the six tuple fields only, and `abi.encode` pads each argument to its own 32-byte
 ///      word, so eight words hash to a different digest than six. The IMPLEMENTATION is
-///      authoritative. `test_Cycle_OptionIdIsPrecomputable` in `test/e2e/ValoremLifecycle.t.sol`
-///      pins the six-field formula against the deployed bytecode, on mocks and on a mainnet fork.
+///      authoritative. Overcall's `test_Cycle_OptionIdIsPrecomputable` (in their repository, not
+///      this one) pins the six-field formula against the deployed bytecode.
 ///
 ///      `tokenType(id)` then reports `Option`, `Claim`, or `None` if the id was never initialised.
 interface IValoremClear {
@@ -118,7 +127,7 @@ interface IValoremClear {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Emitted when a new option type is created.
-    /// @dev Note `optionId` is NOT indexed while `expiryTimestamp` IS, exactly as vendored.
+    /// @dev Note `optionId` is NOT indexed while `expiryTimestamp` IS, exactly as upstream.
     /// @param optionId The token id of the new option type created.
     /// @param exerciseAsset The ERC20 contract address of the exercise asset.
     /// @param underlyingAsset The ERC20 contract address of the underlying asset.
@@ -158,7 +167,7 @@ interface IValoremClear {
 
     /// @notice Emitted when a claim is redeemed.
     /// @dev The declaration order is `(claimId, optionId, redeemer, ...)`, which is the reverse of
-    ///      the first two entries in the vendored NatSpec block; the declaration is authoritative.
+    ///      the first two entries in the upstream NatSpec block; the declaration is authoritative.
     /// @param claimId The token id of the claim being redeemed.
     /// @param optionId The token id of the option type of the claim being redeemed.
     /// @param redeemer The address redeeming the claim.
@@ -208,7 +217,7 @@ interface IValoremClear {
     event FeeSwept(address indexed asset, address indexed feeTo, uint256 amount);
 
     /// @notice Emitted when protocol fees are enabled or disabled.
-    /// @dev Neither parameter is indexed, exactly as vendored.
+    /// @dev Neither parameter is indexed, exactly as upstream.
     /// @param feeTo The address which enabled or disabled fees.
     /// @param enabled Whether fees are enabled or disabled.
     event FeeSwitchUpdated(address feeTo, bool enabled);
@@ -391,7 +400,7 @@ interface IValoremClear {
     /// @dev The resulting `optionId` is precomputable off-chain as
     ///      `uint256(uint160(bytes20(keccak256(abi.encode(underlyingAsset, underlyingAmount, exerciseAsset,
     ///      exerciseAmount, exerciseTimestamp, expiryTimestamp))))) << 96` — the six tuple fields and
-    ///      nothing else. See the header: the vendored NatSpec's eight-field variant is stale and the
+    ///      nothing else. See the header: the upstream NatSpec's eight-field variant is stale and the
     ///      implementation is authoritative.
     /// @param underlyingAsset The contract address of the ERC20 underlying asset.
     /// @param underlyingAmount The amount of underlyingAsset, in wei, collateralizing each option contract.

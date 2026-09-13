@@ -16,9 +16,11 @@ import {ISeaport} from "../src/interfaces/ISeaport.sol";
 ///        forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast \
 ///          --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
 ///
-///      SeaportOrderLib is a `public` library and must be deployed and linked. Foundry does this
-///      automatically during `forge script`; if you link manually, pass
-///      --libraries src/lib/SeaportOrderLib.sol:SeaportOrderLib:<address>.
+///      SeaportOrderLib and ValoremLib are `public` libraries and must both be deployed and linked
+///      (Vault links them at five sites). Foundry does this automatically during `forge script`;
+///      if you link manually, pass both
+///        --libraries src/lib/SeaportOrderLib.sol:SeaportOrderLib:<address>
+///        --libraries src/lib/ValoremLib.sol:ValoremLib:<address>
 contract DeployVault is Script {
     /*//////////////////////////////////////////////////////////////
              CHAIN 4663 — all explorer/eth_call confirmed
