@@ -39,7 +39,7 @@ admin from block one and every admin action is a Safe transaction (path B below)
 
 | Item | Detail |
 |---|---|
-| Deployer key | an EOA kept offline. It is the vault admin until the handover. Fund it for about 7.6M gas (rehearsal: 7,514,058 for the two libraries and the vault) plus the configure and handover transactions |
+| Deployer key | an EOA kept offline. It is the vault admin until the handover. Fund it for about 7.6M gas (rehearsal: 7,569,702 for the two libraries and the vault) plus the configure and handover transactions |
 | Admin Safe | 2 of 3, created in Safe{Wallet} on Robinhood Chain (supported; SafeL2 1.4.1 and SafeProxyFactory 1.4.1 are deployed at their canonical addresses). Owners on hardware. No modules, no guard. `ops/safes.md` §1 (leekzor/callhouse) |
 | Fee Safe | receives the protocol fee (5% of premium). Its legal owner is a counsel question, `ops/launch-legal.md` §2 item 5 (leekzor/callhouse) |
 | Guardian key | 1 of 1 on separate hardware, as `ops/safes.md` §3 (leekzor/callhouse) requires |
@@ -64,7 +64,7 @@ cast call 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0 "feesEnabled()(bool)" --rpc
 Libraries are deployed through the deterministic CREATE2 factory (`0x4e59b44847b379578588920cA78FbF26c0B4956C`,
 present on 4663), so their addresses depend only on their bytecode, not on who deploys them. For this
 commit: SeaportOrderLib `0xAe4ba02cd5Ace94DA3bbd68f746DafaA66d013f2`, ValoremLib
-`0x9068EA27fC0D1BF3e0D64F423e6C222F60C24C1F`. If they already exist (anyone may deploy them first), forge
+`0xb1E1aEF7cB829E0890e74eE324e6eEa437761626` (it changed with the 2026-09-13 lot-size fix). If they already exist (anyone may deploy them first), forge
 reuses them; `Verify.s.sol` checks their code byte for byte either way.
 
 ---
@@ -191,26 +191,26 @@ In leekzor/callhouse:
 ## Rehearsal record — 2026-09-13
 
 `script/rehearse-deploy.sh` against `anvil --fork-url https://rpc.mainnet.chain.robinhood.com
---chain-id 4663`, fork block **62201116**, every forge call with `--no-storage-caching`. **Passed.**
+--chain-id 4663`, fork block **62212405**, every forge call with `--no-storage-caching`, on commit `6ed528f` (after the lot-size and queue-fairness fixes). **Passed.**
 
-Setup: admin Safe `0x7a7A7920ECfB41Fa781A3257E7E6Ef03D9EBc746` and fee Safe
-`0x2e19bcd7987ce0b07F60f96294fbE67a703c5BEC`, both 2 of 3, created through the canonical SafeProxyFactory
+Setup: admin Safe `0x40B2B8fAf07563A99203b55377ed2c9148a30468` and fee Safe
+`0x2e91b07AB8c64CF2e0Bb3593945818fEF387BC05`, both 2 of 3, created through the canonical SafeProxyFactory
 1.4.1 on the fork. Preflight: registry cycle 1, feed answer `21829793457` (218.29793457 USD), feed age
-170,302 s (47.3 h, a weekend gap, inside the 4-day window).
+171,469 s (47.6 h, a weekend gap, inside the 4-day window).
 
 | Step | Result |
 |---|---|
-| A1 deploy, `ADMIN` = deployer | SeaportOrderLib `0xAe4ba02cd5Ace94DA3bbd68f746DafaA66d013f2` and ValoremLib `0x9068EA27fC0D1BF3e0D64F423e6C222F60C24C1F` via CREATE2, Vault `0x1ACF2372B7F66968Ca894A62E7F3Ec05e67Ce1e8`; 3 transactions, 7,514,058 gas; plain-key WARNING printed |
+| A1 deploy, `ADMIN` = deployer | SeaportOrderLib `0xAe4ba02cd5Ace94DA3bbd68f746DafaA66d013f2` and ValoremLib `0xb1E1aEF7cB829E0890e74eE324e6eEa437761626` via CREATE2, Vault `0x1ACF2372B7F66968Ca894A62E7F3Ec05e67Ce1e8`; 3 transactions, 7,569,702 gas; plain-key WARNING printed |
 | A2 verify, bootstrap, unconfigured | 55 of 55 |
 | A3 configure with the deployer key; verify | 2 calls; 61 of 61 |
 | Verify has teeth (1) | library addresses swapped: 3 FAIL (link sites, both library bytecodes) |
 | A4 handover grant | Safe granted; renounce **refused**: "the Safe has not executed a transaction since the grant" |
 | A5 smoke batch | executed through the admin Safe, 2 of 3 owners supplied out of address order |
 | A6 renounce; verify, safe phase | deployer renounced; 64 of 64 with the owner set pinned; a configure signed by the renounced key refused: "ADMIN_PK does not hold DEFAULT_ADMIN_ROLE" |
-| B1 deploy, `SAFE_ADMIN`; configure | Vault `0x69da14d9a33efa32e535c3ea0da9e341ff1b8cfa`, 1 transaction (libraries reused), 5,403,454 gas; batch written, nothing broadcast; decoded independently to `grantRole(keccak("KEEPER_ROLE") = 0xfc8737ab…4fab, keeper)` and `grantRole(keccak("GUARDIAN_ROLE") = 0x55435dd2…5041, guardian)` |
+| B1 deploy, `SAFE_ADMIN`; configure | Vault `0x69da14d9a33efa32e535c3ea0da9e341ff1b8cfa`, 1 transaction (libraries reused), 5,445,268 gas; batch written, nothing broadcast; decoded independently to `grantRole(keccak("KEEPER_ROLE") = 0xfc8737ab…4fab, keeper)` and `grantRole(keccak("GUARDIAN_ROLE") = 0x55435dd2…5041, guardian)` |
 | B2 the Safe executes that exact file; verify | 2 transactions; 63 of 63 |
 | B3 executor on a non-anvil node | refused against the public RPC (simulation only): "ExecuteSafeBatch runs on an anvil node only" |
-| Verify has teeth (2) | one byte of vault code flipped with `anvil_setCode` (byte 100, 0x87 → 0x86): "vault: runtime == compiled Vault" FAIL |
+| Verify has teeth (2) | one byte of vault code flipped with `anvil_setCode` (byte 100, 0xab → 0xaa): "vault: runtime == compiled Vault" FAIL |
 
 Found while building it: without `--no-storage-caching`, the tamper test passed, because forge served
 the vault's code from its fork cache for an unchanged block number. That is the reason for the warning
