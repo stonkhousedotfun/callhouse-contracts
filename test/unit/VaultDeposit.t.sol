@@ -180,7 +180,7 @@ contract VaultDepositTest is BaseTest {
 
         vm.startPrank(bob);
         nvda.approve(address(vault), 5e18);
-        vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Idle, Vault.Phase.Exercisable));
+        vm.expectRevert(Vault.DepositsClosed.selector);
         vault.deposit(5e18, bob);
         vm.stopPrank();
     }
@@ -193,7 +193,7 @@ contract VaultDepositTest is BaseTest {
 
         vm.startPrank(bob);
         nvda.approve(address(vault), 5e18);
-        vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Idle, Vault.Phase.Exercisable));
+        vm.expectRevert(Vault.DepositsClosed.selector);
         vault.mint(5e18, bob);
         vm.stopPrank();
     }
@@ -351,7 +351,7 @@ contract VaultDepositTest is BaseTest {
 
         vm.startPrank(bob);
         nvda.approve(address(vault), 1e18);
-        vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Idle, Vault.Phase.Exercisable));
+        vm.expectRevert(Vault.DepositsClosed.selector);
         vault.deposit(1e18, bob);
         vm.stopPrank();
 

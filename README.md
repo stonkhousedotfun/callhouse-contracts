@@ -212,7 +212,9 @@ A halt blocks `rollOpen`, `writeMore` and `approveListing` **only**. `queueRedee
 trap a depositor.
 
 Deposits close on the cycle's exercise **timestamp**, whether or not anyone calls `lockBook`:
-after it, `deposit`/`mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0.
+after it, `deposit`/`mint` revert `DepositsClosed` and `maxDeposit`/`maxMint` return 0 (the same
+selector covers every refusal: wrong phase, unclaimed assignment proceeds, a stranded claim, or an
+asset balance below `reservedAssets` after an issuer burn).
 Assignment collapses NAV mid-transaction with no callback, so minting against the gap has to be
 impossible — that was the critical finding of the 2026-09-12 review, written up in
 [`SECURITY.md`](SECURITY.md).
@@ -226,7 +228,7 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 | `minOtmBps` | 300 | **floor** 100 — stops an admin selling at-the-money |
 | `maxOtmBps` | 1200 | ceiling 2500 |
 | `minPremiumBps` | 40 | floor 10 |
-| `maxUtilizationBps` | 9500 | ceiling 10000 |
+| `maxUtilizationBps` | 9500 | ceiling 9985 (leaves Valorem's 15 bps fee inside the free balance) |
 | `protocolFeeBps` | 500 (5% of premium) | ceiling 2000. The fee base is premium only: strike proceeds from assignment are excluded in `Vault._accrueHarvest`, at any setting |
 | `maxContractsCap` | 50 | must be non-zero |
 | `maxPriceAge` | 4 days | 1 hour to 7 days |

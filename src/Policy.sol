@@ -53,8 +53,19 @@ library Policy {
     /// @dev Admin may not set minPremiumBps below this. Stops listing for dust.
     uint16 internal constant MIN_PREMIUM_FLOOR_BPS = 10;
 
-    /// @dev Utilization can never exceed 100% of idle.
-    uint16 internal constant MAX_UTILIZATION_CEIL_BPS = BPS;
+    /// @dev Utilization can never exceed 99.85% of the sizing base (AUDIT-FINDINGS F-04, decision D7).
+    ///
+    ///      WHY NOT 100%. Valorem's engine fee, when switched on, is 15 bps of NOTIONAL charged ON
+    ///      TOP of the collateral, and the write gate sizes contracts against `totalAssets()`, which
+    ///      already nets out `reservedAssets`. At 100% utilisation with the fee on, a maximum-size
+    ///      write pulled collateral + 15 bps from the raw balance, reserved tokens included, and a
+    ///      settled redeemer could no longer be paid (ACCOUNTING §7 invariant 6 broken). Capping
+    ///      utilisation at 9,985 bps leaves the fee's 15 bps inside the free balance: n lots pass
+    ///      only if n × 1e18 <= 0.9985 × free, and Valorem pulls at most n × 1e18 × 1.0015 =
+    ///      0.99999775 × free < free. The write-on-fill path adds a post-write
+    ///      `balance >= reservedAssets` check as the second line of defence, so a fee rate above
+    ///      15 bps cannot slip through either.
+    uint16 internal constant MAX_UTILIZATION_CEIL_BPS = 9_985;
 
     /// @dev Protocol fee can never exceed 20% of harvested premium.
     uint16 internal constant PROTOCOL_FEE_CEIL_BPS = 2_000;

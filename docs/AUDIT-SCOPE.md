@@ -840,8 +840,8 @@ for `Distributor.sol`, `Policy.sol` and `SeaportOrderLib.sol` (§1 "Commit").
 
 | # | Property | Where |
 |---|---|---|
-| P-01 | No `policy` value outside the hard caps (`minOtmBps >= 100`, `maxOtmBps <= 2500`, `minOtm <= maxOtm`, `minPremiumBps >= 10`, `maxUtilizationBps <= 10000`, `protocolFeeBps <= 2000`, `maxContractsCap != 0`) can ever be stored | `Policy.sol` L101–115; `Vault.sol` L305, L1156–1160 |
-| P-02 | Once `block.timestamp >= cycleExerciseTs` in `Listed`, `deposit` and `mint` revert `DepositsClosedForCycle` and `maxDeposit`/`maxMint` return 0, whether or not anyone called `lockBook` | `Vault.sol` L507–519, L408–422 |
+| P-01 | No `policy` value outside the hard caps (`minOtmBps >= 100`, `maxOtmBps <= 2500`, `minOtm <= maxOtm`, `minPremiumBps >= 10`, `maxUtilizationBps <= 9985`, `protocolFeeBps <= 2000`, `maxContractsCap != 0`) can ever be stored | `Policy.sol` `validate`; `Vault.sol` constructor, `setPolicy` |
+| P-02 | Once `block.timestamp >= cycleExerciseTs` in `Listed`, `deposit` and `mint` revert `DepositsClosed` and `maxDeposit`/`maxMint` return 0, whether or not anyone called `lockBook`; the same selector and quote apply whenever `asset.balanceOf(vault) < reservedAssets` | `Vault.sol` `_depositRefused`, `_requireDepositPhase`, `maxDeposit` |
 | P-03 | While `claimKey != 0 && claimedExerciseProceeds() != 0`, no share can be minted by any path | `Vault.sol` L518; `ValoremLib.sol` L296–303 |
 | P-04 | Neither `rollOpen` nor `writeMore` writes if `expiry <= exercise` or `expiry > now + 21 days` (`BadCycleWindow`), and nothing moves before the check | `ValoremLib.sol` L38, L151–153 |
 | P-05 | The option written, by either write, always has `underlyingAsset == asset`, `exerciseAsset == USDG`, `underlyingAmount == cyc.lotSize`, and exercise/expiry timestamps equal to the live cycle's; otherwise nothing moves | `ValoremLib.sol` L174–201 |

@@ -7,12 +7,14 @@ import {MockERC20} from "../../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
 import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 
-/// @title AF-03 regression: `completeRedeem` pays the NVDA and USDG legs all-or-nothing
+/// @title AF-03 regression: `completeRedeem` pays the NVDA leg even when the USDG leg cannot move
 /// @notice Ported from the audit PoC `PoC_completeredeem_all_or_nothing_legs.t.sol` (AUDIT-FINDINGS F-03,
-///         Medium), plus the frozen-RECEIVER case from the USDG recon. BUG-PRESENT FORM: a USDG-side
-///         failure takes the Stock Token leg down with it while non-queuers exit instantly. Stage C-02
-///         inverts these: the NVDA leg is paid with `safeTransfer`, the USDG leg is best-effort through
-///         `_tryTransfer`, and `owedQueueUsdg` / `usdgReservedForQueue` change only on success.
+///         Medium), plus the frozen-RECEIVER case from the USDG recon. FIXED FORM (stage C-02): the same
+///         attack runs, and the final assertions are inverted. The Stock Token leg is paid with
+///         `safeTransfer`, the USDG leg is best-effort through `_tryTransfer`, and `owedQueueUsdg` /
+///         `usdgReservedForQueue` / `usdgAccounted` change only when the USDG actually moved. A settled
+///         queuer therefore gets her principal on the first call whatever USDG is doing, and collects the
+///         USDG once the obstruction clears, to the same or to another receiver.
 contract AF03_CompleteRedeemLegs is BaseTest {
     function _closeCycle() internal {
         _warpToExercise();
@@ -32,9 +34,32 @@ contract AF03_CompleteRedeemLegs is BaseTest {
         vault.queueRedeem(20e18);
     }
 
-    /// (a1) Global USDG pause after settlement: alice's 20e18 NVDA principal cannot be collected while
-    ///      bob exits instantly. Nothing in the vault pays the asset leg alone.
-    function test_usdgPause_freezesQueuedPrincipal() public {
+    /// @dev The books a deferred USDG leg must leave untouched.
+    struct UsdgBooks {
+        uint256 owed;
+        uint256 reserved;
+        uint256 accounted;
+        uint256 vaultBalance;
+    }
+
+    function _usdgBooks(address who) internal view returns (UsdgBooks memory b) {
+        b.owed = vault.owedQueueUsdg(who);
+        b.reserved = vault.usdgReservedForQueue();
+        b.accounted = vault.usdgAccounted();
+        b.vaultBalance = usdg.balanceOf(address(vault));
+    }
+
+    function _assertUsdgBooksUnchanged(UsdgBooks memory before, address who, string memory why) internal view {
+        UsdgBooks memory now_ = _usdgBooks(who);
+        assertEq(now_.owed, before.owed, string.concat(why, ": owedQueueUsdg moved without a transfer"));
+        assertEq(now_.reserved, before.reserved, string.concat(why, ": usdgReservedForQueue moved without a transfer"));
+        assertEq(now_.accounted, before.accounted, string.concat(why, ": usdgAccounted was debited for nothing"));
+        assertEq(now_.vaultBalance, before.vaultBalance, string.concat(why, ": USDG left the vault"));
+    }
+
+    /// (a1) Global USDG pause after settlement: alice collects her 20e18 NVDA on the first call, the
+    ///      USDG stays booked to her, and she collects it after the unpause.
+    function test_usdgPause_paysTheNvdaLegAndDefersTheUsdgLeg() public {
         _setupFilledWeekWithAliceQueued();
         _closeCycle();
         assertEq(_phase(), uint8(Vault.Phase.Idle), "flat");
@@ -50,33 +75,43 @@ contract AF03_CompleteRedeemLegs is BaseTest {
         assertEq(vault.redeem(20e18, bob, bob), 20e18, "bob instant redeem works under USDG pause");
         assertEq(nvda.balanceOf(bob), 30e18);
 
-        // BUG PRESENT: alice cannot get her NVDA. The USDG leg reverts and takes the NVDA leg with it.
-        uint256 before = nvda.balanceOf(alice);
-        vm.prank(alice);
-        vm.expectRevert(MockERC20.ContractPaused.selector);
-        vault.completeRedeem(alice);
-
-        // No other path: no free shares to redeem.
-        assertEq(vault.balanceOf(alice), 0);
-        vm.prank(alice);
-        vm.expectRevert();
-        vault.redeem(1, alice, alice);
-
-        assertEq(nvda.balanceOf(alice), before, "alice got no NVDA");
-        assertEq(vault.owedAssets(alice) + _pendingAssets(alice), 20e18, "20e18 NVDA principal still locked");
-
-        // Only lifting the USDG pause releases her Stock Token.
-        usdg.unpause();
+        // FIXED: alice gets her NVDA now. The USDG leg is deferred, and every USDG book is untouched.
+        uint256 usdgBefore = usdg.balanceOf(alice);
+        vm.expectEmit(true, true, false, true, address(vault));
+        emit Vault.UsdgLegDeferred(alice, alice, owedU);
         vm.prank(alice);
         (uint256 a, uint256 u) = vault.completeRedeem(alice);
-        assertEq(a, 20e18);
-        assertEq(u, owedU);
+        assertEq(a, 20e18, "principal paid on the first call");
+        assertEq(u, 0, "USDG leg reported as not paid");
+        assertEq(nvda.balanceOf(alice), 30e18, "the NVDA reached her");
+        assertEq(usdg.balanceOf(alice), usdgBefore, "no USDG moved under the pause");
+        assertEq(vault.owedAssets(alice), 0, "asset leg fully collected");
+        assertEq(vault.reservedAssets(), 0, "asset reserve released");
+        assertEq(vault.owedQueueUsdg(alice), owedU, "USDG still booked to alice");
+        assertEq(vault.usdgReservedForQueue(), owedU, "and still reserved for the queue");
+
+        // A second call with only USDG left says exactly why nothing moved, and changes nothing.
+        UsdgBooks memory books = _usdgBooks(alice);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Vault.UsdgLegBlocked.selector, owedU));
+        vault.completeRedeem(alice);
+        _assertUsdgBooksUnchanged(books, alice, "blocked retry");
+
+        // Lifting the pause releases the USDG.
+        usdg.unpause();
+        vm.prank(alice);
+        (a, u) = vault.completeRedeem(alice);
+        assertEq(a, 0, "no principal left");
+        assertEq(u, owedU, "the deferred USDG is paid in full");
+        assertEq(usdg.balanceOf(alice), usdgBefore + owedU);
+        assertEq(vault.owedQueueUsdg(alice), 0);
+        assertEq(vault.usdgReservedForQueue(), 0, "queue USDG reserve fully released");
     }
 
     /// (a2) Vault frozen on USDG while Listed. The OTM rollClose still succeeds (the fee push is
-    ///      best-effort and `clear.redeem` only moves NVDA), bob exits, alice's principal is locked for
-    ///      as long as the freeze lasts, which on this chain has so far meant for ever.
-    function test_vaultFrozenOnUsdg_freezesQueuedPrincipalIndefinitely() public {
+    ///      best-effort and `clear.redeem` only moves NVDA), bob exits, and alice's principal is paid
+    ///      on the first call however long the freeze lasts. The USDG waits for the unfreeze.
+    function test_vaultFrozenOnUsdg_stillPaysQueuedPrincipal() public {
         _setupFilledWeekWithAliceQueued();
 
         usdg.freeze(address(vault));
@@ -91,24 +126,34 @@ contract AF03_CompleteRedeemLegs is BaseTest {
         vm.prank(bob);
         assertEq(vault.redeem(20e18, bob, bob), 20e18, "bob exits");
 
-        // A year passes; still locked.
+        // A year passes. FIXED: the principal is paid; only the USDG waits.
         vm.warp(block.timestamp + 365 days);
         vm.prank(alice);
-        vm.expectRevert(MockERC20.AddressFrozen.selector);
-        vault.completeRedeem(alice);
+        (uint256 a, uint256 u) = vault.completeRedeem(alice);
+        assertEq(a, 20e18, "principal paid under the vault-side freeze");
+        assertEq(u, 0, "USDG deferred");
+        assertEq(nvda.balanceOf(alice), 30e18, "alice has her 20e18 NVDA back");
+        assertEq(nvda.balanceOf(address(vault)), 0, "nothing left in the vault on the asset side");
+        assertEq(vault.owedQueueUsdg(alice), owedU, "USDG still owed");
 
-        // Receiver choice does not help: the vault itself is the frozen sender.
+        // Receiver choice does not help while the vault itself is the frozen sender, and nothing moves.
+        UsdgBooks memory books = _usdgBooks(alice);
         vm.prank(alice);
-        vm.expectRevert(MockERC20.AddressFrozen.selector);
+        vm.expectRevert(abi.encodeWithSelector(Vault.UsdgLegBlocked.selector, owedU));
         vault.completeRedeem(carol);
+        _assertUsdgBooksUnchanged(books, alice, "frozen vault");
 
-        assertEq(nvda.balanceOf(alice), 10e18, "alice still missing 20e18 NVDA");
-        assertEq(nvda.balanceOf(address(vault)), 20e18, "her NVDA sits in the vault, unpayable");
+        usdg.unfreeze(address(vault));
+        vm.prank(alice);
+        (a, u) = vault.completeRedeem(alice);
+        assertEq(a, 0);
+        assertEq(u, owedU, "USDG collected after the unfreeze");
+        assertEq(vault.usdgReservedForQueue(), 0);
     }
 
-    /// (a3) The RECEIVER is frozen on USDG while the vault is healthy: paying alice's own address
-    ///      reverts on the USDG leg, so her NVDA is not paid either.
-    function test_frozenReceiver_blocksTheNvdaLegToo() public {
+    /// (a3) The RECEIVER is frozen on USDG while the vault is healthy: paying alice's own address moves
+    ///      the NVDA, defers the USDG, and she then collects the USDG to a receiver that is not frozen.
+    function test_frozenReceiver_getsTheNvdaAndCollectsUsdgElsewhere() public {
         _setupFilledWeekWithAliceQueued();
         _closeCycle();
 
@@ -118,21 +163,59 @@ contract AF03_CompleteRedeemLegs is BaseTest {
 
         usdg.freeze(alice);
 
-        // BUG PRESENT: the recipient check on the USDG leg reverts the whole payout.
+        // FIXED: the recipient check on the USDG leg no longer blocks the NVDA leg.
         vm.prank(alice);
-        vm.expectRevert(MockERC20.AddressFrozen.selector);
+        (uint256 a, uint256 u) = vault.completeRedeem(alice);
+        assertEq(a, 20e18, "NVDA paid to the USDG-frozen receiver");
+        assertEq(u, 0, "USDG deferred");
+        assertEq(nvda.balanceOf(alice), 30e18);
+        assertEq(vault.owedQueueUsdg(alice), owedU, "USDG still booked");
+
+        // Same receiver again: blocked, nothing moves.
+        UsdgBooks memory books = _usdgBooks(alice);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Vault.UsdgLegBlocked.selector, owedU));
         vault.completeRedeem(alice);
-        assertEq(nvda.balanceOf(alice), 10e18, "no NVDA paid");
-        assertEq(vault.owedAssets(alice) + _pendingAssets(alice), 20e18, "principal still parked");
+        _assertUsdgBooksUnchanged(books, alice, "frozen receiver");
+
+        // A different receiver works right away: the vault is not the frozen party.
+        uint256 carolBefore = usdg.balanceOf(carol);
+        vm.prank(alice);
+        (a, u) = vault.completeRedeem(carol);
+        assertEq(a, 0);
+        assertEq(u, owedU, "USDG paid to carol");
+        assertEq(usdg.balanceOf(carol), carolBefore + owedU);
+        assertEq(vault.owedQueueUsdg(alice), 0);
+        assertEq(vault.usdgReservedForQueue(), 0);
     }
 
-    /// (b) Stock Token pause: alice's queue USDG is locked while bob's `claimUsdg` works. This is the
-    ///     mirror case AUDIT-SCOPE §5 A.2 documents as expected; the leg split fixes it too.
-    function test_stockPause_blocksQueueUsdg() public {
+    /// (a4) Both legs owed, both healthy: one call pays both, exactly as before the split.
+    function test_healthyTokens_payBothLegsInOneCall() public {
+        _setupFilledWeekWithAliceQueued();
+        _closeCycle();
+        (uint256 owedA, uint256 owedU) = vault.previewCompleteRedeem(alice);
+
+        uint256 usdgBefore = usdg.balanceOf(alice);
+        vm.prank(alice);
+        (uint256 a, uint256 u) = vault.completeRedeem(alice);
+        assertEq(a, owedA);
+        assertEq(u, owedU);
+        assertEq(nvda.balanceOf(alice), 30e18);
+        assertEq(usdg.balanceOf(alice), usdgBefore + owedU);
+        assertEq(vault.reservedAssets(), 0);
+        assertEq(vault.usdgReservedForQueue(), 0);
+    }
+
+    /// (b) Stock Token pause: the mirror case. The NVDA leg is a hard `safeTransfer` (there is nothing
+    ///     to pay principal with while the issuer has paused the token), so `completeRedeem` reverts and
+    ///     alice's queue USDG waits behind it while bob's `claimUsdg` works. AUDIT-SCOPE §5 A.2 documents
+    ///     this asymmetry as accepted: a Stock Token pause is the issuer stopping settlement, and the
+    ///     USDG follows the principal once the pause lifts.
+    function test_stockPause_blocksQueueUsdgBehindThePrincipal() public {
         _setupFilledWeekWithAliceQueued();
         _closeCycle();
 
-        (, uint256 owedU) = vault.previewCompleteRedeem(alice);
+        (uint256 owedA, uint256 owedU) = vault.previewCompleteRedeem(alice);
         assertGt(owedU, 0);
 
         nvda.pause();
@@ -147,7 +230,14 @@ contract AF03_CompleteRedeemLegs is BaseTest {
         vm.prank(alice);
         vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.completeRedeem(alice);
-        assertEq(usdg.balanceOf(alice), aliceBefore, "alice's queue USDG is stuck behind the NVDA leg");
+        assertEq(usdg.balanceOf(alice), aliceBefore, "alice's queue USDG waits behind the NVDA leg");
+        assertEq(vault.owedAssets(alice) + _pendingAssets(alice), owedA, "principal still booked");
+
+        nvda.unpause();
+        vm.prank(alice);
+        (uint256 a, uint256 u) = vault.completeRedeem(alice);
+        assertEq(a, owedA);
+        assertEq(u, owedU);
     }
 
     function _pendingAssets(address who) internal view returns (uint256) {

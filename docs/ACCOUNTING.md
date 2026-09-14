@@ -24,8 +24,13 @@ The vault runs **two independent ledgers** and never mixes them.
 `totalAssets()` counts **only** the collateral:
 
 ```
-totalAssets() = asset.balanceOf(vault) - reservedAssets + lockedAssets()
+totalAssets() = max(asset.balanceOf(vault) + lockedAssets() - reservedAssets, 0)
 ```
+
+The reserve comes off the whole book and only the final figure saturates. An earlier form clamped
+`balance − reserved` at zero and then added the locked collateral, so an issuer `adminBurn` that took
+the balance below the reserve while a call was open overstated NAV by the shortfall (AUDIT-FINDINGS
+F-05). While `balance < reservedAssets` deposits are refused outright (§5).
 
 USDG is **not** in the share price. It accrues through `accUsdgPerShare` and is claimed separately
 with `claimUsdg()`.
@@ -166,7 +171,10 @@ Two consequences to hold in mind:
    if the recipient cannot receive, anyone can complete it later with `sweepFee()` (see §6).
 
 The deposit gate itself closes on the cycle's exercise **timestamp**, not on the phase: after it,
-`deposit`/`mint` revert `DepositsClosedForCycle` and the previews return 0. The reason is
+`deposit`/`mint` revert `DepositsClosed` and the previews return 0. One private predicate,
+`_depositRefused()`, decides both the revert and the zero quote, and it has five reasons: a phase
+other than Idle or Listed, the exercise timestamp in Listed, unclaimed assignment proceeds, a claim
+still open while Idle (stranded), and `asset.balanceOf(vault) < reservedAssets`. The reason is
 assignment — Valorem takes collateral with no callback, so NAV collapses mid-transaction while
 the strike proceeds sit in the claim, and minting against that gap was the one critical finding
 of the 2026-09-12 review. The checkpoint above is the companion rule for the premium side of the
@@ -358,6 +366,27 @@ during a freeze — which would break the promise that a halt or a freeze never 
 Only `completeRedeem` touches tokens, and that is the one leg a freeze is allowed to stop. See
 `test_issuerFreezeDoesNotBlockQueueingForAStaleSlotHolder`.
 
+**The two legs of a payout are independent (AUDIT-FINDINGS F-03).** `_payoutOwed` pays the Stock
+Token leg with `safeTransfer` and then attempts the USDG leg with a raw call. `owedQueueUsdg`,
+`usdgReservedForQueue` and `usdgAccounted` move only if the USDG actually left; on failure
+`UsdgLegDeferred(owner, receiver, usdgOwed)` is emitted, the USDG stays booked, and a later
+`completeRedeem` (to the same or another receiver) collects it. A call with nothing left but a
+blocked USDG leg reverts `UsdgLegBlocked(usdgOwed)` rather than pretending nothing was queued. A
+Stock Token pause still reverts the whole call: there is nothing to pay principal with, and the USDG
+waits behind it (AUDIT-SCOPE §5 A.2).
+
+**The reserve is haircut pro rata when it is unbacked (AUDIT-FINDINGS F-05).** `reservedAssets` is a
+claim on the idle balance, senior to live shares (§1). The issuer's `adminBurn` can take the balance
+below it. Then every uncollected reserved claimant is paid `booked × balance / reservedAssets`
+(`ReserveHaircut(owner, booked, paid)`), `reservedAssets` is released by the booked amount, and
+the fraction is invariant under collection (paying `a × b / r` leaves `b' / r' = b / r`), so the order
+people collect in does not matter and the last claimant drains the reserve to exactly the balance.
+`previewCompleteRedeem` quotes the haircut figure. Live shares' idle backing is already zero while
+the balance is below the reserve, so nothing is taken from them; while a call is open, collateral
+returning at `rollClose` refills the balance and a claimant who has not yet collected is then paid
+in full, with the burn borne by live shares through NAV. Deposits are refused throughout
+(`DepositsClosed`, `maxDeposit == 0`) and reopen once `balance >= reservedAssets` again.
+
 The flush emits **`QueueEntrySettled`** (from both settle paths — the flush and
 `completeRedeem` itself), because it changes who the epoch still owes without moving a token.
 `CompleteRedeem` only ever reports the payout. Off-chain readers must draw epochs down on the
@@ -454,14 +483,17 @@ Overcall's schema rejects a zero-amount consideration item. `Policy.minListableU
 ## 7. The invariants
 
 Asserted after every call of the stateful suite, `test/invariant/VaultInvariant.t.sol` (64 runs ×
-600 calls in the default profile). There are **eight** `invariant_*` functions; USDG solvency is
+600 calls in the default profile). There are **nine** `invariant_*` functions; USDG solvency is
 split into an aggregate half and a per-holder half. Formulas below are what the code asserts, not a
-paraphrase of intent.
+paraphrase of intent. `burned` and `burnReserveShortfall` are ghosts of the handler's `adminBurn`
+action (the issuer's bare `_burn`, at most two ordinary and two reserve-aimed burns a run, none
+before the run's first `rollClose`): the total destroyed, and the part of each burn that took the
+balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − balBefore, 0)`.
 
 ```
 1. asset conservation                                  invariant_assetConservation
-   deposited >= withdrawn + assignedOut
-   asset.balanceOf(vault) + lockedAssets()  ==  deposited - withdrawn - assignedOut
+   deposited >= withdrawn + assignedOut + burned
+   asset.balanceOf(vault) + lockedAssets()  ==  deposited - withdrawn - assignedOut - burned
    (ghosts built from what callers asked for and what the vault returned, never from its balance)
 
 2. USDG books balance (aggregate)                      invariant_usdgBooksBalance
@@ -481,10 +513,16 @@ paraphrase of intent.
 
 5. no free shares                                      invariant_noFreeShares
    totalSupply() > 0  =>  convertToAssets(totalSupply()) <= totalAssets()
-   sum(convertToAssets(holder balance)) + reservedAssets  <=  asset.balanceOf(vault) + lockedAssets()
+   sum(convertToAssets(holder balance)) + min(reservedAssets, asset.balanceOf(vault))
+       <=  asset.balanceOf(vault) + lockedAssets()
+   totalAssets() == max(asset.balanceOf(vault) + lockedAssets() - reservedAssets, 0)
+   (min(reserved, balance) is the reserve's real claim: under a shortfall the haircut pays exactly
+    the balance across all claimants, §5)
 
 6. reserves are real                                   invariant_reservesAreReal
-   reservedAssets <= asset.balanceOf(vault)
+   reservedAssets <= asset.balanceOf(vault) + burnReserveShortfall
+   (a shortfall of the balance below the reserve can originate only in a burn; with no burn in the
+    run this is reservedAssets <= asset.balanceOf(vault))
    usdgReservedForQueue <= usdg.balanceOf(vault)
    usdgReservedForQueue + pendingFeeUsdg <= usdg.balanceOf(vault)
    reservedAssets == sum(epoch.assetsRemaining) + sum(owedAssets)
@@ -500,7 +538,20 @@ paraphrase of intent.
    protocolFeeBps == Policy.launchDefaults().protocolFeeBps   (one rate per run; pinned)
    (usdg.balanceOf(feeRecipient) + pendingFeeUsdg) * 10_000  <=  premiumToVault * protocolFeeBps
    (premiumToVault is a ghost measured as the vault's USDG balance change on every successful fill)
+
+9. the deposit gate tracks the reserve                 invariant_depositGateTracksTheReserve
+   asset.balanceOf(vault) < reservedAssets  =>  maxDeposit() == 0 && maxMint() == 0
+   maxDeposit() != 0  =>  balance >= reservedAssets, phase in {Idle, Listed},
+                          maxDeposit() == depositCap - totalAssets()
 ```
+
+The handler's `completeRedeem` also asserts, on every successful call, that `reservedAssets` fell by
+the BOOKED amount (staged balance plus the entry's share of its epoch) whatever was paid, that a
+payment below the booked amount happened only while the balance was below the reserve, and that
+`previewCompleteRedeem` quoted exactly what was paid. `adminBurn` asserts that NAV after the burn is
+the formula in invariant 5 and that both deposit quotes read zero the instant the reserve is
+unbacked. `test_handlerReachesABurnShortfallAndTheHaircut` proves the shortfall, the shut gate, the
+haircut and the reopening are all reachable with no reverted call.
 
 `maxIndexRoundingDrift` is not slack. The index floors once per distribution while an account's
 pending accrual floors once over its combined delta, so holders can be promised a base unit per
@@ -512,9 +563,9 @@ With `rollClose` passing 0 instead of the claim redemption to the harvest (the p
 rule, §6), invariant 8 failed with a counterexample that shrinks to seven calls: mint shares, roll open
 (3 contracts), approve a listing, fill, exercise 1, warp, roll close.
 
-**Tranches, flat settlement and stale-listing kills (2026-09-13 second pass).** The handler now
-registers 20 actions; the three new ones are `writeMore`, `settleQueue` and
-`invalidateStaleListing`. No formula above changed: invariant 6's `lockedAssets() ==
+**Tranches, flat settlement and stale-listing kills (2026-09-13 second pass).** The handler
+registered 20 actions after that pass (21 with `adminBurn`, above); the three new ones then were
+`writeMore`, `settleQueue` and `invalidateStaleListing`. No formula above changed: invariant 6's `lockedAssets() ==
 (contractsWritten − contractsAssigned()) × 1e18` holds with `contractsWritten` as the running total
 of a multi-tranche claim, and invariant 7 still requires `Idle ⇒ claimKey == 0`, which is why
 `settleQueue` may only run in `Idle`. What the new actions add is asserted inline on every

@@ -204,6 +204,14 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         address indexed owner, uint256 indexed epochId, uint256 shares, uint256 assets, uint256 usdgOut
     );
     event QueueSettled(uint256 indexed epochId, uint256 shares, uint256 assets, uint256 usdgOut);
+    /// @dev A `completeRedeem` paid its Stock Token leg but could not move its USDG leg (USDG
+    ///      paused, the vault or the receiver frozen). `usdgOwed` stays booked to the owner and
+    ///      is collected by a later `completeRedeem`; see {_payoutOwed}.
+    event UsdgLegDeferred(address indexed owner, address indexed receiver, uint256 usdgOwed);
+    /// @dev A settled redeemer was paid less than booked because the asset balance sits below
+    ///      `reservedAssets` (an issuer `adminBurn`). Every uncollected reserved claimant takes the
+    ///      same fraction; see {_payoutOwed}.
+    event ReserveHaircut(address indexed owner, uint256 booked, uint256 paid);
     event RollOpen(uint32 indexed cycleNumber, uint256 indexed optionId, uint112 contractsCount, uint256 strikeUsdg);
     event BookLocked(uint32 indexed cycleNumber);
     event RollClose(
@@ -247,7 +255,11 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @dev Covers both an inverted cycle window and one whose tenor exceeds MAX_CYCLE_TENOR.
     ///      The two timestamps tell you which.
     error BadCycleWindow(uint40 exerciseTs, uint40 expiryTs);
-    error DepositsClosedForCycle(uint40 exerciseTs);
+    /// @dev The one deposit refusal. Every reason is enumerated in {_depositRefused}.
+    error DepositsClosed();
+    /// @dev `completeRedeem` had only USDG left to pay and the USDG transfer failed (pause,
+    ///      frozen vault, frozen receiver). Nothing moved; the USDG stays owed and collectable.
+    error UsdgLegBlocked(uint256 usdgOwed);
     error WriteWindowClosed(uint40 exerciseTs);
     error ListingStillValid();
 
@@ -339,15 +351,24 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Asset base units backing the live share supply.
-    /// @dev Idle balance, less what is already promised to settled redeemers, plus whatever
-    ///      is still locked behind this cycle's Valorem claim. USDG is not included: it is
-    ///      distributed through {Distributor}, not through the share price. Unsold option
+    /// @dev Idle balance plus whatever is still locked behind this cycle's Valorem claim, less
+    ///      what is already promised to settled redeemers, floored at zero. USDG is not included:
+    ///      it is distributed through {Distributor}, not through the share price. Unsold option
     ///      inventory is valued at zero.
+    ///
+    ///      WHY THE RESERVE IS SUBTRACTED FROM THE WHOLE, NOT FROM THE IDLE PART. The Stock Token
+    ///      issuer can `adminBurn` from any address, pause or blocklist notwithstanding. An earlier
+    ///      draft clamped `balance - reserved` at zero and then ADDED the locked collateral, so a
+    ///      burn that took the balance below the reserve while a call was open left NAV overstated
+    ///      by the shortfall (47e18 read against a true 30e18 in the audit PoC, AUDIT-FINDINGS
+    ///      F-05) and a depositor bought in above true value. The settled redeemers' claim is on
+    ///      the vault's collateral as a whole, so it comes off the whole; only the final figure
+    ///      saturates. Deposits are refused for as long as the balance sits below the reserve
+    ///      ({_depositRefused}).
     function totalAssets() public view returns (uint256) {
-        uint256 idle = asset.balanceOf(address(this));
+        uint256 gross = asset.balanceOf(address(this)) + lockedAssets();
         uint256 reserved = reservedAssets;
-        uint256 free = idle > reserved ? idle - reserved : 0;
-        return free + lockedAssets();
+        return gross > reserved ? gross - reserved : 0;
     }
 
     /// @notice Idle asset base units available to write against right now.
@@ -406,19 +427,42 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      it mid-cycle. `totalAssets` also excludes assets already promised to settled
     ///      redeemers, which is the other half of the same mistake.
     function maxDeposit(address) public view returns (uint256) {
-        // Quote zero in any phase that would reject the deposit. A non-zero figure the caller
-        // cannot act on is the same dishonesty as a preview quoting an instant redemption while
-        // the queue is the only path.
-        Phase p = phase;
-        if (p != Phase.Idle && p != Phase.Listed) return 0;
-        // Mirror the exercise-window close in {_requireDepositPhase}, so the quote goes to zero
-        // at the same instant the deposit starts reverting.
-        if (p == Phase.Listed && block.timestamp >= cycleExerciseTs) return 0;
-        if (claimKey != 0 && claimedExerciseProceeds() != 0) return 0;
+        // Quote zero whenever the deposit would revert. A non-zero figure the caller cannot act
+        // on is the same dishonesty as a preview quoting an instant redemption while the queue
+        // is the only path. ONE predicate serves both this quote and {_requireDepositPhase}, so
+        // the quote goes to zero at the same instant the deposit starts reverting.
+        if (_depositRefused()) return 0;
 
         uint256 held = totalAssets();
         if (held >= depositCap) return 0;
         return depositCap - held;
+    }
+
+    /// @dev Every reason a deposit is refused, in one place. `maxDeposit`/`maxMint` quote zero
+    ///      and `deposit`/`mint` revert {DepositsClosed} on exactly the same conditions; an earlier
+    ///      draft kept two copies and per-reason errors, and the two drifted.
+    ///
+    ///      1. PHASE. Only Idle and Listed accept deposits.
+    ///      2. THE EXERCISE WINDOW. In Listed, deposits close at `cycleExerciseTs` whether or not
+    ///         anyone calls `lockBook`; see the long note on {_requireDepositPhase}.
+    ///      3. UNCLAIMED ASSIGNMENT PROCEEDS. Clock-independent second line of defence: if any
+    ///         contract has been assigned and the claim not yet redeemed, NAV has already fallen by
+    ///         the collateral that left while the offsetting strike USDG is still inside Valorem.
+    ///      4. A STRANDED CLAIM. `claimKey != 0` while Idle means `rollClose` could not redeem the
+    ///         claim (a USDG pause or freeze in an assigned week). The strike proceeds are owed to
+    ///         the holders of record at that close, so nobody may buy in until they are collected.
+    ///      5. THE RESERVE IS UNBACKED. `asset.balanceOf(this) < reservedAssets` can only follow an
+    ///         issuer `adminBurn` (or a Valorem fee taken past the utilisation ceiling). While it
+    ///         holds, NAV reads zero on the idle side and any new deposit would be paid straight
+    ///         out to earlier settled redeemers (AUDIT-FINDINGS F-05). Deposits reopen once the
+    ///         reserve is collected (with its pro-rata haircut, {_payoutOwed}) or refilled by
+    ///         returning collateral.
+    function _depositRefused() private view returns (bool) {
+        Phase p = phase;
+        if (p != Phase.Idle && p != Phase.Listed) return true;
+        if (p == Phase.Listed && block.timestamp >= cycleExerciseTs) return true;
+        if (claimKey != 0 && (p == Phase.Idle || claimedExerciseProceeds() != 0)) return true;
+        return asset.balanceOf(address(this)) < reservedAssets;
     }
 
     /// @notice Shares mintable right now, mirroring {maxDeposit}.
@@ -504,18 +548,13 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      never at risk for — taking it directly from the depositors whose collateral was
     ///      actually assigned. Closing on the timestamp removes the window whether or not
     ///      anyone calls `lockBook`, and whether or not the keeper is alive.
+    ///
+    ///      ONE ERROR FOR EVERY REASON. {DepositsClosed} carries no argument on purpose: the
+    ///      conditions are enumerated in {_depositRefused}, `maxDeposit` returns 0 for each of
+    ///      them, and a client that wants the reason reads the phase, the clock and the reserve
+    ///      rather than decoding five selectors.
     function _requireDepositPhase() private view {
-        Phase p = phase;
-        if (p != Phase.Idle && p != Phase.Listed) revert WrongPhase(Phase.Idle, p);
-        if (p == Phase.Listed && block.timestamp >= cycleExerciseTs) {
-            revert DepositsClosedForCycle(cycleExerciseTs);
-        }
-        // Second line of defence, independent of the clock. If any contract has been assigned
-        // and the claim has not been redeemed yet, the vault's NAV has already fallen by the
-        // collateral that left while the offsetting strike USDG is still inside Valorem. Pricing
-        // new shares against that gap is exactly the theft the timestamp check prevents, so
-        // refuse regardless of what the timestamps say.
-        if (claimKey != 0 && claimedExerciseProceeds() != 0) revert DepositsClosedForCycle(cycleExerciseTs);
+        if (_depositRefused()) revert DepositsClosed();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -617,10 +656,18 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // earlier epoch can still be collected by someone who has since queued again.
         uint256 shares = (queued != 0 && e < epochId) ? _settleEpochEntry(owner) : 0;
 
+        // Judged on what was BOOKED, not on what was paid: a reserve haircut can round a booked
+        // asset leg down to zero, and that collection still happened.
+        bool hadAssets = owedAssets[owner] != 0;
         (assets, usdgOut) = _payoutOwed(owner, receiver);
 
-        if (shares == 0 && assets == 0 && usdgOut == 0) {
+        if (shares == 0 && !hadAssets && usdgOut == 0) {
             if (queued != 0) revert EpochNotSettled(e, epochId);
+            // The only thing left to collect was USDG and it could not move. Say so rather than
+            // "nothing queued": the money is still owed and the caller should retry later or to
+            // another receiver.
+            uint256 blocked = owedQueueUsdg[owner];
+            if (blocked != 0) revert UsdgLegBlocked(blocked);
             revert NothingQueued();
         }
 
@@ -662,25 +709,83 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     }
 
     /// @dev Pay out whatever `owner` is owed. This is the only leg that touches tokens, so it
-    ///      is the only leg an issuer freeze can stop.
+    ///      is the only leg an issuer action can stop.
+    ///
+    ///      THE TWO LEGS ARE INDEPENDENT (AUDIT-FINDINGS F-03). Almost every settled entry
+    ///      carries some USDG, because the escrow earns the week's indexed premium. An earlier
+    ///      draft moved both legs in one breath with `safeTransfer`, so a USDG pause or a USDG
+    ///      freeze of the vault reverted the Stock Token leg too: settled queuers' PRINCIPAL was
+    ///      held hostage by a stablecoin-side event while everyone who had not queued redeemed
+    ///      instantly (the instant path never touches USDG). Now the Stock Token leg is paid
+    ///      first with `safeTransfer` (an issuer freeze of the Stock Token still reverts the whole
+    ///      call, and that is the honest place for it to surface: there is nothing to pay
+    ///      principal with), and the USDG leg is attempted on its own through {_tryTransfer}.
+    ///      `owedQueueUsdg`, `usdgReservedForQueue` and `_debitUsdgOut` move ONLY on success, so a
+    ///      failed USDG leg leaves the USDG exactly where it was, collectable by a later call or
+    ///      to another receiver ({UsdgLegDeferred}).
+    ///
+    ///      THE RESERVE IS HAIRCUT PRO RATA WHEN IT IS UNBACKED (AUDIT-FINDINGS F-05, decision
+    ///      D6). `reservedAssets` is carved out of the idle balance and is senior to live shares
+    ///      on it ({totalAssets} subtracts it in full), but the Stock Token issuer can `adminBurn`
+    ///      the balance below it. An earlier draft then paid whoever collected first in full and
+    ///      reverted for the rest, and once deposits reopened, the last claimants were paid out of
+    ///      a newcomer's principal. Now every uncollected reserved claimant takes the same
+    ///      fraction `balance / reservedAssets` of what is booked to them. The fraction is
+    ///      invariant under collection: paying `a × b / r` leaves `b' / r' = b(r − a) / (r(r − a))
+    ///      = b / r`, so the order in which people collect does not matter. The haircut is
+    ///      permanent even if the issuer later restores tokens; those would accrue to live
+    ///      shares through NAV, which is the accepted trade for never paying a shortfall out of
+    ///      someone else's deposit. Live shares' idle backing is already zero while the balance
+    ///      is below the reserve, so nothing is taken from them here.
     function _payoutOwed(address owner, address receiver) private returns (uint256 assets, uint256 usdgOut) {
         assets = owedAssets[owner];
         usdgOut = owedQueueUsdg[owner];
         if (assets == 0 && usdgOut == 0) return (0, 0);
 
-        owedAssets[owner] = 0;
-        owedQueueUsdg[owner] = 0;
-        reservedAssets -= assets;
-        usdgReservedForQueue -= usdgOut;
-
-        if (assets != 0) asset.safeTransfer(receiver, assets);
+        if (assets != 0) {
+            uint256 booked = assets;
+            owedAssets[owner] = 0;
+            uint256 r = reservedAssets;
+            reservedAssets = r - booked;
+            assets = _haircut(booked, r);
+            if (assets != booked) emit ReserveHaircut(owner, booked, assets);
+            if (assets != 0) asset.safeTransfer(receiver, assets);
+        }
         if (usdgOut != 0) {
-            _debitUsdgOut(usdgOut);
-            usdg.safeTransfer(receiver, usdgOut);
+            if (_tryTransfer(usdg, receiver, usdgOut)) {
+                owedQueueUsdg[owner] = 0;
+                usdgReservedForQueue -= usdgOut;
+                _debitUsdgOut(usdgOut);
+            } else {
+                emit UsdgLegDeferred(owner, receiver, usdgOut);
+                usdgOut = 0;
+            }
         }
     }
 
+    /// @dev What `booked` asset base units of a reserve of `reserved` actually pay right now:
+    ///      the whole amount while the balance backs the reserve, the pro-rata fraction otherwise.
+    ///      Shared by {_payoutOwed} and {previewCompleteRedeem} so the preview quotes exactly
+    ///      what the payout moves. Rounds down; the base units it leaves behind fall to live
+    ///      shares through NAV once the reserve is fully collected.
+    function _haircut(uint256 booked, uint256 reserved) private view returns (uint256) {
+        uint256 bal = asset.balanceOf(address(this));
+        return bal < reserved ? booked.mulDiv(bal, reserved) : booked;
+    }
+
+    /// @dev Best-effort ERC-20 transfer that never reverts the caller. A raw call rather than
+    ///      SafeERC20 so a paused or blocklisting token cannot take the caller down with it. A
+    ///      missing return value is treated as success, matching the non-compliant-ERC20
+    ///      convention SafeERC20 follows. Shared by {_payoutOwed} (the USDG leg) and {_tryPayFee}.
+    function _tryTransfer(IERC20 token, address to, uint256 amount) private returns (bool) {
+        (bool ok, bytes memory ret) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        return ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool))));
+    }
+
     /// @notice What a queued position is worth once its epoch has settled.
+    /// @dev Quotes the asset leg after the reserve haircut ({_haircut}), so it is exactly what
+    ///      `completeRedeem` pays now. The USDG leg is quoted as booked; whether it MOVES depends
+    ///      on the stablecoin's pause and freeze state at the time of the call.
     function previewCompleteRedeem(address owner) external view returns (uint256 assets, uint256 usdgOut) {
         // Anything already settled out of an epoch but not yet collected.
         assets = owedAssets[owner];
@@ -688,11 +793,14 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
 
         uint256 shares = queuedSharesOf[owner];
         uint256 e = queuedEpochOf[owner];
-        if (shares == 0 || e >= epochId) return (assets, usdgOut);
-        Epoch storage ep = epochs[e];
-        if (ep.sharesRemaining == 0) return (assets, usdgOut);
-        assets += (ep.assetsRemaining * shares) / ep.sharesRemaining;
-        usdgOut += _entryUsdg(owner, e, shares, ep);
+        if (shares != 0 && e < epochId) {
+            Epoch storage ep = epochs[e];
+            if (ep.sharesRemaining != 0) {
+                assets += (ep.assetsRemaining * shares) / ep.sharesRemaining;
+                usdgOut += _entryUsdg(owner, e, shares, ep);
+            }
+        }
+        if (assets != 0) assets = _haircut(assets, reservedAssets);
     }
 
     /// @dev USDG owed to `owner`'s entry of `shares` in settled epoch `e`: the index growth those
@@ -1121,11 +1229,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         if (fee > bal) fee = bal;
         if (fee == 0) return 0;
 
-        // Raw call rather than SafeERC20 so a reverting or blocklisting token cannot take the
-        // caller down with it. A missing return value is treated as success, matching the
-        // non-compliant-ERC20 convention SafeERC20 follows.
-        (bool ok, bytes memory ret) = address(usdg).call(abi.encodeCall(IERC20.transfer, (feeRecipient, fee)));
-        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) return 0;
+        // Best-effort, so a reverting or blocklisting token cannot take the caller down with it.
+        if (!_tryTransfer(usdg, feeRecipient, fee)) return 0;
 
         pendingFeeUsdg -= fee;
         _debitUsdgOut(fee);

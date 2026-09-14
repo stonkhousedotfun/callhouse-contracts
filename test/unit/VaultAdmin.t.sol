@@ -397,9 +397,9 @@ contract VaultAdminTest is BaseTest {
         vault.setPolicy(p);
 
         p = _launchPolicy();
-        p.maxUtilizationBps = 10_001;
+        p.maxUtilizationBps = 9_986;
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(Policy.UtilizationAboveCeiling.selector, uint16(10_001), uint16(10_000)));
+        vm.expectRevert(abi.encodeWithSelector(Policy.UtilizationAboveCeiling.selector, uint16(9_986), uint16(9_985)));
         vault.setPolicy(p);
 
         p = _launchPolicy();
@@ -423,7 +423,7 @@ contract VaultAdminTest is BaseTest {
             minOtmBps: 100,
             maxOtmBps: 2_500,
             minPremiumBps: 10,
-            maxUtilizationBps: 10_000,
+            maxUtilizationBps: 9_985,
             protocolFeeBps: 2_000,
             maxContractsCap: 1
         });

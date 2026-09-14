@@ -61,7 +61,7 @@ contract VaultSecurityTest is BaseTest {
 
         vm.startPrank(bob);
         nvda.approve(address(vault), 19e18);
-        vm.expectRevert(abi.encodeWithSelector(Vault.DepositsClosedForCycle.selector, exerciseTs));
+        vm.expectRevert(Vault.DepositsClosed.selector);
         vault.deposit(19e18, bob);
         vm.stopPrank();
 
@@ -93,7 +93,7 @@ contract VaultSecurityTest is BaseTest {
 
         vm.startPrank(carol);
         nvda.approve(address(vault), 1e18);
-        vm.expectRevert(abi.encodeWithSelector(Vault.DepositsClosedForCycle.selector, exerciseTs));
+        vm.expectRevert(Vault.DepositsClosed.selector);
         vault.deposit(1e18, carol);
         vm.stopPrank();
     }

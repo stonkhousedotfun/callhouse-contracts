@@ -43,10 +43,18 @@ These are not conventions; they are checks in the deployed code, each with regre
   exclusion is code, not a policy field, so no admin setting can put strike proceeds back under
   the fee. See `docs/ACCOUNTING.md` §6.
 - **The deposit window closes on the cycle's exercise timestamp**, not on the phase enum and
-  not on anyone calling `lockBook`. After it, `deposit`/`mint` revert `DepositsClosedForCycle`
+  not on anyone calling `lockBook`. After it, `deposit`/`mint` revert `DepositsClosed`
   and `maxDeposit`/`maxMint` return 0. A second, clock-independent line refuses deposits
   whenever unclaimed assignment proceeds exist (NAV has already fallen by the collateral that
-  left). See §4, finding 1.
+  left), and a third whenever the asset balance sits below `reservedAssets` (an issuer burn), so
+  a newcomer's deposit can never be paid straight out to earlier settled redeemers. One predicate
+  and one selector serve every refusal. See §4, finding 1, and AUDIT-FINDINGS F-05.
+- **A settled redeemer's Stock Token leg is paid whatever USDG is doing.** `completeRedeem` pays
+  the asset leg with `safeTransfer` and the USDG leg best-effort; a USDG pause or freeze defers the
+  USDG (`UsdgLegDeferred`, collectable later or to another receiver) and never holds principal.
+  If the asset balance has been burnt below the reserve, every uncollected reserved claimant takes
+  the same `balance / reservedAssets` fraction (`ReserveHaircut`), never first come, first served.
+  See AUDIT-FINDINGS F-03 and F-05.
 - **Cycle tenor is capped at 21 days** by a compiled-in constant (`ValoremLib.MAX_CYCLE_TENOR`).
   The registry that sets the weekly cycle is a single third-party EOA; a hostile or fat-fingered
   cycle must produce a skipped week, not a years-long lock on depositor principal.

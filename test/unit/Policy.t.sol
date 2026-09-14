@@ -137,8 +137,10 @@ contract PolicyTest is Test {
 
     function test_validate_revertsWhenUtilizationAboveCeiling() public {
         PolicyParams memory p = _p();
-        p.maxUtilizationBps = 10_001;
-        vm.expectRevert(abi.encodeWithSelector(Policy.UtilizationAboveCeiling.selector, uint16(10_001), uint16(10_000)));
+        // 9,985 bps, not 10,000: the ceiling leaves Valorem's 15 bps engine fee inside the free
+        // balance so a maximum-size write can never dip into `reservedAssets` (F-04, D7).
+        p.maxUtilizationBps = 9_986;
+        vm.expectRevert(abi.encodeWithSelector(Policy.UtilizationAboveCeiling.selector, uint16(9_986), uint16(9_985)));
         h.validate(p);
     }
 

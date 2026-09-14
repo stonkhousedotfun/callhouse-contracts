@@ -61,6 +61,15 @@ contract VaultHandler is Test {
     uint256 public totalWithdrawn;
     /// @notice Asset base units handed to option buyers through assignment. Gone for good.
     uint256 public totalAssignedOut;
+    /// @notice Asset base units the issuer has burnt out of the vault with `adminBurn`. Gone for good.
+    uint256 public totalBurned;
+    /// @notice The part of every burn that landed on `reservedAssets` rather than on live shares:
+    ///         `max(reserved - balanceAfter, 0) - max(reserved - balanceBefore, 0)`, summed over burns.
+    /// @dev A shortfall of the balance below the reserve can ORIGINATE only in a burn. Payouts
+    ///      (with their haircut), settlements and returning collateral can only shrink it, so the
+    ///      live shortfall is bounded by this ghost at every step; see
+    ///      {VaultInvariantTest.invariant_reservesAreReal}.
+    uint256 public burnReserveShortfall;
 
     /*//////////////////////////////////////////////////////////////
                   GHOST STATE FOR THE PROTOCOL FEE BOUND
@@ -122,6 +131,14 @@ contract VaultHandler is Test {
     uint256 public cWriteMore;
     uint256 public cSettleQueue;
     uint256 public cStaleKill;
+    uint256 public cBurn;
+    /// @notice Burns that took the balance below `reservedAssets`.
+    uint256 public cBurnShortfalls;
+    /// @dev Per-run budget for each burn shape; see {adminBurn}.
+    uint256 internal ordinaryBurns;
+    uint256 internal aimedBurns;
+    /// @notice Completed redemptions that were paid less than booked (the reserve haircut).
+    uint256 public cHaircuts;
 
     /// @notice Cycles that ended with at least one contract assigned.
     uint256 public cAssignedCycles;
@@ -435,12 +452,34 @@ contract VaultHandler is Test {
         }
 
         (uint256 dueAssets, uint256 dueUsdg) = vault.previewCompleteRedeem(who);
+        // What is BOOKED to the account, before any haircut: the staged balance plus its share of
+        // the settled epoch. The preview quotes this after the haircut, so the two differ exactly
+        // when the balance sits below the reserve.
+        uint256 booked = vault.owedAssets(who);
+        if (settledEntry) {
+            (uint256 sharesR, uint256 assetsR,) = vault.epochs(e);
+            booked += (assetsR * q) / sharesR;
+        }
+        uint256 reservedBefore = vault.reservedAssets();
         uint256 before = nvda.balanceOf(address(vault));
         uint256 usdgBefore = usdg.balanceOf(address(vault));
         vm.prank(who);
         try vault.completeRedeem(who) returns (uint256 assets, uint256 usdgOut) {
             totalWithdrawn += assets;
             assertEq(assets, dueAssets, "previewCompleteRedeem quoted assets completeRedeem did not pay");
+            // The reserve is released by what was BOOKED, whatever was paid: a haircut is a loss
+            // taken by the claimant, never a base unit left promised in the reserve.
+            assertEq(
+                reservedBefore - vault.reservedAssets(),
+                booked,
+                "reservedAssets released something other than the booked amount"
+            );
+            if (assets < booked) {
+                cHaircuts++;
+                assertLt(before, reservedBefore, "a haircut was applied while the balance backed the reserve");
+            } else {
+                assertEq(assets, booked, "paid more than was booked");
+            }
             assertEq(usdgOut, dueUsdg, "previewCompleteRedeem quoted USDG completeRedeem did not pay");
             assertEq(before - nvda.balanceOf(address(vault)), assets, "completeRedeem moved the wrong amount of asset");
             assertEq(usdgBefore - usdg.balanceOf(address(vault)), usdgOut, "completeRedeem moved the wrong USDG");
@@ -633,7 +672,9 @@ contract VaultHandler is Test {
         uint256 spot = bound(spotSeed, (k * BPS) / (BPS + maxOtmBps) + 1, (k * BPS) / (BPS + minOtmBps) - 1);
         feed.setAnswer(int256(spot * 100));
 
-        uint256 byUtil = ((vault.idleAssets() + vault.lockedAssets()) * util) / BPS / LOT;
+        // Sized on `totalAssets()`, exactly as the gate is: after an issuer burn the reserve can sit
+        // above the balance, and `idle + locked` would then overstate the sizing base.
+        uint256 byUtil = (vault.totalAssets() * util) / BPS / LOT;
         uint256 maxTotal = byUtil < cap ? byUtil : cap;
         uint256 written = vault.contractsWritten();
         if (maxTotal <= written) {
@@ -876,6 +917,83 @@ contract VaultHandler is Test {
             cClose++;
         } catch (bytes memory err) {
             _reverted("rollClose", err);
+        }
+    }
+
+    /// @notice The issuer seizes Stock Tokens straight out of the vault. `adminBurn` on the live token
+    ///         is a bare `_burn` that ignores pause and blocklist, and it is the one action here that
+    ///         destroys collateral rather than moving it.
+    /// @dev Rare and bounded on purpose: one seed in twelve, at most four burns a run. A seizure is a
+    ///      rare event, and an unbounded one wrecks the run rather than testing it: a burn of the whole
+    ///      balance leaves NAV at zero with shares outstanding, after which every mint costs one base
+    ///      unit, no lot is ever idle again and no cycle can open, and the anti-vacuity gate in
+    ///      {VaultInvariantTest.afterInvariant} rightly refuses the run. Two shapes, two a run each:
+    ///        - a seizure AIMED AT THE RESERVE, taken whenever the reserve is non-zero and backed: it
+    ///          leaves the balance between half the reserve and one base unit below it, so the
+    ///          shortfall path (deposits shut, pro-rata haircut on collection) is reached in ordinary
+    ///          runs and not only in {VaultInvariantTest.test_handlerReachesABurnShortfallAndTheHaircut};
+    ///        - otherwise an ordinary seizure of up to a quarter of the balance, absorbed by live
+    ///          shares through NAV.
+    ///      The aimed shape has priority because the reserve is non-zero only between a settlement and
+    ///      its collection, and the fuzzer's seeds are dictionary-biased towards round numbers, so
+    ///      selecting the shape by seed parity almost never landed an aimed burn on a live reserve.
+    ///
+    ///      NO BURN BEFORE THE FIRST CLOSE. A reserve seizure leaves the vault Idle at NAV zero with
+    ///      shares outstanding; from there every mint costs one base unit and only fresh deposits can
+    ///      bring a lot back idle, so a run seized early spends most of its 600 calls unable to open a
+    ///      cycle and trips the "no cycle was ever closed" floor in {VaultInvariantTest.afterInvariant}
+    ///      (observed: one open at call ~450, locked, never closed). Waiting for the first close keeps
+    ///      the floors honest — a run has proven it can deposit, open, queue and close before the
+    ///      issuer is allowed to wreck it — and every later cycle is still exposed to burns in every
+    ///      phase. The ghosts record what was destroyed and how much of it fell on the reserve, which
+    ///      is what {VaultInvariantTest.invariant_assetConservation} and
+    ///      {VaultInvariantTest.invariant_reservesAreReal} are stated against.
+    function adminBurn(uint256 seed, uint256 amountSeed) external {
+        attempted++;
+        if (seed % 12 != 0 || cClose == 0) {
+            _skip();
+            return;
+        }
+        uint256 bal = nvda.balanceOf(address(vault));
+        uint256 reserved = vault.reservedAssets();
+        uint256 amount;
+        if (reserved >= 2 && bal >= reserved && aimedBurns < 2) {
+            aimedBurns++;
+            amount = bound(amountSeed, bal - reserved + 1, bal - reserved / 2);
+        } else {
+            if (bal < 4 || ordinaryBurns >= 2) {
+                _skip();
+                return;
+            }
+            ordinaryBurns++;
+            amount = bound(amountSeed, 1, bal / 4);
+        }
+        uint256 shortBefore = reserved > bal ? reserved - bal : 0;
+        uint256 navBefore = vault.totalAssets();
+        uint256 lockedBefore = vault.lockedAssets();
+
+        try nvda.adminBurn(address(vault), amount) {
+            totalBurned += amount;
+            uint256 after_ = bal - amount;
+            uint256 shortAfter = reserved > after_ ? reserved - after_ : 0;
+            burnReserveShortfall += shortAfter - shortBefore;
+            if (shortAfter != 0) cBurnShortfalls++;
+
+            // NAV falls by exactly the part of the burn that live shares absorb, and saturates at
+            // zero: the reserve comes off the whole book, never off the idle part alone (F-05).
+            uint256 gross = after_ + lockedBefore;
+            uint256 navExpected = gross > reserved ? gross - reserved : 0;
+            assertEq(vault.totalAssets(), navExpected, "NAV after a burn is not max(balance + locked - reserved, 0)");
+            assertLe(vault.totalAssets(), navBefore, "a burn raised NAV");
+            // Deposits shut the instant the reserve is unbacked, whatever the phase says.
+            if (shortAfter != 0) {
+                assertEq(vault.maxDeposit(actors[0]), 0, "maxDeposit quoted room while the reserve is unbacked");
+                assertEq(vault.maxMint(actors[0]), 0, "maxMint quoted shares while the reserve is unbacked");
+            }
+            succeeded++;
+            cBurn++;
+        } catch (bytes memory err) {
+            _reverted("adminBurn", err);
         }
     }
 
@@ -1145,7 +1263,7 @@ contract VaultInvariantTest is BaseTest {
 
         holders = [alice, bob, carol, buyer, address(vault)];
 
-        bytes4[] memory selectors = new bytes4[](20);
+        bytes4[] memory selectors = new bytes4[](21);
         selectors[0] = VaultHandler.deposit.selector;
         selectors[1] = VaultHandler.mintShares.selector;
         selectors[2] = VaultHandler.instantRedeem.selector;
@@ -1166,6 +1284,7 @@ contract VaultInvariantTest is BaseTest {
         selectors[17] = VaultHandler.writeMore.selector;
         selectors[18] = VaultHandler.settleQueue.selector;
         selectors[19] = VaultHandler.invalidateStaleListing.selector;
+        selectors[20] = VaultHandler.adminBurn.selector;
 
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
@@ -1183,12 +1302,14 @@ contract VaultInvariantTest is BaseTest {
     ///      this a comparison of two independent accounts rather than of a balance with itself.
     function invariant_assetConservation() public view {
         uint256 inflow = handler.totalDeposited();
-        uint256 outflow = handler.totalWithdrawn() + handler.totalAssignedOut();
+        // Three ways out and no fourth: paid to a redeemer, taken by an assigned buyer, or
+        // destroyed by the issuer's `adminBurn`.
+        uint256 outflow = handler.totalWithdrawn() + handler.totalAssignedOut() + handler.totalBurned();
         // Checked separately so a leak reports as a leak instead of an underflow panic.
         assertGe(inflow, outflow, "asset conservation: more asset left the vault than ever entered");
 
         uint256 accountedFor = nvda.balanceOf(address(vault)) + vault.lockedAssets();
-        assertEq(accountedFor, inflow - outflow, "asset conservation: idle + locked != in - out - assigned");
+        assertEq(accountedFor, inflow - outflow, "asset conservation: idle + locked != in - out - assigned - burned");
     }
 
     /// @notice I-02, aggregate half. The vault's own books account for every USDG base unit it
@@ -1316,19 +1437,65 @@ contract VaultInvariantTest is BaseTest {
         for (uint256 i; i < holders.length; i++) {
             owedToHolders += vault.convertToAssets(vault.balanceOf(holders[i]));
         }
+        // The reserve's REAL claim is `min(reservedAssets, balance)`: after an issuer burn takes the
+        // balance below it, every uncollected claimant is paid the same `balance / reserved` fraction
+        // ({Vault._payoutOwed}), so together they take exactly the balance and not a base unit
+        // more. With no burn in the run this is the plain `reservedAssets`.
+        uint256 balance = nvda.balanceOf(address(vault));
+        uint256 reserved = vault.reservedAssets();
+        uint256 reserveClaim = reserved < balance ? reserved : balance;
         assertLe(
-            owedToHolders + vault.reservedAssets(),
-            nvda.balanceOf(address(vault)) + vault.lockedAssets(),
+            owedToHolders + reserveClaim,
+            balance + vault.lockedAssets(),
             "holders plus settled redeemers are owed more asset than exists"
         );
+        // And NAV is the formula, not a paraphrase of it: the reserve comes off the whole book and
+        // only the final figure saturates (F-05). Stated here because a burn is the only action that
+        // can make `balance + locked < reserved`, and this is where the two formulas diverged.
+        uint256 gross = balance + vault.lockedAssets();
+        assertEq(
+            vault.totalAssets(),
+            gross > reserved ? gross - reserved : 0,
+            "totalAssets != max(balance + locked - reserved, 0)"
+        );
+    }
+
+    /// @notice Deposits are shut, and quoted shut, for exactly as long as the reserve is unbacked.
+    /// @dev The one `_depositRefused()` predicate serves `maxDeposit`/`maxMint` and `deposit`/`mint`
+    ///      alike. An earlier draft kept two copies with no reserve check in either, so after an
+    ///      issuer burn a newcomer's deposit was quoted at the full cap and paid straight out to
+    ///      earlier settled redeemers (F-05). Here: whenever `balance < reservedAssets`, both quotes
+    ///      are zero; and whenever a quote is non-zero, the reserve is backed and the phase is one
+    ///      that accepts deposits.
+    function invariant_depositGateTracksTheReserve() public view {
+        uint256 balance = nvda.balanceOf(address(vault));
+        uint256 room = vault.maxDeposit(alice);
+        if (balance < vault.reservedAssets()) {
+            assertEq(room, 0, "maxDeposit quoted room while the balance is below the reserve");
+            assertEq(vault.maxMint(alice), 0, "maxMint quoted shares while the balance is below the reserve");
+        }
+        if (room != 0) {
+            assertGe(balance, vault.reservedAssets(), "deposits quoted open over an unbacked reserve");
+            uint8 p = uint8(vault.phase());
+            assertTrue(p == 0 || p == 1, "deposits quoted open outside Idle and Listed");
+            assertEq(room, vault.depositCap() - vault.totalAssets(), "maxDeposit is not cap minus NAV");
+        }
     }
 
     /// @notice A settled redeemer's money is really there. Reserves are carved out of the
     ///         balance, never out of the locked collateral or out of thin air.
     function invariant_reservesAreReal() public view {
-        // The asset leg is strict. Nothing rounds here: `reservedAssets` is set from a real
-        // balance at settlement and drawn down by real transfers.
-        assertLe(vault.reservedAssets(), nvda.balanceOf(address(vault)), "reservedAssets exceeds the asset balance");
+        // The asset leg is strict up to what the issuer has destroyed. `reservedAssets` is set from
+        // a real balance at settlement and drawn down by real transfers, so nothing the VAULT does
+        // can put it above the balance; only an `adminBurn` can, and the handler measures exactly
+        // how much of each burn landed on the reserve. A shortfall above that ghost would mean the
+        // vault itself had promised money it never had. With no burn in the run the bound is the
+        // plain `reservedAssets <= balance`.
+        assertLe(
+            vault.reservedAssets(),
+            nvda.balanceOf(address(vault)) + handler.burnReserveShortfall(),
+            "reservedAssets exceeds the asset balance by more than the issuer burnt out of the reserve"
+        );
 
         // The USDG leg is STRICT, and it deliberately carries no allowance even though
         // {invariant_usdgHolderSolvency} needs one. It used to need one too: `_settleQueue`
@@ -1478,6 +1645,9 @@ contract VaultInvariantTest is BaseTest {
         emit log_named_uint("tranche top-ups", handler.cWriteMore());
         emit log_named_uint("flat queue settlements", handler.cSettleQueue());
         emit log_named_uint("stale listings killed", handler.cStaleKill());
+        emit log_named_uint("issuer burns", handler.cBurn());
+        emit log_named_uint("burns that unbacked the reserve", handler.cBurnShortfalls());
+        emit log_named_uint("haircut redemptions", handler.cHaircuts());
         emit log_named_uint("cycles with assignment", handler.cAssignedCycles());
 
         emit log_named_uint("index rounding allowance (usdg base units)", handler.maxIndexRoundingDrift());
@@ -1621,6 +1791,61 @@ contract VaultInvariantTest is BaseTest {
         invariant_reservesAreReal();
         invariant_phaseSanity();
         invariant_feeNeverTouchesStrikeProceeds();
+        invariant_depositGateTracksTheReserve();
+    }
+
+    /// @notice Proves the handler reaches an issuer burn that unbacks the reserve, the shut deposit
+    ///         gate that follows, and a haircut redemption, with every invariant holding throughout.
+    function test_handlerReachesABurnShortfallAndTheHaircut() public {
+        handler.deposit(0, type(uint256).max); // alice, 6e18
+        handler.deposit(1, type(uint256).max); // bob, 6e18
+
+        // The handler refuses to burn before the run has closed a cycle, so run one OTM week first.
+        handler.rollOpen(0, 0, 0); // one contract
+        handler.adminBurn(0, 1e18);
+        assertEq(handler.cBurn(), 0, "no burn before the first close");
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.rollClose(1);
+        assertEq(handler.cClose(), 1, "first cycle closed");
+        assertEq(nvda.balanceOf(address(vault)), 12e18, "collateral back, nothing assigned");
+
+        handler.queueRedeem(0, type(uint256).max); // alice queues everything
+        handler.settleQueue(0);
+        assertEq(vault.reservedAssets(), 6e18, "half the book is reserved");
+
+        // Burn three quarters of the balance: the reserve (half) is now unbacked.
+        uint256 bal = nvda.balanceOf(address(vault));
+        handler.adminBurn(0, (bal * 3) / 4);
+        assertEq(handler.cBurn(), 1, "adminBurn");
+        assertEq(handler.cBurnShortfalls(), 1, "the burn unbacked the reserve");
+        assertLt(nvda.balanceOf(address(vault)), vault.reservedAssets(), "balance < reserved");
+        assertEq(vault.maxDeposit(alice), 0, "deposits shut");
+        handler.deposit(2, type(uint256).max); // carol: skipped, not reverted
+        assertEq(handler.cDeposit(), 2, "no deposit landed while the reserve was unbacked");
+        invariant_assetConservation();
+        invariant_noFreeShares();
+        invariant_reservesAreReal();
+        invariant_depositGateTracksTheReserve();
+
+        // alice collects: paid the haircut, reserve released in full, deposits reopen.
+        handler.completeRedeem(0);
+        assertEq(handler.cHaircuts(), 1, "haircut redemption");
+        assertEq(vault.reservedAssets(), 0, "reserve fully released");
+        assertGt(vault.maxDeposit(alice), 0, "deposits reopen once the reserve is collected");
+        handler.deposit(2, type(uint256).max);
+        assertEq(handler.cDeposit(), 3, "carol's deposit lands now");
+
+        assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
+        invariant_assetConservation();
+        invariant_usdgBooksBalance();
+        invariant_shareAccounting();
+        invariant_noFreeShares();
+        invariant_reservesAreReal();
+        invariant_phaseSanity();
+        invariant_depositGateTracksTheReserve();
     }
 
     /// @notice Proves the handler reaches the three audit-fix actions: a tranche top-up, a stale
