@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title Distributor
 /// @notice USDG accrual for vault shareholders.
@@ -111,13 +112,16 @@ abstract contract Distributor is ERC20 {
         return _accrued[account] + _pending(account);
     }
 
-    /// @dev Unsettled accrual for `account` at the current index.
+    /// @dev Unsettled accrual for `account` at the current index. `Math.mulDiv` rather than
+    ///      `bal * delta / ACC_PRECISION`: the same floor, but the product is formed in 512 bits,
+    ///      so a balance times the 1e27-scaled index can never revert the settle that runs inside
+    ///      every transfer, mint and burn of this account's shares (AF-05 follow-up).
     function _pending(address account) internal view returns (uint256) {
         uint256 bal = balanceOf(account);
         if (bal == 0) return 0;
         uint256 delta = accUsdgPerShare - _accSnapshot[account];
         if (delta == 0) return 0;
-        return (bal * delta) / ACC_PRECISION;
+        return Math.mulDiv(bal, delta, ACC_PRECISION);
     }
 
     /*//////////////////////////////////////////////////////////////

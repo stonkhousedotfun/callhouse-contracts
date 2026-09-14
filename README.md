@@ -134,7 +134,7 @@ FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
 profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
 verbosity.
 
-Current state: **399 unit, regression and invariant tests across 23 suites, 20 fork tests** (the
+Current state: **402 unit, regression and invariant tests across 23 suites, 20 fork tests** (the
 fork suite runs with `FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC`; it needs the live RPC
 and is not part of the offline gate). Measured 2026-09-13 on branch
 `redesign/a2-own-strikes-2026-09-13` after the S4 hardening pass.
@@ -151,7 +151,7 @@ them with `set -o pipefail` when piping: a piped failure that hides behind `tee`
 that did not pass.
 
 There is no external audit (owner decision D14, 2026-09-13) and no separate security gauntlet.
-The contracts are unaudited. What stands behind them is the gate above: 399 tests including the
+The contracts are unaudited. What stands behind them is the gate above: 402 tests including the
 five audit proofs of concept re-asserted as fixed behaviour on the real Valorem bytecode, the
 real Seaport 1.6 runtime driven through every fulfilment path, a 64 × 600 stateful campaign with a
 third-party writer in the vault's bucket (thirteen invariants, among them: the vault never holds
@@ -170,7 +170,8 @@ code limit (our own Clear deployed and used on path A, Overcall's on path B; `do
 enforces a **98,304 B** contract code limit (verified with `eth_call --create` probes: 98,304 B
 deploys, 98,305 B fails `max code size exceeded`; decision D17), so `foundry.toml` sets
 `code_size_limit = 98304` and forge's 24,576 B warnings are noise here. The Vault runtime is
-25,470 B after the redesign and the AF-02 stranded-claim state machine (ValoremLib 5,993 B,
+25,765 B after the redesign, the AF-02 stranded-claim state machine and the AF-05 share-price
+floor (ValoremLib 5,993 B,
 SeaportOrderLib 5,170 B); `forge build --sizes` therefore prints a negative "margin" and exits 1,
 which is forge measuring against EIP-170 and is ignored by the gate. Two things follow:
 a default `anvil` REFUSES the Vault — `script/rehearse-deploy.sh` requires and probes for
@@ -306,8 +307,10 @@ and records its share of the claim, deposits and instant redemption stay shut, `
 
 Deposits close on the cycle's exercise **timestamp**, whether or not anyone calls `lockBook`:
 after it, `deposit`/`mint` revert `DepositsClosed` and `maxDeposit`/`maxMint` return 0 (the same
-selector covers every refusal: wrong phase, unclaimed assignment proceeds, a stranded claim, or an
-asset balance below `reservedAssets` after an issuer burn).
+selector covers every refusal: wrong phase, unclaimed assignment proceeds, a stranded claim, an
+asset balance below `reservedAssets` after an issuer burn, or a share price below the floor of one
+share per 1e-6 asset base unit, so a book burnt to nothing with its shares outstanding sells no new
+shares; `docs/ACCOUNTING.md` §3).
 Assignment collapses NAV mid-transaction with no callback, so minting against the gap has to be
 impossible — that was the critical finding of the 2026-09-12 review, written up in
 [`SECURITY.md`](SECURITY.md).

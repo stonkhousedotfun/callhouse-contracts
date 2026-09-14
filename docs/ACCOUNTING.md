@@ -114,6 +114,38 @@ only path, rather than quoting an instant amount the caller cannot get. `maxDepo
 any phase where `deposit` would revert. This is a deliberate departure from the naive ERC-4626
 reading, and it is what an integrator sizing a "max" button needs.
 
+**A floor on the share price (AF-05 follow-up).** `deposit` and `mint` revert `DepositsClosed`, and
+`maxDeposit`/`maxMint` quote 0, while
+
+```
+totalSupply() > totalAssets() * MAX_SHARES_PER_ASSET        MAX_SHARES_PER_ASSET = 1e6, compiled in
+```
+
+that is, while one share is worth less than a millionth of an asset base unit. A live book is nowhere
+near it: one share is one token at launch, one share per base unit, and the floor sits a million
+times further out. Only a book that has lost everything with its shares still outstanding reads like
+this: every contract it sold assigned plus an issuer `adminBurn`, or a burn that took the whole idle
+balance, with the reserve gate (§4) satisfied because nothing is reserved. Two reasons, neither
+governable:
+
+- **A dead book must not sell new shares at nothing.** With `totalAssets()` at a few wei the formula
+  above mints `assets × (supply + 1) / (assets + 1)` shares, up to ~1e18 per wei deposited. The
+  newcomer buys the book for its dust, and whatever later returns to it (a redeemed stranded claim,
+  an issuer restoring tokens) is theirs rather than the burnt holders'.
+- **The overflow bound.** Two such deposits put the supply near 1e58, and `shares × accUsdgPerShare`
+  (the 1e27-scaled index, §4) passes 2^256 in the queue's per-entry maths, so a queued account
+  panicked in `queueRedeem` and `completeRedeem` and could never settle. The queue and index maths
+  no longer form that product (§5, "What each entry is paid"), and the floor bounds the supply at
+  1e6 times the asset supply on top: with NVDA's ~7.7e22 base units that is ~7.7e28 shares, and a
+  share count times a 1e27-scaled index stays around 1e56.
+
+The floor lifts by itself the moment the book is worth 1e-6 base units a share again: collateral
+returning at `rollClose`, a stranded claim redeemed, an issuer restoring tokens, or the outstanding
+shares queueing out (`totalSupply() == 0` is not below the floor, so an emptied book is reborn at
+par). The exact boundary, the wind-down of a dead book through the queue, and the arithmetic are in
+`test/regression/AF05_BurnShortfall.t.sol` (`test_deadBook_*`,
+`test_queueMaths_doNotNeedShareTimesIndexToFit256Bits`).
+
 ---
 
 ## 4. The premium index
@@ -178,9 +210,10 @@ Two consequences to hold in mind:
 
 The deposit gate itself closes on the cycle's exercise **timestamp**, not on the phase: after it,
 `deposit`/`mint` revert `DepositsClosed` and the previews return 0. One private predicate,
-`_depositRefused()`, decides both the revert and the zero quote, and it has five reasons: a phase
+`_depositRefused()`, decides both the revert and the zero quote, and it has six reasons: a phase
 other than Idle or Listed, the exercise timestamp in Listed, unclaimed assignment proceeds, a claim
-still open while Idle (stranded), and `asset.balanceOf(vault) < reservedAssets`. The reason is
+still open while Idle (stranded), `asset.balanceOf(vault) < reservedAssets`, and the share-price
+floor `totalSupply() > totalAssets() × 1e6` (§3). The reason is
 assignment — Valorem takes collateral with no callback, so NAV collapses mid-transaction while
 the strike proceeds sit in the claim, and minting against that gap was the one critical finding
 of the 2026-09-12 review. The checkpoint above is the companion rule for the premium side of the
@@ -226,7 +259,8 @@ queueRedeem(shares)      shares move into ESCROW on the vault.
                          The owner's free balance is simply balanceOf; there is no separate lock.
                          Their USDG is settled first, so they keep everything already earned.
   debt[owner] += shares * accUsdgPerShare          the index these shares enter escrow at
-                                                   (summed if the owner queues again in the epoch)
+                                                   (summed if the owner queues again in the epoch;
+                                                   stored as quotient and remainder by 1e27, below)
 
 _settleQueue()           runs inside rollClose, AFTER the harvest, or from the permissionless
                          settleQueue() while Idle, AFTER a harvest checkpoint (below).
@@ -243,8 +277,9 @@ _settleQueue()           runs inside rollClose, AFTER the harvest, or from the p
 completeRedeem(to)       settles the owner's entry out of their epoch (below) and pays it.
 ```
 
-`debt` is the private `_queueAccDebt`, `epochIndex` the private `_epochAccUsdgPerShare`. Neither is
-in the public ABI.
+`debt` is the private `_queueAccDebt`, an `AccDebt {usdg, rem}` pair with `debt == usdg × 1e27 +
+rem` and `rem < 1e27`; `epochIndex` the private `_epochAccUsdgPerShare`. Neither is in the public
+ABI.
 
 ### Settling while flat: `settleQueue()`
 
@@ -323,6 +358,18 @@ claims just before it): the `_takeAccrued` clamp to `_usdgAvailableForHolders()`
 settlement (the pot is smaller); a residual left in the escrow's accrual by that clamp at an earlier
 settlement (larger); and the accrual of shares transferred straight to the vault address, which
 have no debt entry (larger).
+
+**The product is never formed in 256 bits (AF-05 follow-up).** `shares × epochIndex` is split by
+`Math.mulDiv` and `mulmod` into `a × 1e27 + b`; the debt is stored split the same way, `q × 1e27 +
+r` (`_addQueueDebt` carries `r` into `q` when it wraps past 1e27); and the entry's floor is exactly
+`a − q`, less one when `b < r`, since the difference is `(a − q) × 1e27 + (b − r)` with `|b − r| <
+1e27`. `shares × epochIndex >= debt` always holds (the debt sums `shares_j × index_j` with every
+`index_j <= epochIndex`), so the subtraction cannot underflow. `Distributor._pending` uses
+`Math.mulDiv` for `balance × Δindex / 1e27` for the same reason. Every figure in this section is
+unchanged to the base unit; what changed is that no share count times the 1e27-scaled index can
+revert a settle, a transfer or a payout, whatever the supply and the index have done since the entry
+was made (`test_queueMaths_doNotNeedShareTimesIndexToFit256Bits`, with the index planted at 2^250).
+The share-price floor (§3) keeps a real vault far from that bound in the first place.
 
 ### Zero dust, by construction
 
@@ -630,10 +677,12 @@ contracts (under write on fill, also everything the vault ever wrote); `armedOpt
    (usdg.balanceOf(feeRecipient) + pendingFeeUsdg) * 10_000  <=  premiumToVault * protocolFeeBps
    (premiumToVault is a ghost measured as the vault's USDG balance change on every successful fill)
 
-9. the deposit gate tracks the reserve                 invariant_depositGateTracksTheReserve
+9. the deposit gate tracks the reserve and the floor   invariant_depositGateTracksTheReserve
    asset.balanceOf(vault) < reservedAssets  =>  maxDeposit() == 0 && maxMint() == 0
    isStranded()                             =>  maxDeposit() == 0 && maxMint() == 0
+   totalSupply() > totalAssets() * 1e6      =>  maxDeposit() == 0 && maxMint() == 0
    maxDeposit() != 0  =>  balance >= reservedAssets, phase in {Idle, Listed}, !isStranded(),
+                          totalSupply() <= totalAssets() * 1e6,
                           maxDeposit() == depositCap - totalAssets()
 
 10. stranded-claim shares are conserved                invariant_strandSharesAreConserved

@@ -92,6 +92,14 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     uint32 internal constant MIN_PRICE_AGE = 1 hours;
     uint32 internal constant MAX_PRICE_AGE_CEIL = 7 days;
 
+    /// @dev The share-price floor: the vault sells no new share while `totalSupply() >
+    ///      totalAssets() * MAX_SHARES_PER_ASSET`, i.e. while one share is worth less than 1e-6
+    ///      asset base units. Compiled in, not governable. See {_depositRefused} reason 6 for why
+    ///      it exists; the constant is sized so that with the whole Stock Token supply in the vault
+    ///      (NVDA: about 7.7e22 base units) the share supply stays under about 7.7e28, and a share
+    ///      count times the 1e27-scaled USDG index stays around 1e56, far inside uint256.
+    uint256 internal constant MAX_SHARES_PER_ASSET = 1e6;
+
     // The bounds on an option type's window (exercise at least 1 hour out, a window of at least
     // 1 day, a tenor of at most 21 days) are compiled into {ValoremLib}, next to the arm gate
     // that enforces them.
@@ -198,7 +206,19 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      deposited (indexing the premium) and queued could take most of it on purpose. Each entry
     ///      now receives exactly `shares * epochIndex - debt`, the index growth its own shares sat
     ///      through in escrow.
-    mapping(address => uint256) private _queueAccDebt;
+    ///
+    ///      HOW IT IS STORED. Not as the raw product: the debt is kept as its quotient and remainder
+    ///      by ACC_PRECISION, `debt == usdg * ACC_PRECISION + rem` with `rem < ACC_PRECISION`, each
+    ///      entry's product split the same way by `Math.mulDiv` and `mulmod` (AF-05 follow-up). The
+    ///      figure an entry is paid is unchanged to the base unit (see {_entryUsdg}), but no step
+    ///      ever needs `shares * accUsdgPerShare` to fit in 256 bits, so an account that queued can
+    ///      always settle whatever the supply and the index have done since.
+    struct AccDebt {
+        uint256 usdg;
+        uint256 rem;
+    }
+
+    mapping(address => AccDebt) private _queueAccDebt;
 
     /// @dev `accUsdgPerShare` at the moment each epoch settled.
     mapping(uint256 => uint256) private _epochAccUsdgPerShare;
@@ -588,12 +608,33 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///         out to earlier settled redeemers (AUDIT-FINDINGS F-05). Deposits reopen once the
     ///         reserve is collected (with its pro-rata haircut, {_payoutOwed}) or refilled by
     ///         returning collateral.
+    ///      6. THE SHARE PRICE IS BELOW THE FLOOR. `totalSupply() > totalAssets() *
+    ///         MAX_SHARES_PER_ASSET`: a share is worth less than 1e-6 asset base units. Only a
+    ///         book that has lost (nearly) everything with its shares still outstanding reads like
+    ///         this: full assignment of all it sold plus an issuer burn, or a burn that took the
+    ///         whole idle balance (AF-05 follow-up). Two reasons, both compiled in:
+    ///         - A DEAD BOOK MUST NOT SELL NEW SHARES AT NOTHING. With `totalAssets()` at a few
+    ///           wei and the supply intact, `previewDeposit` mints `assets * (supply + 1) /
+    ///           (assets + 1)` shares, up to ~1e18 per wei deposited: the newcomer is sold the
+    ///           book for its dust and every existing holder's share of anything that later
+    ///           returns (a stranded claim, an issuer restoring tokens) goes to the newcomer.
+    ///         - THE OVERFLOW BOUND. Two such deposits put the supply near 1e58, and
+    ///           `shares * accUsdgPerShare` (ACC_PRECISION 1e27) in the queue's per-entry maths
+    ///           passes uint256; a queued account then panics in `queueRedeem` and
+    ///           `completeRedeem` and can never settle. The queue maths no longer form that product
+    ///           ({_entryUsdg}, {_pending}), and this floor bounds the supply at 1e6 times the
+    ///           asset supply on top, so neither defence carries the whole weight.
+    ///         Deposits reopen the moment the book is worth at least one millionth of a base unit
+    ///         a share again (collateral returning, a redeemed stranded claim, or the shares
+    ///         redeeming out); nothing here needs governance. A fresh vault (`totalSupply() == 0`)
+    ///         is not below the floor.
     function _depositRefused() private view returns (bool) {
         Phase p = phase;
         if (p != Phase.Idle && p != Phase.Listed) return true;
         if (p == Phase.Listed && block.timestamp >= cycleExerciseTs) return true;
         if (claimKey != 0 && (p == Phase.Idle || claimedExerciseProceeds() != 0)) return true;
-        return asset.balanceOf(address(this)) < reservedAssets;
+        if (asset.balanceOf(address(this)) < reservedAssets) return true;
+        return totalSupply() > totalAssets() * MAX_SHARES_PER_ASSET;
     }
 
     /// @notice Shares mintable right now, mirroring {maxDeposit}.
@@ -768,9 +809,11 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         queuedShares += shares;
 
         // Settle before escrowing so the depositor keeps every cent already earned, and record the
-        // index these shares enter escrow at: they earn only what is indexed from here on.
+        // index these shares enter escrow at: they earn only what is indexed from here on. The debt
+        // `shares * accUsdgPerShare` is added as a quotient and a remainder by ACC_PRECISION so the
+        // product itself never has to fit in 256 bits ({AccDebt}).
         _settleAccount(msg.sender);
-        _queueAccDebt[msg.sender] += shares * accUsdgPerShare;
+        _addQueueDebt(msg.sender, shares, accUsdgPerShare);
         _transfer(msg.sender, address(this), shares);
 
         emit QueueRedeem(msg.sender, shares, queuedEpoch);
@@ -834,7 +877,7 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // strands a unit.
         uint256 assets = (ep.assetsRemaining * shares) / ep.sharesRemaining;
         uint256 usdgOut = _entryUsdg(owner, e, shares, ep);
-        _queueAccDebt[owner] = 0;
+        delete _queueAccDebt[owner];
 
         // An epoch that settled while a claim was stranded also owns a share of that claim. It is
         // drawn down like the assets, pro rata by shares with the last claimant taking the rest, and
@@ -1034,10 +1077,35 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      shares sat through in escrow, capped at what the epoch still holds. The last claimant
     ///      takes the remainder, which absorbs the floor rounding of every earlier entry and of the
     ///      escrow's own accrual.
+    ///
+    ///      The figure is `floor((shares * epochIndex - debt) / ACC_PRECISION)`, computed without
+    ///      ever forming either product in 256 bits. With `shares * epochIndex == a * P + b`
+    ///      (`a` by `Math.mulDiv`, `b` by `mulmod`, `b < P`) and `debt == q * P + r` ({AccDebt}),
+    ///      the difference is `(a - q) * P + (b - r)` with `|b - r| < P`, so the floor is exactly
+    ///      `a - q`, less one when `b < r`. `shares * epochIndex >= debt` always: the debt sums
+    ///      `shares_j * index_j` over the entries with `sum(shares_j) == shares` and every
+    ///      `index_j <= epochIndex` (the index is monotone and the epoch's is taken at settlement).
     function _entryUsdg(address owner, uint256 e, uint256 shares, Epoch storage ep) private view returns (uint256) {
         if (shares == ep.sharesRemaining) return ep.usdgRemaining;
-        uint256 earned = (shares * _epochAccUsdgPerShare[e] - _queueAccDebt[owner]) / ACC_PRECISION;
+        uint256 index = _epochAccUsdgPerShare[e];
+        AccDebt storage d = _queueAccDebt[owner];
+        uint256 earned = shares.mulDiv(index, ACC_PRECISION) - d.usdg;
+        if (mulmod(shares, index, ACC_PRECISION) < d.rem) earned -= 1;
         return earned < ep.usdgRemaining ? earned : ep.usdgRemaining;
+    }
+
+    /// @dev Add `shares * index` to `owner`'s reward debt as a quotient and remainder by
+    ///      ACC_PRECISION, carrying the remainder into the quotient when it wraps ({AccDebt}).
+    function _addQueueDebt(address owner, uint256 shares, uint256 index) private {
+        AccDebt storage d = _queueAccDebt[owner];
+        uint256 rem = d.rem + mulmod(shares, index, ACC_PRECISION);
+        uint256 carry;
+        if (rem >= ACC_PRECISION) {
+            rem -= ACC_PRECISION;
+            carry = 1;
+        }
+        d.usdg += shares.mulDiv(index, ACC_PRECISION) + carry;
+        d.rem = rem;
     }
 
     /*//////////////////////////////////////////////////////////////

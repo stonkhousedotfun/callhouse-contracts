@@ -112,7 +112,7 @@ forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-stora
 # forge verify-contract --verifier sourcify --chain 4663 $VALOREM_LIB src/lib/ValoremLib.sol:ValoremLib
 ```
 
-`--non-interactive` is required: the Vault runtime (25,470 B) is above EIP-170's 24,576 B, and
+`--non-interactive` is required: the Vault runtime (25,765 B) is above EIP-170's 24,576 B, and
 forge's broadcast step stops at a confirmation prompt for such a contract even though
 `foundry.toml` raises `code_size_limit` to chain 4663's real 98,304 B limit for the simulation. The
 flag only suppresses that prompt; the chain accepts the contract (README "Four things that will bite
@@ -265,7 +265,7 @@ returns the bytes, both checked by hand the same day.
 
 Found while re-running it after the redesign: (1) the script's create probe had `--rpc-url` after
 `--create`, which `cast` (1.3.5) rejects because `--create` is a subcommand, so the probe had never
-run; (2) `forge script --broadcast` stops at an interactive EIP-170 confirmation for the 25,470 B
+run; (2) `forge script --broadcast` stops at an interactive EIP-170 confirmation for the 25,765 B
 Vault whatever `code_size_limit` says, fatal on a non-terminal, hence `--non-interactive` in the
 script and in the A1/B1 commands above. The earlier record (commit `6ed528f`, pre-redesign, fork
 block 62212405, Verify 55/61/64/63) is superseded; its finding stands: without

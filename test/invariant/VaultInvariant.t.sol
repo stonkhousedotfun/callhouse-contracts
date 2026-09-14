@@ -1458,21 +1458,20 @@ contract VaultHandler is Test {
         return actors[seed % actors.length];
     }
 
+    /// @dev THE VAULT'S OWN GATE, AND NOTHING ELSE. `maxDeposit` is 0 exactly when `deposit` and `mint`
+    ///      would revert `DepositsClosed` ({Vault._depositRefused}: the phase, the exercise timestamp,
+    ///      unclaimed assignment proceeds, a stranded claim, an unbacked reserve, and the share-price
+    ///      floor). An earlier handler carried its own copy of the floor, because the vault had none:
+    ///      full assignment of everything sold plus an issuer burn left NAV at zero with the supply
+    ///      outstanding, a deposit then minted `assets x (supply + 1)` shares at one wei each, two of
+    ///      those put the supply near 1e58, and `shares x accUsdgPerShare` (1e27-scaled) overflowed in
+    ///      the queue's per-entry maths, so the handler stopped "where a UI would", at 1e-6 token a
+    ///      share, and the deterministic self-check pinned the vault accepting what the handler refused.
+    ///      The vault now refuses it too (`Vault.MAX_SHARES_PER_ASSET`, AF-05 follow-up), so the handler
+    ///      asks the vault, and {VaultInvariantTest.invariant_depositGateTracksTheReserve} holds the
+    ///      vault to the rule.
     function _canDeposit() internal view returns (bool) {
-        uint8 p = uint8(vault.phase());
-        if (p != 0 && p != 1) return false;
-        // A DEAD VAULT IS NOT DEPOSITED INTO. Full assignment of everything sold (which the third-party
-        // exerciser reaches routinely) plus an issuer burn can leave NAV at zero, or a few wei, with the
-        // whole supply still outstanding and `balance == reservedAssets` keeping the gate open. A deposit
-        // then mints `assets x (supply + 1)` shares at one wei each; two of those in a row put the supply
-        // near 1e58 and `shares x accUsdgPerShare` (1e27-scaled) past uint256 in the queue's per-entry
-        // maths, so `previewCompleteRedeem` panics for that owner. That is a numeric edge of a book that
-        // has lost everything, not a fill or settlement defect, and no front end would quote a deposit
-        // into it: the handler stops where a UI would, at a share price under 1e-6 token per share, and
-        // the edge is recorded in the stage report rather than papered over in the vault.
-        uint256 supply = vault.totalSupply();
-        if (supply != 0 && vault.totalAssets() * 1e6 < supply) return false;
-        return true;
+        return vault.maxDeposit(address(this)) != 0;
     }
 
     /// @dev Queued shares have already moved into escrow at the vault, so a holder's own
@@ -1606,6 +1605,11 @@ contract VaultInvariantTest is BaseTest {
     ///      productivity only when `attempted` reaches exactly this, so that a shrunk replay
     ///      cannot trip the vacuity gate instead of reporting the failure it was shrinking.
     uint256 internal constant DEPTH = 600;
+
+    /// @dev Mirror of `Vault.MAX_SHARES_PER_ASSET` (internal, compiled in): the vault sells no share
+    ///      while `totalSupply() > totalAssets() * SHARE_PRICE_FLOOR`, one share per 1e-6 base unit.
+    ///      The one number {invariant_depositGateTracksTheReserve} needs that the vault does not expose.
+    uint256 internal constant SHARE_PRICE_FLOOR = 1e6;
 
     VaultHandler internal handler;
 
@@ -1861,11 +1865,20 @@ contract VaultInvariantTest is BaseTest {
             assertEq(room, 0, "maxDeposit quoted room while a claim is stranded");
             assertEq(vault.maxMint(alice), 0, "maxMint quoted shares while a claim is stranded");
         }
+        // Nobody is sold a share worth less than 1e-6 asset base units: a book that has lost everything
+        // with its shares outstanding sells nothing until it is worth something again (AF-05 follow-up).
+        uint256 supply = vault.totalSupply();
+        uint256 nav = vault.totalAssets();
+        if (supply > nav * SHARE_PRICE_FLOOR) {
+            assertEq(room, 0, "maxDeposit quoted room below the share-price floor");
+            assertEq(vault.maxMint(alice), 0, "maxMint quoted shares below the share-price floor");
+        }
         if (room != 0) {
             assertGe(balance, vault.reservedAssets(), "deposits quoted open over an unbacked reserve");
             uint8 p = uint8(vault.phase());
             assertTrue(p == 0 || p == 1, "deposits quoted open outside Idle and Listed");
             assertFalse(vault.isStranded(), "deposits quoted open over a stranded claim");
+            assertLe(supply, nav * SHARE_PRICE_FLOOR, "deposits quoted open below the share-price floor");
             assertEq(room, vault.depositCap() - vault.totalAssets(), "maxDeposit is not cap minus NAV");
         }
     }
@@ -2516,19 +2529,24 @@ contract VaultInvariantTest is BaseTest {
         invariant_reservesAreReal();
         invariant_depositGateTracksTheReserve();
 
-        // alice collects: paid the haircut, reserve released in full, the vault's gate reopens.
+        // alice collects: paid the haircut, reserve released in full. The reserve gate is satisfied again
+        // (balance 0 >= reserved 0), but the burn took the whole book: alice's haircut payout drained
+        // the balance to zero while bob's shares are still outstanding, so the vault is a dead book at a
+        // share price of zero and the SHARE-PRICE FLOOR keeps deposits shut (AF-05 follow-up). Before
+        // the floor the vault would have sold carol the book at one wei a share and only the handler
+        // refused; now the vault refuses, and the handler skips because `maxDeposit` is 0.
         handler.completeRedeem(0);
         assertEq(handler.cHaircuts(), 1, "haircut redemption");
         assertEq(vault.reservedAssets(), 0, "reserve fully released");
-        assertGt(vault.maxDeposit(alice), 0, "deposits reopen once the reserve is collected");
-        // The burn took the whole book: alice's haircut payout drained the balance to zero while bob's
-        // shares are still outstanding, so the vault is a dead book at a share price of zero. The VAULT
-        // would accept carol's deposit (at one wei a share); the HANDLER refuses it, as a front end
-        // would, see `_canDeposit`. Pinned both ways so neither side drifts silently.
         assertEq(nvda.balanceOf(address(vault)), 0, "the book is empty");
         assertGt(vault.totalSupply(), 0, "with shares outstanding");
+        assertEq(vault.maxDeposit(alice), 0, "a dead book sells no new shares");
+        vm.prank(carol);
+        vm.expectRevert(Vault.DepositsClosed.selector);
+        vault.deposit(1e18, carol);
         handler.deposit(2, type(uint256).max);
         assertEq(handler.cDeposit(), 2, "the handler does not deposit into a dead book");
+        invariant_depositGateTracksTheReserve();
 
         assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
         invariant_assetConservation();
