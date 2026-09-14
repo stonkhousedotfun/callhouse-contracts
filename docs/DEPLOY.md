@@ -67,13 +67,12 @@ cast call 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0 "feesEnabled()(bool)" --rpc
 > rehearsal on this machine, also clear it: `rm -rf ~/.foundry/cache/rpc/4663`.
 
 Libraries are deployed through the deterministic CREATE2 factory (`0x4e59b44847b379578588920cA78FbF26c0B4956C`,
-present on 4663), so their addresses depend only on their bytecode, not on who deploys them. For this
-commit: SeaportOrderLib `0xAe4ba02cd5Ace94DA3bbd68f746DafaA66d013f2`, ValoremLib
-`0xb1E1aEF7cB829E0890e74eE324e6eEa437761626` (it changed with the 2026-09-13 lot-size fix). If they already exist (anyone may deploy them first), forge
-reuses them; `Verify.s.sol` checks their code byte for byte either way. For this commit (S4
-rehearsal, 2026-09-13): SeaportOrderLib `0x6B617a0B578Ef6EDCD07774468f08b3778272D8A`, ValoremLib
-`0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d`; the addresses quoted above are the pre-redesign ones and
-change with every library byte.
+present on 4663), so their addresses depend only on their bytecode, not on who deploys them, and they
+change with every library byte. For this commit (S4 rehearsal, 2026-09-13): SeaportOrderLib
+`0x6B617a0B578Ef6EDCD07774468f08b3778272D8A`, ValoremLib `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d`
+(the pre-redesign pair, SeaportOrderLib `0xAe4b…13f2` and ValoremLib `0xb1E1…1626`, is history). If
+they already exist (anyone may deploy them first), forge reuses them; `Verify.s.sol` checks their code
+byte for byte either way.
 
 ---
 
@@ -137,11 +136,11 @@ ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false \
   forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
 ```
 
-Every line `ok`, ending `VERIFY PASSED` (55 checks in the rehearsal). What it covers:
+Every line `ok`, ending `VERIFY PASSED` (63 checks in the rehearsal). What it covers:
 
 - chain id; vault and both libraries **byte for byte** against `out/`, with only link sites (each
   checked to hold the right library; how many there are is read from the artifact's `linkReferences`,
-  7 at this commit, never hard-coded), immutables (each checked by value) and a library's own address
+  8 at this commit, never hard-coded), immutables (each checked by value) and a library's own address
   word masked — this is what proves the compiled-in hard caps and all logic are this commit's;
 - every immutable: asset, USDG, clearinghouse, Seaport, price feed, zero conduit key, **the zone is
   the vault itself**, the ERC-1155 approval target and the approval itself on Valorem, the Seaport
@@ -163,8 +162,8 @@ ADMIN_PK=$DEPLOYER_PK forge script script/Configure.s.sol --rpc-url $RH_RPC --br
 ADMIN_PHASE=bootstrap forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
 ```
 
-`VERIFY PASSED` (61 checks with `SAFE_ADMIN` exported, which adds the Safe's own checks). The vault is
-now operable: the keeper can open a cycle.
+`VERIFY PASSED` (69 checks in the rehearsal; exporting `SAFE_ADMIN` adds the Safe's own checks). The
+vault is now operable: the keeper can arm a cycle.
 
 ### A4. Hand over to the Safe (when scheduled)
 
@@ -188,7 +187,7 @@ ADMIN_PHASE=safe forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage
 
 Renounce refuses until the Safe's nonce has moved past `GRANT_NONCE`, so the key is never dropped
 before the Safe has executed a transaction as admin. After it, `VERIFY PASSED` in the safe phase
-(64 checks in the rehearsal, with `EXPECT_SAFE_OWNER_SET` pinning the three owners): the Safe holds
+(72 checks in the rehearsal, with `EXPECT_SAFE_OWNER_SET` pinning the three owners): the Safe holds
 admin, the deployer holds nothing. From here every admin action is a Safe transaction.
 
 ---
