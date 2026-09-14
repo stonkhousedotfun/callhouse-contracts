@@ -211,7 +211,7 @@ contract VaultSecurityTest is BaseTest {
         _fill(c, 10);
 
         // The stablecoin issuer blocklists our fee Safe.
-        usdg.setBlocked(feeSafe, true);
+        usdg.freeze(feeSafe);
 
         _warpToExercise();
         vault.lockBook();
@@ -241,7 +241,7 @@ contract VaultSecurityTest is BaseTest {
 
         // Once the block lifts, anyone can push it through. It always goes to the stored
         // recipient, never to the caller.
-        usdg.setBlocked(feeSafe, false);
+        usdg.unfreeze(feeSafe);
         vm.prank(carol);
         uint256 paid = vault.sweepFee();
         assertEq(paid, 950_000);
@@ -262,7 +262,7 @@ contract VaultSecurityTest is BaseTest {
     ///      upgradeability, that would have ended the product's ability to write, permanently.
     function test_medium_acceptedValoremFeeActuallyLetsTheVaultWrite() public {
         _deposit(alice, 20e18);
-        clear.setFeesEnabled(true);
+        mockClear.setFeesEnabled(true);
 
         uint256 optionId = optionIds[RUNG_PICK];
 

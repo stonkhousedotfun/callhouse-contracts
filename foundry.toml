@@ -10,10 +10,19 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 bytecode_hash = "none"
+# Robinhood Chain 4663 (and testnet 46630) enforce a 98,304 B contract code limit, NOT EIP-170's
+# 24,576 B: proven with create probes (98,304 B deploys, 98,305 B fails `max code size exceeded`).
+# The only hard limit for the Vault is therefore 98,304 B; forge's 24,576 B "sizes" warnings are
+# noise on this chain. Rehearsals must start anvil with `--code-size-limit 98304` to match.
+code_size_limit = 98304
 ffi = false
 fs_permissions = [
     { access = "read", path = "./out" },
     { access = "read", path = "../ops" },
+    # Vendored runtimes: real Valorem Clear (6436c82) artifact and the Seaport 1.6 / ConduitController
+    # runtime bytecode read from chain 4663. Tests etch or deployCode them; nothing under out/ is
+    # relied on for third-party code.
+    { access = "read", path = "./test/fixtures" },
     # script/Configure.s.sol writes the Safe Transaction Builder batch here (gitignored)
     { access = "read-write", path = "./broadcast" },
 ]

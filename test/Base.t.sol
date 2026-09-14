@@ -51,7 +51,13 @@ abstract contract BaseTest is Test {
 
     MockStockToken internal nvda;
     MockERC20 internal usdg;
-    MockClear internal clear;
+    /// @dev The clearinghouse the vault is wired to. {MockClear} by default; a suite that needs the
+    ///      real Valorem bytecode overrides {_deployClear} (see test/helpers/RealClearBase.sol) and
+    ///      every helper below keeps working because none of them needs a mock-only function.
+    IValoremClear internal clear;
+    /// @dev The same address as {clear} when the mock is in use, typed for the mock-only test
+    ///      helpers (`setFeesEnabled`, `setFeeBps`, bucket views). Zero under the real bytecode.
+    MockClear internal mockClear;
     MockRegistry internal registry;
     MockSeaport internal seaport;
     MockFeed internal feed;
@@ -89,10 +95,17 @@ abstract contract BaseTest is Test {
 
         nvda = new MockStockToken("NVDA Stock Token", "NVDAx");
         usdg = new MockERC20("Global Dollar", "USDG", 6);
-        clear = new MockClear();
+        clear = _deployClear();
         registry = new MockRegistry(address(nvda), address(usdg), address(clear));
         seaport = new MockSeaport();
         feed = new MockFeed(8, SPOT_FEED, "NVDA / USD");
+
+        // Fund BEFORE creating option types: Valorem's `newOptionType` (real and mock alike) requires
+        // `totalSupply(underlying) >= underlyingAmount` and `totalSupply(exercise) >= exerciseAmount`.
+        _fund(alice, 30e18, 0);
+        _fund(bob, 30e18, 0);
+        _fund(carol, 30e18, 0);
+        _fund(buyer, 0, 5_000_000_000); // $5,000 USDG
 
         exerciseTs = uint40(block.timestamp + 6 days);
         expiryTs = uint40(block.timestamp + 7 days);
@@ -123,16 +136,18 @@ abstract contract BaseTest is Test {
         vault.grantRole(vault.KEEPER_ROLE(), keeper);
         vault.grantRole(vault.GUARDIAN_ROLE(), guardian);
         vm.stopPrank();
-
-        _fund(alice, 30e18, 0);
-        _fund(bob, 30e18, 0);
-        _fund(carol, 30e18, 0);
-        _fund(buyer, 0, 5_000_000_000); // $5,000 USDG
     }
 
     /*//////////////////////////////////////////////////////////////
                                 HELPERS
     //////////////////////////////////////////////////////////////*/
+
+    /// @dev The clearinghouse to wire the vault to. The default is the bucket-faithful {MockClear};
+    ///      override to return the real Valorem bytecode (test/helpers/RealClearBase.sol).
+    function _deployClear() internal virtual returns (IValoremClear) {
+        mockClear = new MockClear();
+        return IValoremClear(address(mockClear));
+    }
 
     /// @dev Create the five Valorem option types and register them as this week's cycle.
     function _installCycle() internal {

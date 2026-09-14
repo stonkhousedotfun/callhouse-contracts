@@ -206,7 +206,7 @@ contract VaultTrancheTest is BaseTest {
 
     function test_writeMore_honoursTheValoremFeeSwitch() public {
         _open();
-        clear.setFeesEnabled(true);
+        mockClear.setFeesEnabled(true);
         _rejectWriteMore(4, abi.encodeWithSelector(Vault.ValoremFeeNotAccepted.selector, uint8(15)));
 
         vm.prank(admin);

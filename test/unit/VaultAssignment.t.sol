@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseTest} from "../Base.t.sol";
 import {Policy, PolicyParams} from "../../src/Policy.sol";
-import {MockClear} from "../../src/mocks/MockClear.sol";
+import {IValoremClear} from "../../src/interfaces/IValoremClear.sol";
 import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 
 /// @notice Exercise, assignment and every in-the-money settlement path (tasks F-05, F-06).
@@ -657,16 +657,17 @@ contract VaultAssignmentTest is BaseTest {
 
         assertEq(clear.balanceOf(buyer, oid), 10, "buyer genuinely owns them");
 
+        bytes memory tooEarly = abi.encodeWithSelector(IValoremClear.ExerciseTooEarly.selector, oid, exerciseTs);
         vm.startPrank(buyer);
         usdg.approve(address(clear), type(uint256).max);
-        vm.expectRevert(MockClear.TooEarlyToExercise.selector);
+        vm.expectRevert(tooEarly);
         clear.exercise(oid, 10);
         vm.stopPrank();
 
         // Still refused one second before the window opens.
         vm.warp(uint256(exerciseTs) - 1);
         vm.prank(buyer);
-        vm.expectRevert(MockClear.TooEarlyToExercise.selector);
+        vm.expectRevert(tooEarly);
         clear.exercise(oid, 10);
         assertEq(vault.contractsAssigned(), 0, "nothing slipped through");
 
@@ -678,8 +679,9 @@ contract VaultAssignmentTest is BaseTest {
         // And shut again at expiry, with six contracts still live in the buyer's hands.
         assertEq(clear.balanceOf(buyer, oid), 6, "six unexercised options remain");
         _warpToExpiry();
+        bytes memory expired = abi.encodeWithSelector(IValoremClear.ExpiredOption.selector, oid, expiryTs);
         vm.prank(buyer);
-        vm.expectRevert(MockClear.Expired.selector);
+        vm.expectRevert(expired);
         clear.exercise(oid, 6);
         assertEq(vault.contractsAssigned(), 4, "the late exercise changed nothing");
 

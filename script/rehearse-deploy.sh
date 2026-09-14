@@ -2,8 +2,12 @@
 # -------------------------------------------------------------------------------------------------
 # Deploy rehearsal on an anvil fork of chain 4663: real Safes, real scripts, real library linking.
 #
-#   anvil --fork-url https://rpc.mainnet.chain.robinhood.com --chain-id 4663 --port 8545
+#   anvil --fork-url https://rpc.mainnet.chain.robinhood.com --chain-id 4663 --port 8545 --code-size-limit 98304
 #   script/rehearse-deploy.sh            # from the repository root, in a second shell
+#
+# `--code-size-limit 98304` is REQUIRED: chain 4663 enforces a 98,304 B contract code limit (verified with
+# create probes; 98,305 B fails `max code size exceeded`), not EIP-170's 24,576 B. A default anvil would
+# refuse the Vault at 24,577 B and make the rehearsal fail for a reason mainnet does not have.
 #
 # PATH A — the launch plan for now (docs/DEPLOY.md "bootstrap"): the deployer key is the admin.
 #   A1  Deploy with ADMIN = deployer. Verify (bootstrap, unconfigured).

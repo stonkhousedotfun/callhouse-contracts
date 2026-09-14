@@ -82,6 +82,64 @@ struct Order {
 }
 
 /*//////////////////////////////////////////////////////////////
+                        SEAPORT 1.6 ZONE HOOKS
+//////////////////////////////////////////////////////////////*/
+
+/// @dev An offer item after the fill fraction and any criteria have been applied.
+struct SpentItem {
+    ItemType itemType;
+    address token;
+    uint256 identifier;
+    uint256 amount;
+}
+
+/// @dev A consideration item after the fill fraction has been applied, with its recipient.
+struct ReceivedItem {
+    ItemType itemType;
+    address token;
+    uint256 identifier;
+    uint256 amount;
+    address payable recipient;
+}
+
+/// @dev What Seaport 1.6 hands a zone on a restricted order (orderType FULL_RESTRICTED or
+///      PARTIAL_RESTRICTED, caller != zone).
+///
+///      VERIFIED 1.6 SEMANTICS (integrations/seaport.md). `authorizeOrder` runs BEFORE any token
+///      transfer and before the order-status update, on every fulfilment path (basic, advanced,
+///      available, match). `validateOrder` runs AFTER all transfers. In the combined paths every
+///      `authorizeOrder` (for every order) runs before any transfer, and `orderHashes` is truncated to
+///      the orders before this one in `authorizeOrder` and complete in `validateOrder`. `fulfiller` is
+///      `msg.sender`, not the recipient. `offer` / `consideration` carry the AUTHORISED amounts, not
+///      measured transfers, so a post-fill invariant must read balances itself. `extraData` is
+///      fulfiller-supplied and untrusted. If `authorizeOrder` reverts inside `fulfillAvailable*` the
+///      order is skipped and its state changes roll back; if it succeeded and the status update then
+///      fails, Seaport reverts the whole transaction rather than skipping.
+struct ZoneParameters {
+    bytes32 orderHash;
+    address fulfiller;
+    address offerer;
+    SpentItem[] offer;
+    ReceivedItem[] consideration;
+    bytes extraData;
+    bytes32[] orderHashes;
+    uint256 startTime;
+    uint256 endTime;
+    bytes32 zoneHash;
+}
+
+/// @notice The Seaport 1.6 zone interface. Each hook must return its own selector to approve.
+interface IZone {
+    /// @notice Called by Seaport before any transfer of a restricted order. Returning anything
+    ///         other than `authorizeOrder.selector` (or reverting) refuses the fill.
+    function authorizeOrder(ZoneParameters calldata zoneParameters) external returns (bytes4 authorizeOrderMagicValue);
+
+    /// @notice Called by Seaport after all transfers of a restricted order. Returning anything
+    ///         other than `validateOrder.selector` (or reverting) reverts the fill.
+    function validateOrder(ZoneParameters calldata zoneParameters) external returns (bytes4 validateOrderMagicValue);
+}
+
+/*//////////////////////////////////////////////////////////////
                            INTERFACE
 //////////////////////////////////////////////////////////////*/
 

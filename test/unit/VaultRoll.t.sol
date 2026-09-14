@@ -465,7 +465,7 @@ contract VaultRollTest is BaseTest {
         _deposit(alice, 20e18);
         uint256 id = optionIds[RUNG_PICK];
 
-        clear.setFeesEnabled(true);
+        mockClear.setFeesEnabled(true);
         assertFalse(vault.valoremFeeAccepted());
 
         vm.prank(keeper);
@@ -473,7 +473,7 @@ contract VaultRollTest is BaseTest {
         vault.rollOpen(id, 5);
 
         // With the fee back off the same write goes through untouched.
-        clear.setFeesEnabled(false);
+        mockClear.setFeesEnabled(false);
         vm.prank(keeper);
         vault.rollOpen(id, 5);
         assertEq(vault.contractsWritten(), 5);
@@ -492,7 +492,7 @@ contract VaultRollTest is BaseTest {
         _deposit(alice, 20e18);
         uint256 id = optionIds[RUNG_PICK];
 
-        clear.setFeesEnabled(true);
+        mockClear.setFeesEnabled(true);
         vm.prank(admin);
         vault.acceptValoremFee(true);
         assertTrue(vault.valoremFeeAccepted(), "governance has accepted the fee");
@@ -552,10 +552,10 @@ contract VaultRollTest is BaseTest {
         _deposit(alice, 20e18);
         uint256 id = optionIds[RUNG_PICK];
 
-        nvda.setFrozen(true);
+        nvda.pause();
 
         vm.prank(keeper);
-        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.rollOpen(id, 5);
 
         assertEq(_phase(), 0, "still Idle, no half-open cycle");
@@ -563,7 +563,7 @@ contract VaultRollTest is BaseTest {
         assertEq(vault.contractsWritten(), 0);
         assertEq(nvda.balanceOf(address(vault)), 20e18, "collateral never left");
 
-        nvda.setFrozen(false);
+        nvda.unpause();
         vm.prank(keeper);
         vault.rollOpen(id, 5);
         assertEq(_phase(), 1, "writing resumes when the freeze lifts");

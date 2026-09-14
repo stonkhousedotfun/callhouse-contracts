@@ -663,7 +663,7 @@ contract VaultQueueTest is BaseTest {
         (uint256 owedA,) = vault.previewCompleteRedeem(alice);
         assertGt(owedA, 0, "alice has an uncollected epoch");
 
-        nvda.setFrozen(true);
+        nvda.pause();
 
         // A holder with no settled slot was never affected.
         _queue(bob, 5e18);
@@ -679,11 +679,11 @@ contract VaultQueueTest is BaseTest {
         // Collecting is the one leg a freeze can stop, which is the honest failure: the tokens
         // genuinely cannot move. It costs her nothing else.
         vm.prank(alice);
-        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.completeRedeem(alice);
 
         // Once the issuer lifts the freeze she collects exactly what was parked.
-        nvda.setFrozen(false);
+        nvda.unpause();
         vm.prank(alice);
         (uint256 got,) = vault.completeRedeem(alice);
         assertEq(got, owedA, "collected in full after the freeze lifted");
@@ -1440,14 +1440,14 @@ contract VaultQueueTest is BaseTest {
     function test_settleQueue_worksUnderAnIssuerFreeze() public {
         _deposit(alice, 10e18);
         _queue(alice, 4e18);
-        nvda.setFrozen(true);
+        nvda.pause();
 
         vault.settleQueue();
         vm.prank(alice);
-        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.completeRedeem(alice);
 
-        nvda.setFrozen(false);
+        nvda.unpause();
         (uint256 assets,) = _complete(alice);
         assertEq(assets, 4e18, "paid once the freeze lifts");
     }

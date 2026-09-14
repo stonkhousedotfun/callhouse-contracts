@@ -589,7 +589,7 @@ contract VaultAdminTest is BaseTest {
         _deposit(alice, 20e18);
         uint256 optionId = optionIds[RUNG_PICK];
 
-        clear.setFeesEnabled(true);
+        mockClear.setFeesEnabled(true);
 
         // Unaccepted: the vault-level gate refuses, and it names the fee it refused over.
         vm.prank(keeper);
@@ -613,7 +613,7 @@ contract VaultAdminTest is BaseTest {
         _warpToExpiry();
         _rollClose();
         _nextCycle();
-        clear.setFeesEnabled(false);
+        mockClear.setFeesEnabled(false);
         vm.prank(admin);
         vault.acceptValoremFee(false);
         vm.prank(keeper);
@@ -632,8 +632,8 @@ contract VaultAdminTest is BaseTest {
         vault.acceptValoremFee(false);
         assertFalse(vault.valoremFeeAccepted());
 
-        clear.setFeeBps(20);
-        clear.setFeesEnabled(true);
+        mockClear.setFeeBps(20);
+        mockClear.setFeesEnabled(true);
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(Vault.ValoremFeeNotAccepted.selector, uint8(20)));
@@ -786,23 +786,23 @@ contract VaultAdminTest is BaseTest {
         assertEq(aliceUsdg, 12_033_333, "alice's two thirds of the 18.05 net, floored");
         assertEq(bobUsdg, 6_016_666, "bob's third, floored");
 
-        nvda.setFrozen(true);
+        nvda.pause();
 
         // --- deposits fail, loudly, with the issuer's own error --------------------------
         vm.prank(carol);
         nvda.approve(address(vault), 5e18); // approvals are not transfers; still fine
         vm.prank(carol);
-        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.deposit(5e18, carol);
 
         // --- asset payouts fail ----------------------------------------------------------
         assertTrue(vault.canRedeemInstantly(), "the vault believes it is flat and Idle");
         vm.prank(alice);
-        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.redeem(1e18, alice, alice);
 
         vm.prank(bob);
-        vm.expectRevert(MockStockToken.IssuerFreeze.selector);
+        vm.expectRevert(MockStockToken.TokenPaused.selector);
         vault.withdraw(1e18, bob, bob);
 
         // --- USDG is a different token and keeps moving ----------------------------------
@@ -823,7 +823,7 @@ contract VaultAdminTest is BaseTest {
         assertEq(vault.totalAssets(), 30e18, "NAV still reads the frozen balance");
 
         // --- unfreeze and everything recovers, same numbers ------------------------------
-        nvda.setFrozen(false);
+        nvda.unpause();
 
         uint256 carolShares = _deposit(carol, 5e18);
         assertEq(carolShares, 5e18, "deposits work again");

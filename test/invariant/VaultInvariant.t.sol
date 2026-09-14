@@ -1124,7 +1124,18 @@ contract VaultInvariantTest is BaseTest {
         super.setUp();
 
         handler = new VaultHandler(
-            vault, nvda, usdg, clear, registry, seaport, feed, buyer, overcallFee, admin, guardian, [alice, bob, carol]
+            vault,
+            nvda,
+            usdg,
+            mockClear,
+            registry,
+            seaport,
+            feed,
+            buyer,
+            overcallFee,
+            admin,
+            guardian,
+            [alice, bob, carol]
         );
 
         // Hoisted: reading KEEPER_ROLE is itself an external call and would eat the prank.
