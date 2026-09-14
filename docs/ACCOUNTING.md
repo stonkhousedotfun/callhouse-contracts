@@ -58,7 +58,7 @@ and the strike proceeds went to the USDG ledger instead.
 | `assets`, `idleAssets()`, `lockedAssets()`, `reservedAssets` | asset base units, 18 dp | `1e18` = 1.0000 NVDA |
 | shares (`cNVDA`) | 18 dp | 1 share = 1 NVDA at launch |
 | `spotUsdg`, `strikeUsdg`, every premium | USDG base units, 6 dp | `226_000_000` = $226.00 |
-| `contracts` | whole lots | 1 contract covers exactly `lotSize` = `1e18` of asset; a write (`rollOpen` or `writeMore`) refuses a cycle with any other lot |
+| `contracts` | whole lots | 1 contract covers exactly `Policy.LOT` = `1e18` of asset; `rollOpen` refuses to arm a type with any other lot |
 | every `*Bps` | basis points | `300` = 3% |
 | `accUsdgPerShare` | USDG per share, scaled `1e27` | see §4 |
 
@@ -67,29 +67,32 @@ Valorem is the one place that breaks the pattern: `Claim.amountWritten` and
 divides them back down. Getting this wrong reports a 10-contract assignment as
 `10_000_000_000_000_000_000`.
 
-### Contracts across tranches
+### Contracts across fills (write on fill)
 
-A week can be written in more than one tranche: `rollOpen` opens the Valorem claim and
-`writeMore(n)` adds `n` contracts to that same claim while the vault is `Listed` and before
-`cycleExerciseTs`. There is still exactly one claim per week, so:
+Nothing is written at `rollOpen`: it ARMS an option type and snapshots its strike and window. Every
+Seaport fill of the cycle's listing writes exactly the filled contracts inside the vault's
+`authorizeOrder` hook, so a week is written in as many pieces as it has fills, all into ONE Valorem
+claim: the first fill opens it (`clear.write(optionId, k)`), every later fill tops it up
+(`clear.write(claimKey, k)`, refused unless the same id comes back). So:
 
-| Quantity | What it counts after tranches |
+| Quantity | What it counts |
 |---|---|
-| `contractsWritten` | the running total of every tranche written into this week's claim; zeroed by `rollClose` |
-| `CallsWritten(optionId, claimKey, contractsCount, collateral)` | **one tranche**: that write's count and that write's collateral, never the running total. Sum them per `claimKey` |
-| `RollOpen.contractsCount` | the opening tranche only. The week's size is `contractsWritten`, or the sum of its `CallsWritten` |
-| `lockedAssets()`, `claimedExerciseProceeds()`, `contractsAssigned()` | read `clear.position(claimKey)` / `clear.claim(claimKey)`, which upstream sums over every claim index (one per bucket written into), so they already cover every tranche |
-| `contractsRemaining()`, `contractsSold()` | live `clear.balanceOf(vault, optionId)` against `contractsWritten`; a tranche raises both the balance and the total |
+| `contractsWritten` | the running total of every fill this week, which is also the number SOLD; zeroed by `rollClose` |
+| `CallsWritten(optionId, claimKey, contractsCount, collateral)` | **one fill**: that fill's count and that fill's collateral, never the running total. Sum them per `claimKey` |
+| `RollOpen.contractsCount` | always 0. The week's size is `contractsWritten`, or the sum of its `CallsWritten` |
+| `lockedAssets()`, `claimedExerciseProceeds()`, `contractsAssigned()` | read `clear.position(claimKey)` / `clear.claim(claimKey)`, which upstream sums over every claim index (one per bucket written into), so they already cover every fill |
+| `clear.balanceOf(vault, optionId)` | always 0 outside a fill. There is no `contractsRemaining`/`contractsSold` pair any more: sold IS written |
 
-Sizing is on the total: a write passes only if `contractsWritten + n` is within
-`maxContractsCap` and within `maxUtilizationBps` of `idleAssets() + lockedAssets()`. Before the
-first write that is just idle, which is what `rollOpen` always measured; checking each tranche
-against idle alone would let repeated tranches creep towards 100%. A tranche moves asset from
-idle into Valorem one for one, so it never moves `totalAssets()` or the share price, except by the
-Valorem engine fee when governance has accepted it (15 bps of the tranche's notional, charged on
-every tranche as on the opening write).
+Sizing is on the total, at the fill: a fill of `k` passes only if `contractsWritten + k` is within
+`maxContractsCap` and within `maxUtilizationBps` of `totalAssets()` (idle plus locked, less
+reserved) at that moment. A fill moves asset from idle into Valorem one for one, so it never moves
+`totalAssets()` or the share price, except by the Valorem engine fee when governance has accepted
+it (15 bps of the fill's notional, charged on every fill, top-ups included, and valued at spot in
+the premium floor the fill must clear).
 
----
+`lockedAssets()` and `written × 1e18 − claim.amountExercised` can differ by a wei: upstream floors
+the underlying and the exercised WAD per claim index separately, and the dust stays in Clear
+(Zellic 2022 §4.1). The invariant suite allows exactly that wei.
 
 ## 3. The share price
 
@@ -191,12 +194,12 @@ this week's call. Stated plainly, because an earlier NatSpec on `deposit` said t
   and the share price falls for all holders, the late shares included; the strike proceeds are
   credited through the index to everyone holding shares at `rollClose`, the late holder included.
   There is no per-depositor tracking of whose collateral was written.
-- **Late money can be written against directly.** `writeMore` sizes on idle plus locked, so a
-  tranche written after the deposit can lock the depositor's own stock
-  (`test_writeMore_sizesOnTheTotalAndCountsLateDeposits`).
+- **Late money can be written against directly** (decision D9, A-6). Every fill sizes on
+  `totalAssets()` at that moment, so a fill after the deposit can lock the depositor's own stock
+  (`test_lateDepositorDuringListed_canBeWrittenAgainstByALaterFill`). The same holds for assets
+  behind shares queued after a fill: queued shares stay in supply and exposed until settlement.
 - **Premium already indexed is not theirs.** The checkpoint inside their deposit fixes every fill
-  before it into the index; fills after it are shared, including fills of tranches written before
-  they arrived.
+  before it into the index; fills after it are shared.
 - **They cannot leave instantly.** Until the week closes the only exit is the queue, which settles
   at `rollClose`.
 
@@ -407,16 +410,16 @@ redeemer neither dilutes nor is diluted by anyone else.
 
 ## 6. Fees
 
-Two fees stack, and both are on the premium only.
+One fee, on the premium only. There is no venue fee item: every listing has ONE consideration item,
+USDG to the vault, so gross and net premium are the same figure.
 
 | Fee | Rate | Mechanism | When |
 |---|---|---|---|
-| Overcall | 5% of gross premium | the second Seaport consideration item, in the same fill | only on a fill |
-| Callhouse | 5% of the premium that reaches the vault (`protocolFeeBps` 500; bytecode ceiling 2000) | `pendingFeeUsdg`, pushed best-effort at `rollClose` | only when harvested premium is positive |
+| Callhouse | 5% of the premium (`protocolFeeBps` 500; bytecode ceiling 2000) | `pendingFeeUsdg`, pushed best-effort at `rollClose` | only when harvested premium is positive |
+| Valorem engine fee (opt-in) | 15 bps of the fill's NOTIONAL in the asset, on top of the collateral, when Clear's switch is on and governance accepted it | pulled by `clear.write` inside the fill; the fill's premium floor is raised by fee × spot | only on a fill, only with the switch on |
 
-Stacked, that is 9.75% of gross premium: Overcall's 5% of gross, then 5% of the 95% that reaches
-the vault. No fee on deposits. No fee on idle collateral. **An unfilled week harvests zero and is
-therefore free** — `Policy.splitHarvest` returns `(0, 0)` on a zero amount.
+No fee on deposits. No fee on idle collateral. **An unfilled week harvests zero and is therefore
+free** — `Policy.splitHarvest` returns `(0, 0)` on a zero amount.
 
 ### Strike proceeds are credited fee-free
 
@@ -458,27 +461,16 @@ the push cannot revert the close: on failure the fee simply stays in `pendingFee
 caller, and it reverts rather than burn the fee while the recipient still cannot receive. See
 `test_medium_blockedFeeRecipientDoesNotFreezeTheVault`.
 
-### Overcall's rounding is load-bearing
+### One consideration item, an exact unit price
 
 ```
-feePerContract    = floor(unitPrice * 500 / 10_000)
-writerPerContract = unitPrice - feePerContract
-consideration[1]  = feePerContract    * contracts
-consideration[0]  = writerPerContract * contracts
+consideration[0] = unitPrice * contracts     (USDG, recipient = the vault)
 ```
 
-Round **per contract, then multiply**. Rounding on the total produces an order that signs, validates
-and then cannot be partially filled — Seaport rejects the fraction with `InexactFraction`. Since
-every Overcall listing is `PARTIAL_OPEN`, that silently makes the listing full-fill-only, and a
-listing a buyer's UI cannot fill is an unfilled week.
-
-Both the contract (`Policy.splitPremium`) and the keeper (`keeper/src/seaport.ts` (leekzor/callhouse)) implement this,
-and `SplitDiff.t.sol` is a differential test that keeps them in agreement.
-
-There is also a floor: a unit price below **20 USDG base units** floors the 5% to zero, and
-Overcall's schema rejects a zero-amount consideration item. `Policy.minListableUnitPrice()`.
-
----
+`approveListing` requires `gross % contracts == 0`: a partial fill pays `gross × k / amount`, Seaport
+rejects a fraction it cannot express exactly (`InexactFraction`), and the fill gate re-checks the
+premium floor per fill against `gross / amount × k`, so the per-contract price has to be an exact
+figure. A premium above the strike is refused as a fat finger (`UnitPriceExceedsStrike`).
 
 ## 7. The invariants
 
@@ -563,30 +555,39 @@ With `rollClose` passing 0 instead of the claim redemption to the harvest (the p
 rule, §6), invariant 8 failed with a counterexample that shrinks to seven calls: mint shares, roll open
 (3 contracts), approve a listing, fill, exercise 1, warp, roll close.
 
-**Tranches, flat settlement and stale-listing kills (2026-09-13 second pass).** The handler
-registered 20 actions after that pass (21 with `adminBurn`, above); the three new ones then were
-`writeMore`, `settleQueue` and `invalidateStaleListing`. No formula above changed: invariant 6's `lockedAssets() ==
-(contractsWritten − contractsAssigned()) × 1e18` holds with `contractsWritten` as the running total
-of a multi-tranche claim, and invariant 7 still requires `Idle ⇒ claimKey == 0`, which is why
-`settleQueue` may only run in `Idle`. What the new actions add is asserted inline on every
-successful call, not by a new `invariant_*` function:
+**Write on fill and the third-party writer (2026-09-13 redesign).** The handler arms with
+`rollOpen(optionId)` (writes nothing), lists up to capacity, and FILLS through the mock Seaport's
+1.6 hook order, which is where the vault writes; `writeMore` and `invalidateStaleListing` no longer
+exist. Two new actions play the F-01 adversary: `thirdPartyWrite` puts a stranger's contracts into
+the vault's bucket on the same option id, and `thirdPartyExercise` exercises them (warping into the
+window). Invariant 6's identity became `lockedAssets() == written × 1e18 − claim.amountExercised`
+(± 1 wei of per-index rounding), stated against Valorem's own WAD figure because the vault's share
+of a shared bucket is fractional, with `contractsAssigned() ≤ contractsWritten` alongside it. A
+tenth invariant, `invariant_vaultHoldsNoOptionTokens`, asserts after every call that
+`clear.balanceOf(vault, optionId) == 0` and that the vault holds its claim NFT. Asserted inline on
+every successful call:
 
 ```
-writeMore(n)             claimKey unchanged; contractsWritten == before + n; totalAssets() unchanged
+rollOpen(id)             contractsWritten == 0; claimKey == 0; cycleNumber == before + 1
+fill(k)                  contractsWritten == before + k; clear.balanceOf(vault, id) == 0;
+                         the claim is opened on the first fill and unchanged by every later one;
+                         premium in == unitPrice × k; totalAssets() unchanged
+thirdPartyWrite(n)       lockedAssets(), totalAssets() and the vault's option balance unchanged
+exercise / thirdPartyExercise
+                         totalAssignedOut += the drop in lockedAssets() (the vault's pro-rata share);
+                         claim.amountExercised <= claim.amountWritten == contractsWritten × 1e18
 settleQueue()            epoch.sharesRemaining == queuedShares before
                          epoch.assetsRemaining == q * (idleAssets() + 1) / (totalSupply + 1)   (before)
                          queuedShares == 0; asset.balanceOf(vault) unchanged
-invalidateStaleListing() called only when the handler's own arithmetic says the listing is stale;
-                         any revert fails the run
 ```
 
 The handler's `approveListing` keeps spot at or below the highest price whose band floor still
-admits the written strike (the vault now refuses a listing below it), and once three price cuts
-are spent it lifts its price to `lowestListedUnitUsdg` instead of skipping.
-`test_handlerReachesTranchesStaleKillsAndFlatSettlement` proves each of the three is reachable
-with no reverted call. The handler never sets the Valorem fee on, so the fee exception to
-"a tranche never moves `totalAssets()`" is covered by `test_writeMore_honoursTheValoremFeeSwitch`
-only.
+admits the armed strike, prices at or above the premium floor, and stops at three listings a
+cycle; `fill` re-stamps the feed at the same answer (a live feed keeps ticking) and caps the fill
+at the capacity the gate would admit. `test_handlerReachesTheThirdPartyBucketAndFlatSettlement`
+proves the adversary and the flat settlement are reachable with no reverted call. The handler
+never sets the Valorem fee on; the fee-on fill path is covered by `VaultWriteOnFill.t.sol` and
+`AF04_FeeSizing.t.sol`.
 
 The per-entry USDG split of §5 changes no formula above: an entry's `usdgOut` is still drawn out of
 `ep.usdgRemaining` and capped by it, so invariants 2 and 6 hold as written. None of the eight checks
@@ -598,12 +599,10 @@ deterministic tests and a fuzz over three entries around two tranches).
 
 ## 8. Worked example
 
-20 NVDA deposited. 10 contracts written at the $231 strike for $2.00 per contract.
+20 NVDA deposited. 10 contracts sold (and so written) at the $231 strike for $1.90 per contract.
 
 ```
-gross premium            20.000000 USDG   (2.00 x 10)
-  -> Overcall 5%          1.000000        consideration[1], paid in the fill
-  -> vault 95%           19.000000        consideration[0], paid in the fill
+premium                  19.000000 USDG   (1.90 x 10), the one consideration item, paid in the fill
 
 harvest at rollClose
   gross                  19.000000

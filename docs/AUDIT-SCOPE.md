@@ -1,5 +1,17 @@
 # Audit scope
 
+> **Status, 2026-09-13 (branch `redesign/s3-parallel`).** There is no external audit (owner decision
+> D14); this document is kept as the scope of the INTERNAL verification and the description of the
+> code for anyone reviewing it. The redesign of the same day replaced the write path: `rollOpen`
+> ARMS and writes nothing, every Seaport fill writes exactly its size inside the vault's own
+> `authorizeOrder` zone hook (write on fill, decision D1 A(ii)), the Overcall registry and fee item
+> are gone (decision D16), and `writeMore`, `invalidateStaleListing`, EIP-1271 and the price-cut
+> slots no longer exist. SECURITY.md §0 and README "Write on fill" describe the new path; the
+> regressions are `test/regression/AF01..AF05_*.t.sol`, `test/unit/VaultWriteOnFill.t.sol` and
+> `test/unit/VaultRealSeaport.t.sol`. **Every line number, size and count below that predates the
+> redesign is stale until this file's next full refresh**; the prose about the removed mechanisms
+> is history, not a description of the code.
+
 The document we hand to the external auditor (`tasks.md` (leekzor/callhouse) E-05; the engagement itself is E-06).
 It says what we want reviewed, what we do not, what we already believe is true of the code, and
 where we think it is weakest. Written 2026-09-12 against commit
@@ -131,23 +143,25 @@ optimisation. Review of the keeper, indexer or web code beyond the note in §4.
 Callhouse is one non-upgradeable vault on Robinhood Chain (chain id 4663) running a weekly
 covered-call strategy on one Robinhood Chain Stock Token, NVDA
 (`0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC`, 18 decimals, non-rebasing). Depositors put in the
-Stock Token and receive 18-decimal ERC-20 shares (`cNVDA`). Once a week the keeper calls
-`rollOpen`; the vault writes out-of-the-money calls on Valorem Clear against up to 95% of idle
-collateral and receives ERC-1155 option tokens plus a claim NFT. While the week is `Listed` and
-before its exercise timestamp the keeper may add further tranches to the same claim with
-`writeMore`, re-checked at live spot and sized on the week's total. The keeper then proposes a
-Seaport 1.6 order selling those option tokens for USDG; the vault checks every field of the
-order against its own state, records the order hash, calls `seaport.validate`, and answers
-EIP-1271 for exactly that hash. Buyers on Overcall's order book fill through Seaport: 95% of
-the premium lands in the vault, 5% goes to Overcall's fee address in the same fill. During the
-cycle's exercise window buyers may exercise inside Valorem; the vault sees this only by reading
-its claim position. After expiry `rollClose` (keeper first, anyone one hour later) redeems the
+Stock Token and receive 18-decimal ERC-20 shares (`cNVDA`). Once a week the keeper creates an
+out-of-the-money option type on Valorem Clear (`newOptionType` is permissionless) and calls
+`rollOpen(optionId)`; the vault validates the type from the clearinghouse (asset, USDG, lot 1e18,
+window and tenor bounds, band with both bounds, fee switch, oracle) and ARMS it, writing nothing.
+The keeper then proposes a `PARTIAL_RESTRICTED` Seaport 1.6 order with the vault as zone selling up
+to the vault's capacity for USDG in one consideration item; the vault checks every field of the
+order against its own state, records the order hash and calls `seaport.validate`, so an empty
+signature fills. On every fill Seaport calls the vault's `authorizeOrder` before any transfer: the
+hook re-runs the clock, fee, oracle, band floor, premium floor and size gates at live spot and
+writes exactly the filled contracts into Valorem (opening the cycle's claim on the first fill,
+topping it up afterwards); Seaport moves the freshly minted tokens to the buyer, and
+`validateOrder` reverts the fill unless the vault's option balance is back at its pre-fill
+baseline. The whole premium lands in the vault. During the cycle's exercise window buyers may
+exercise inside Valorem; the vault sees this only by reading its claim position. After expiry `rollClose` (keeper first, anyone one hour later) redeems the
 claim, harvests every unit of USDG that arrived (premium plus any strike proceeds), takes a
 protocol fee on the premium only (5% at launch, capped at 20% in bytecode; strike proceeds are
 excluded from the fee base), credits the rest to holders through a per-share index, and settles
 a batched redeem queue. A queue made while the vault is flat can also be settled by anyone with
-`settleQueue`, and anyone can kill a listing the policy would no longer authorise with
-`invalidateStaleListing`.
+`settleQueue`. A week with no fill has no claim: `rollClose` skips the redeem and returns to Idle.
 
 Two ledgers, kept apart on purpose (ACCOUNTING.md §1): the share price tracks only the raw
 Stock Token balance (idle minus reserved, plus collateral locked in Valorem). It never marks the
