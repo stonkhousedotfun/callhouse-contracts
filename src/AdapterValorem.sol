@@ -127,19 +127,31 @@ abstract contract AdapterValorem {
         emit CallsWritten(optionId_, key, n, collateral);
     }
 
-    /// @dev Redeems the cycle's claim after expiry and reports the exact balance deltas.
-    function _redeemClaim(IERC20 asset, IERC20 exerciseAsset)
+    /// @dev Tries to redeem the cycle's claim after expiry and reports the exact balance deltas.
+    ///
+    ///      ON FAILURE THE POSITION IS KEPT. `ok` is false when Valorem's `redeem` reverted (a USDG
+    ///      pause or freeze in an assigned week, a Stock Token blocklist of the vault in an
+    ///      unassigned one; see {ValoremLib.tryRedeemClaim}). `claimKey`, `optionId` and
+    ///      `contractsWritten` then stay exactly as they were: the claim is still the vault's, its
+    ///      collateral is still readable through {lockedAssets}, and the caller decides what a
+    ///      failed redeem means for the phase machine ({Vault.rollClose} strands the claim;
+    ///      {Vault.retryStrandedClaim} comes back here). Only a successful redeem clears the cycle's
+    ///      position and emits {ClaimRedeemed}.
+    ///
+    ///      Unsold option ERC-1155 may still sit in the vault; they are worthless after expiry and,
+    ///      critically, holding them does NOT block the claim redemption. Their collateral comes back
+    ///      through the claim.
+    /// @return ok True if the claim was redeemed and the position cleared.
+    function _tryRedeemClaim(IERC20 asset, IERC20 exerciseAsset)
         internal
-        returns (uint256 underlyingReturned, uint256 exerciseReceived)
+        returns (bool ok, uint256 underlyingReturned, uint256 exerciseReceived)
     {
         uint256 key = claimKey;
         if (key == 0) revert NoOpenClaim();
 
-        (underlyingReturned, exerciseReceived) = ValoremLib.redeemClaim(clear, asset, exerciseAsset, key);
+        (ok, underlyingReturned, exerciseReceived) = ValoremLib.tryRedeemClaim(clear, asset, exerciseAsset, key);
+        if (!ok) return (false, 0, 0);
 
-        // Clear the cycle's position. Unsold option ERC-1155 may still sit in the vault; they are
-        // worthless after expiry and, critically, holding them does NOT block the claim
-        // redemption. Their collateral already came back through the claim.
         claimKey = 0;
         optionId = 0;
         contractsWritten = 0;

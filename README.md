@@ -72,7 +72,7 @@ git clone --recurse-submodules git@github.com:leekzor/callhouse-contracts.git
 git submodule update --init --recursive
 
 forge fmt --check                                     # format gate
-forge build --sizes                                   # watch the EIP-170 margin
+forge build --sizes                                   # report sizes; the 98,304 B chain limit is the real one (see 1 below)
 rm -rf cache/invariant                                # after any behaviour change (see 4 below)
 forge test --no-match-path 'test/fork/*'              # unit + invariant, mocks only
 forge test --match-path 'test/unit/VaultQueue.t.sol'  # one suite
@@ -99,14 +99,16 @@ that is fixed CI proves nothing, and the gate is the four commands above run loc
 
 ## Four things that will bite you
 
-**1. `Vault` has about 1.7 KB of headroom** under the EIP-170 24,576-byte runtime limit (22,854 B
-used, 1,722 B margin, after the 2026-09-13 second-pass fixes moved the write gate, the spot read
-and the oracle-pause probe into `ValoremLib`; it was 23,618 B before them). via-IR is already on
-and BOTH `SeaportOrderLib` and `ValoremLib` are already extracted — the second extraction paid for
-the deposit-gate and cycle-window checks from the 2026-09-12 review, and the move into it paid for
-`writeMore`, `settleQueue` and `invalidateStaleListing`. Optimiser runs were measured from 1 to 200 and move the figure by under
-200 bytes, so if you run out of room the answer is another library extraction, not another
-setting.
+**1. `Vault` is over EIP-170's 24,576 B, and that is fine on this chain.** Robinhood Chain 4663
+(and testnet 46630) enforce a **98,304 B** contract code limit, proven with create probes on
+2026-09-13 (a 98,304 B deploy succeeds, 98,305 B fails `max code size exceeded`; a default anvil
+fails at 24,577). `foundry.toml` sets `code_size_limit = 98304` so tests and scripts deploy the
+real Vault, and `script/rehearse-deploy.sh` must start anvil with `--code-size-limit 98304`. The
+Vault runtime is 25,636 B after the AF-02 stranded-claim state machine (2026-09-13), so
+`forge build --sizes` prints a negative "margin" and exits 1: that exit code is forge measuring
+against EIP-170 and is ignored by the gate; the sizes it prints are still recorded in every stage
+report. Nothing is trimmed for bytes any more, and a chain whose limit really is 24,576 B is not a
+deployment target for this Vault without a library extraction.
 
 **2. The test tree is near solc's tag-space limit.** Each unit suite deploys the whole fixture and
 compiles to roughly 100–122 KB of deployed bytecode. With via-IR on, adding another fixture-heavy

@@ -392,6 +392,79 @@ The flush emits **`QueueEntrySettled`** (from both settle paths — the flush an
 `CompleteRedeem` only ever reports the payout. Off-chain readers must draw epochs down on the
 first event and reserves on the second; watching only `CompleteRedeem` misreads both.
 
+### A stranded claim (AUDIT-FINDINGS F-02)
+
+Valorem's `redeem` pushes the claim's strike USDG and then its unassigned NVDA to the vault in one
+call, each leg only if non-zero, and a revert on either leg reverts the redeem. Both tokens have an
+issuer who can make a leg revert at will: USDG paused, the vault or Clear frozen on USDG (Clear is the
+sender of the USDG leg), Clear's USDG burnt by a supply controller; the vault blocklisted on the Stock
+Token (the NVDA leg bites in every week that is not fully assigned). `rollClose` used to let that
+revert take it down, and it was the only exit from Listed/Exercisable, so a stablecoin action froze
+every idle unit of collateral and the whole queue for as long as it lasted.
+
+`rollClose` now reaches Idle either way. `ValoremLib.tryRedeemClaim` makes the redeem as a low-level
+call; on failure the claim, `optionId` and `contractsWritten` are all **kept**, and the vault is
+**stranded**: `isStranded() == phase == Idle && claimKey != 0`, the one state no other path can
+produce. A gas-starved call cannot fake the failure: with `gasleft() <= gasBefore / 63` after the
+inner call it reverts `RedeemOutOfGas` instead of stranding (EIP-150 leaves a starved callee's caller
+at most 1/64 of its gas, a genuine refusal far more).
+
+```
+rollClose (redeem fails)   strandGen += 1 ; strandedRemainingWad = 1e18 ; emit ClaimStranded
+                           harvest(0) ; _settleQueue() ; phase = Idle
+while stranded             deposits refused (DepositsClosed, maxDeposit == 0)
+                           instant redeem off (contractsWritten != 0 => !canRedeemInstantly)
+                           rollOpen reverts StillStranded (exactly one stranded claim at a time)
+                           lockedAssets() still reads the claim; NAV counts only live shares' part:
+                             totalAssets = max(balance + locked x strandedRemainingWad / 1e18 - reserved, 0)
+                           queueRedeem and settleQueue keep working on the IDLE balance
+_settleQueue (claimKey != 0)
+  payoutAsset = q x (idleAssets + 1) / (supply + 1)           the idle slice, as always
+  share       = strandedRemainingWad x q / supply              the escrow's part of the claim, WAD
+  strandedRemainingWad -= share
+  epochStrandWad[epochId] = share ; epochStrandGen[epochId] = strandGen ; emit EpochStrandShare
+_settleEpochEntry           mine = share x shares / ep.sharesRemaining  (last claimant takes the rest)
+                            staged as owedStrandWad[owner] / owedStrandGen[owner]; no token, no value yet
+retryStrandedClaim()        anyone, any time; reverts StillStranded until Valorem lets the redeem through
+  (a, b) = redeem           NVDA and USDG returned
+  queueWad = 1e18 - strandedRemainingWad
+  strands[gen] = {assetsIn a, usdgIn b, wadLeft queueWad,
+                  assetsLeft a x queueWad / 1e18, usdgLeft b x queueWad / 1e18}
+  reservedAssets += assetsLeft ; usdgReservedForQueue += usdgLeft ; usdgAccounted += usdgLeft
+  lastResolvedGen = gen ; emit StrandedClaimRecovered
+  _harvest(b - usdgLeft)    live shares' USDG goes through the index fee-free, as strike proceeds do;
+                            their NVDA is simply in the balance again, so NAV rises by it
+completeRedeem (later)      _materializeStrand(owner): the staged WAD becomes
+                              w == strands[gen].wadLeft ? (assetsLeft, usdgLeft)              the last owner
+                                                        : (assetsIn x w / 1e18, usdgIn x w / 1e18)  floors
+                            moved from the generation's *Left into owedAssets / owedQueueUsdg,
+                            emit StrandShareSettled, then paid by _payoutOwed as any other owed balance
+```
+
+**Generations.** Each stranding is a generation; `rollOpen` refuses to open over a stranded claim,
+so generations resolve strictly in order and an account never holds unresolved shares of two
+generations at once. When an entry of a newer generation is staged against an owner still holding a
+share of an older one, the older share is materialised first (`_stageStrandShare`); the preview folds
+in the same order and with the same rounding, so `previewCompleteRedeem` still quotes exactly what
+`completeRedeem` pays. A share whose generation is not yet redeemed is quoted as nothing, and a
+`completeRedeem` with nothing else to collect reverts `StillStranded` rather than `NothingQueued`.
+
+**Zero dust, by construction.** The epoch shares of a generation sum to exactly `1e18 −
+strandedRemainingWad`, the owner shares of an epoch sum to exactly the epoch's share, and the last
+owner of a generation takes exactly what its `*Left` still hold. The sum of the floors of the others
+is at most the generation's `*Left`, so the last slice is never short of its own floor. Nothing is
+left in `reservedAssets` or `usdgReservedForQueue` once every owner has collected; invariants 2 and 6
+state the reserves as equalities with the uncollected `*Left` on the right-hand side.
+
+**What changes for readers.** `RollClose` on a stranded close reports `assetsReturned == 0` and
+`usdgFromAssignment == 0`, immediately preceded by `ClaimStranded(cycleNumber, claimKey, gen)`; the
+claim's real proceeds arrive in the later `ClaimRedeemed` and `StrandedClaimRecovered`. The retry's
+`Harvest` is emitted under the stranded cycle's number, and it is where a protocol fee the stranded
+close could not push (USDG paused, vault frozen) finally leaves. `EpochStrandShare` is what a UI needs
+to show a queuer's pending claim share; `StrandShareSettled` is the strand analogue of
+`QueueEntrySettled` (books move, no token). Worked to the base unit in
+`test/regression/AF02_UsdgFreezeRollClose.t.sol`, on the mock and on the real Clear bytecode.
+
 ### Fairness
 
 Queued shares keep earning premium right up to settlement, and that accrual is paid out **with the
@@ -483,12 +556,16 @@ Overcall's schema rejects a zero-amount consideration item. `Policy.minListableU
 ## 7. The invariants
 
 Asserted after every call of the stateful suite, `test/invariant/VaultInvariant.t.sol` (64 runs ×
-600 calls in the default profile). There are **nine** `invariant_*` functions; USDG solvency is
+600 calls in the default profile). There are **ten** `invariant_*` functions; USDG solvency is
 split into an aggregate half and a per-holder half. Formulas below are what the code asserts, not a
 paraphrase of intent. `burned` and `burnReserveShortfall` are ghosts of the handler's `adminBurn`
 action (the issuer's bare `_burn`, at most two ordinary and two reserve-aimed burns a run, none
 before the run's first `rollClose`): the total destroyed, and the part of each burn that took the
 balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − balBefore, 0)`.
+`strandAssetsLeft` / `strandUsdgLeft` are `Σ strands[g].assetsLeft` / `Σ strands[g].usdgLeft` over
+every generation: the settled epochs' share of redeemed stranded claims their owners have not yet
+collected (§5). `navLocked` is `lockedAssets()`, or `lockedAssets() × strandedRemainingWad / 1e18`
+while a claim is stranded.
 
 ```
 1. asset conservation                                  invariant_assetConservation
@@ -500,7 +577,8 @@ balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − b
    usdgOwed() + usdgReservedForQueue + usdgDust + usdgUnallocated + pendingFeeUsdg
        <=  usdg.balanceOf(vault) + maxIndexRoundingDrift
    usdgAccounted <= usdg.balanceOf(vault)                                   (no allowance)
-   usdgReservedForQueue == sum(epoch.usdgRemaining) + sum(owedQueueUsdg)    (no allowance)
+   usdgReservedForQueue == sum(epoch.usdgRemaining) + sum(owedQueueUsdg) + strandUsdgLeft
+                                                                            (no allowance)
 
 3. USDG holder solvency (per holder)                   invariant_usdgHolderSolvency
    sum(claimableUsdg) + usdgReservedForQueue + usdgDust + usdgUnallocated + pendingFeeUsdg
@@ -515,9 +593,9 @@ balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − b
    totalSupply() > 0  =>  convertToAssets(totalSupply()) <= totalAssets()
    sum(convertToAssets(holder balance)) + min(reservedAssets, asset.balanceOf(vault))
        <=  asset.balanceOf(vault) + lockedAssets()
-   totalAssets() == max(asset.balanceOf(vault) + lockedAssets() - reservedAssets, 0)
+   totalAssets() == max(asset.balanceOf(vault) + navLocked - reservedAssets, 0)
    (min(reserved, balance) is the reserve's real claim: under a shortfall the haircut pays exactly
-    the balance across all claimants, §5)
+    the balance across all claimants, §5; navLocked scales a stranded claim to live shares' part)
 
 6. reserves are real                                   invariant_reservesAreReal
    reservedAssets <= asset.balanceOf(vault) + burnReserveShortfall
@@ -525,13 +603,18 @@ balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − b
     run this is reservedAssets <= asset.balanceOf(vault))
    usdgReservedForQueue <= usdg.balanceOf(vault)
    usdgReservedForQueue + pendingFeeUsdg <= usdg.balanceOf(vault)
-   reservedAssets == sum(epoch.assetsRemaining) + sum(owedAssets)
+   reservedAssets == sum(epoch.assetsRemaining) + sum(owedAssets) + strandAssetsLeft   (no allowance)
    contractsAssigned() <= contractsWritten
    lockedAssets() == (contractsWritten - contractsAssigned()) * 1e18
 
 7. phase sanity                                        invariant_phaseSanity
-   contractsWritten > 0  =>  phase != Idle
-   phase == Idle         =>  claimKey == 0, lockedAssets() == 0, canRedeemInstantly()
+   contractsWritten > 0  =>  phase != Idle  ||  isStranded()
+   phase == Idle && !isStranded()  =>  claimKey == 0, lockedAssets() == 0, canRedeemInstantly(),
+                                       strandGen == lastResolvedGen
+   phase == Idle &&  isStranded()  =>  claimKey != 0, contractsWritten > 0, !canRedeemInstantly(),
+                                       maxDeposit() == 0, strandGen == lastResolvedGen + 1,
+                                       strandedRemainingWad <= 1e18
+   phase != Idle         =>  strandGen == lastResolvedGen   (no cycle opens over a stranded claim)
    phase != Settling     (Settling is entered and left inside one rollClose)
 
 8. the fee never touches strike proceeds               invariant_feeNeverTouchesStrikeProceeds
@@ -541,8 +624,16 @@ balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − b
 
 9. the deposit gate tracks the reserve                 invariant_depositGateTracksTheReserve
    asset.balanceOf(vault) < reservedAssets  =>  maxDeposit() == 0 && maxMint() == 0
-   maxDeposit() != 0  =>  balance >= reservedAssets, phase in {Idle, Listed},
+   isStranded()                             =>  maxDeposit() == 0 && maxMint() == 0
+   maxDeposit() != 0  =>  balance >= reservedAssets, phase in {Idle, Listed}, !isStranded(),
                           maxDeposit() == depositCap - totalAssets()
+
+10. stranded-claim shares are conserved                invariant_strandSharesAreConserved
+   for every generation g:
+     g > lastResolvedGen  =>  strandedRemainingWad + sum(epochStrandWad | epochStrandGen == g)
+                                + sum(owedStrandWad | owedStrandGen == g)  ==  1e18
+     g <= lastResolvedGen =>  sum(epochStrandWad | gen g) + sum(owedStrandWad | gen g)
+                                ==  strands[g].wadLeft
 ```
 
 The handler's `completeRedeem` also asserts, on every successful call, that `reservedAssets` fell by
@@ -558,6 +649,24 @@ pending accrual floors once over its combined delta, so holders can be promised 
 account per distribution more than was credited (§4). The handler bounds that exactly, and the run
 is refused if it ever reaches a dollar. The queue reserve and the pending fee are asserted with no
 allowance at all (invariant 6), because they are the obligations that must be backed to the unit.
+
+**Issuer actions and the stranded claim (2026-09-13, AF-02).** The handler registers 25 actions.
+The four added for F-02 are `toggleUsdgPause`, `toggleUsdgFreeze` (the vault or Clear),
+`toggleNvdaBlock` (the vault's Stock Token blocklist) and `retryStrandedClaim`. Every existing action
+skips exactly the calls the tokens' own gates would refuse (a deposit into a blocklisted vault, a
+`claimUsdg` under a pause, a fill into a frozen vault, an exercise into a frozen Clear), and nothing
+else: `rollClose` in particular is never skipped for a token state, because it must reach Idle
+either way. The handler decides from the token state whether the redeem CAN go through and asserts
+that the close stranded exactly when it could not, that `retryStrandedClaim` is refused
+`StillStranded` exactly while a non-zero leg is blocked, and on success that the generation's
+`assetsIn`/`usdgIn` equal the claim's `lockedAssets()`/`claimedExerciseProceeds()`, that its
+`*Left` are the pro-rata floors of the queue's WAD, and that the reserves grew by exactly those.
+`completeRedeem` asserts the reserve was released by the BOOKED amount including any stranded-claim
+share folded in by the call (measured as the drop in `strandAssetsLeft`), and, while USDG cannot
+leave the vault, that the USDG leg moved nothing and stayed booked in full (F-03).
+`test_handlerReachesAStrandAndRecovers` and `test_handlerReachesANvdaBlocklistStrand` prove the
+USDG-side and NVDA-side strands, a deferred USDG leg, a refused retry and a full recovery are all
+reachable with no reverted call.
 
 With `rollClose` passing 0 instead of the claim redemption to the harvest (the pre-2026-09-13 fee
 rule, §6), invariant 8 failed with a counterexample that shrinks to seven calls: mint shares, roll open

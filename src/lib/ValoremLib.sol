@@ -80,6 +80,9 @@ library ValoremLib {
     error OptionWindowMismatch(uint40 optionExerciseTs, uint40 optionExpiryTs);
     error WriteReturnedNoClaim();
     error WriteReturnedWrongClaim(uint256 expected, uint256 got);
+    /// @dev The claim redeem failed with almost no gas left: the inner call was starved, not refused.
+    ///      See {tryRedeemClaim}.
+    error RedeemOutOfGas();
 
     /*//////////////////////////////////////////////////////////////
                                  WRITE
@@ -255,18 +258,55 @@ library ValoremLib {
                                 REDEEM
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Redeem a claim after expiry and report the exact balance deltas.
+    /// @notice Try to redeem a claim after expiry and report the exact balance deltas.
     /// @dev Measures real balances rather than trusting the event or the position struct. That is
     ///      correct even if Valorem ever netted a fee, and it is the number both the redeem queue
     ///      and the harvest are computed from.
-    function redeemClaim(IValoremClear clear, IERC20 asset, IERC20 exerciseAsset, uint256 claimKey)
+    ///
+    ///      WHY A LOW-LEVEL CALL AND NOT `clear.redeem(...)` (AUDIT-FINDINGS F-02). Upstream `redeem`
+    ///      pushes the exercise asset (USDG) and then the underlying (NVDA) to the caller in the same
+    ///      call, each only when non-zero, and a revert on either leg reverts the redeem. Both tokens
+    ///      have an issuer who can make a leg revert at will: USDG can be paused, or the vault or
+    ///      Clear frozen (Clear is the SENDER of the USDG leg), or Clear's USDG burnt by a supply
+    ///      controller; the Stock Token issuer can blocklist the vault, which reverts the NVDA leg in
+    ///      every week that is not fully assigned. An earlier draft let that revert bubble out of
+    ///      `rollClose`, and `rollClose` is the only exit from Listed/Exercisable, so a stablecoin
+    ///      action froze 100% of principal and the queue for as long as it lasted. The revert is now
+    ///      caught and reported as `ok == false`; {Vault.rollClose} moves to Idle with the claim kept
+    ///      (a "stranded" claim) and {Vault.retryStrandedClaim} redeems it once the cause clears.
+    ///
+    ///      THE GAS GUARD. A caught revert cannot be told apart from an out-of-gas inside the callee
+    ///      by its return data, and a caller who starves the inner call could otherwise strand a
+    ///      perfectly redeemable claim on purpose. EIP-150 hands the callee at most 63/64 of the gas
+    ///      left, so after a callee out-of-gas the caller has at most 1/64 of `gasBefore` remaining;
+    ///      a genuine early revert leaves far more. Failing with `gasleft() <= gasBefore / 63` is
+    ///      therefore treated as starvation and reverts {RedeemOutOfGas} instead of stranding. The
+    ///      bound errs on the safe side: a legitimate revert that happens to land in the last 1/63 of
+    ///      the gas is also refused, and the caller simply retries with more gas.
+    ///
+    ///      WHAT THE GUARD DOES NOT SEE, AND WHY IT STILL HOLDS. If the starvation lands one call
+    ///      deeper, in the token transfer Clear makes, Clear itself reverts with a reason and hands
+    ///      back the 1/64 it kept, so this frame is left with about 2/64 of `gasBefore` and the
+    ///      guard reads that as a refusal. But stranding is not free: the caller still has to open a
+    ///      generation, harvest and settle the queue, which costs far more than 2/64 of any gas
+    ///      figure small enough to starve a ~130k redeem, so the outer call runs out and the whole
+    ///      transaction reverts with the claim untouched. The regression walks `rollClose` up a gas
+    ///      ladder against the mock and the real Clear bytecode and asserts every call either
+    ///      reverts leaving the claim as it was or redeems it: nothing lands in between.
+    /// @return ok True if the claim was redeemed and its collateral is now in the caller's balance.
+    function tryRedeemClaim(IValoremClear clear, IERC20 asset, IERC20 exerciseAsset, uint256 claimKey)
         public
-        returns (uint256 underlyingReturned, uint256 exerciseReceived)
+        returns (bool ok, uint256 underlyingReturned, uint256 exerciseReceived)
     {
         uint256 assetBefore = asset.balanceOf(address(this));
         uint256 exerciseBefore = exerciseAsset.balanceOf(address(this));
 
-        clear.redeem(claimKey);
+        uint256 gasBefore = gasleft();
+        (ok,) = address(clear).call(abi.encodeCall(IValoremClear.redeem, (claimKey)));
+        if (!ok) {
+            if (gasleft() <= gasBefore / 63) revert RedeemOutOfGas();
+            return (false, 0, 0);
+        }
 
         underlyingReturned = asset.balanceOf(address(this)) - assetBefore;
         exerciseReceived = exerciseAsset.balanceOf(address(this)) - exerciseBefore;

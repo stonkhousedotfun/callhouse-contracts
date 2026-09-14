@@ -139,6 +139,17 @@ contract VaultHandler is Test {
     uint256 internal aimedBurns;
     /// @notice Completed redemptions that were paid less than booked (the reserve haircut).
     uint256 public cHaircuts;
+    /// @notice Completed redemptions whose USDG leg could not move and stayed booked (F-03).
+    uint256 public cDeferredUsdgLegs;
+    /// @notice Closes that could not redeem the claim and stranded it (F-02).
+    uint256 public cStrands;
+    /// @notice Stranded claims redeemed by `retryStrandedClaim`, and retries refused `StillStranded`.
+    uint256 public cRetries;
+    uint256 public cRetriesRefused;
+    /// @notice Issuer actions: USDG pause flips, USDG freeze flips (vault or Clear), NVDA blocklist flips.
+    uint256 public cUsdgPauseToggles;
+    uint256 public cUsdgFreezeToggles;
+    uint256 public cNvdaBlockToggles;
 
     /// @notice Cycles that ended with at least one contract assigned.
     uint256 public cAssignedCycles;
@@ -218,7 +229,7 @@ contract VaultHandler is Test {
 
     function deposit(uint256 actorSeed, uint256 amountSeed) external {
         attempted++;
-        if (!_canDeposit()) {
+        if (!_canDeposit() || _vaultBlockedOnNvda()) {
             _skip();
             return;
         }
@@ -258,7 +269,7 @@ contract VaultHandler is Test {
 
     function mintShares(uint256 actorSeed, uint256 sharesSeed) external {
         attempted++;
-        if (!_canDeposit()) {
+        if (!_canDeposit() || _vaultBlockedOnNvda()) {
             _skip();
             return;
         }
@@ -290,7 +301,8 @@ contract VaultHandler is Test {
 
     function instantRedeem(uint256 actorSeed, uint256 sharesSeed) external {
         attempted++;
-        if (!vault.canRedeemInstantly()) {
+        // A Stock Token blocklist of the vault stops the payout and nothing else; that revert is honest.
+        if (!vault.canRedeemInstantly() || _vaultBlockedOnNvda()) {
             _skip();
             return;
         }
@@ -325,7 +337,7 @@ contract VaultHandler is Test {
 
     function instantWithdraw(uint256 actorSeed, uint256 assetsSeed) external {
         attempted++;
-        if (!vault.canRedeemInstantly()) {
+        if (!vault.canRedeemInstantly() || _vaultBlockedOnNvda()) {
             _skip();
             return;
         }
@@ -443,29 +455,48 @@ contract VaultHandler is Test {
         uint256 q = vault.queuedSharesOf(who);
         uint256 e = vault.queuedEpochOf(who);
         bool settledEntry = q != 0 && e < vault.epochId();
-        bool staged = vault.owedAssets(who) != 0 || vault.owedQueueUsdg(who) != 0;
+        // A share of a stranded claim is collectable only once that claim has been redeemed; until
+        // then it is owed but nothing can be paid for it, and the vault says `StillStranded`.
+        bool strandReady = vault.owedStrandWad(who) != 0 && vault.owedStrandGen(who) <= vault.lastResolvedGen();
+        bool staged = vault.owedAssets(who) != 0 || vault.owedQueueUsdg(who) != 0 || strandReady;
         // A live (unsettled) entry does NOT block collection of a staged balance; see
         // {VaultInvariantTest.test_reQueuingDoesNotLockAlreadySettledMoney}.
         if (!settledEntry && !staged) {
             _skip();
             return;
         }
+        // Only a USDG leg left and USDG cannot leave the vault: the vault reverts `UsdgLegBlocked`
+        // rather than pretend nothing was queued, so do not fire the doomed call.
+        bool usdgBlocked = _usdgOutBlocked();
+        if (!settledEntry && !strandReady && vault.owedAssets(who) == 0 && usdgBlocked) {
+            _skip();
+            return;
+        }
 
         (uint256 dueAssets, uint256 dueUsdg) = vault.previewCompleteRedeem(who);
+        // The Stock Token leg is paid with `safeTransfer`, and a blocklist of the vault reverts it
+        // honestly: there is nothing to pay principal with. Only fired when a leg would move.
+        if (dueAssets != 0 && _vaultBlockedOnNvda()) {
+            _skip();
+            return;
+        }
         // What is BOOKED to the account, before any haircut: the staged balance plus its share of
-        // the settled epoch. The preview quotes this after the haircut, so the two differ exactly
-        // when the balance sits below the reserve.
+        // the settled epoch, plus whatever share of a redeemed stranded claim is folded in by this
+        // call (measured as the drop in the generations' `assetsLeft`). The preview quotes this
+        // after the haircut, so the two differ exactly when the balance sits below the reserve.
         uint256 booked = vault.owedAssets(who);
         if (settledEntry) {
             (uint256 sharesR, uint256 assetsR,) = vault.epochs(e);
             booked += (assetsR * q) / sharesR;
         }
+        uint256 strandLeftBefore = strandAssetsLeft();
         uint256 reservedBefore = vault.reservedAssets();
         uint256 before = nvda.balanceOf(address(vault));
         uint256 usdgBefore = usdg.balanceOf(address(vault));
         vm.prank(who);
         try vault.completeRedeem(who) returns (uint256 assets, uint256 usdgOut) {
             totalWithdrawn += assets;
+            booked += strandLeftBefore - strandAssetsLeft();
             assertEq(assets, dueAssets, "previewCompleteRedeem quoted assets completeRedeem did not pay");
             // The reserve is released by what was BOOKED, whatever was paid: a haircut is a loss
             // taken by the claimant, never a base unit left promised in the reserve.
@@ -480,14 +511,31 @@ contract VaultHandler is Test {
             } else {
                 assertEq(assets, booked, "paid more than was booked");
             }
-            assertEq(usdgOut, dueUsdg, "previewCompleteRedeem quoted USDG completeRedeem did not pay");
+            // The USDG leg is best-effort (F-03): while USDG cannot leave the vault it stays booked
+            // to the owner, to the base unit, and nothing else about the call changes.
+            if (usdgBlocked) {
+                assertEq(usdgOut, 0, "USDG left the vault while it was paused or the vault frozen");
+                assertEq(vault.owedQueueUsdg(who), dueUsdg, "a deferred USDG leg was not kept booked in full");
+                if (dueUsdg != 0) cDeferredUsdgLegs++;
+            } else {
+                assertEq(usdgOut, dueUsdg, "previewCompleteRedeem quoted USDG completeRedeem did not pay");
+                assertEq(vault.owedQueueUsdg(who), 0, "staged USDG survived a completed redemption");
+            }
             assertEq(before - nvda.balanceOf(address(vault)), assets, "completeRedeem moved the wrong amount of asset");
             assertEq(usdgBefore - usdg.balanceOf(address(vault)), usdgOut, "completeRedeem moved the wrong USDG");
-            // Nothing collectable may survive: no staged balance, and no SETTLED queue entry.
-            // A live entry for an epoch that has not closed yet is allowed to remain — that is
-            // the whole point of {VaultInvariantTest.test_reQueuingDoesNotLockAlreadySettledMoney}.
+            // Nothing collectable may survive: no staged balance, no SETTLED queue entry, and no
+            // share of a REDEEMED stranded claim. A live entry for an epoch that has not closed
+            // yet is allowed to remain — that is the whole point of
+            // {VaultInvariantTest.test_reQueuingDoesNotLockAlreadySettledMoney} — and so is a
+            // share of a claim that is still stranded.
             assertEq(vault.owedAssets(who), 0, "staged assets survived a completed redemption");
-            assertEq(vault.owedQueueUsdg(who), 0, "staged USDG survived a completed redemption");
+            if (vault.owedStrandWad(who) != 0) {
+                assertGt(
+                    vault.owedStrandGen(who),
+                    vault.lastResolvedGen(),
+                    "a share of a redeemed stranded claim survived a completed redemption"
+                );
+            }
             if (vault.queuedSharesOf(who) != 0) {
                 assertGe(
                     vault.queuedEpochOf(who), vault.epochId(), "a settled queue entry survived a completed redemption"
@@ -511,7 +559,8 @@ contract VaultHandler is Test {
         attempted++;
         address who = _actor(actorSeed);
         uint256 claimable = vault.claimableUsdg(who);
-        if (claimable == 0) {
+        // `claimUsdg` is a hard `safeTransfer`: a paused USDG or a frozen vault reverts it, honestly.
+        if (claimable == 0 || _usdgOutBlocked()) {
             _skip();
             return;
         }
@@ -549,13 +598,32 @@ contract VaultHandler is Test {
         return bal > spokenFor ? bal - spokenFor : 0;
     }
 
+    /// @notice Asset base units of redeemed stranded claims still sitting in `reservedAssets` for
+    ///         owners who have not collected their share yet, summed over every generation.
+    function strandAssetsLeft() public view returns (uint256 left) {
+        for (uint256 g = 1; g <= vault.strandGen(); g++) {
+            (,,, uint256 assetsLeft,) = vault.strands(g);
+            left += assetsLeft;
+        }
+    }
+
+    /// @notice The USDG counterpart of {strandAssetsLeft}, inside `usdgReservedForQueue`.
+    function strandUsdgLeft() public view returns (uint256 left) {
+        for (uint256 g = 1; g <= vault.strandGen(); g++) {
+            (,,,, uint256 usdgLeft) = vault.strands(g);
+            left += usdgLeft;
+        }
+    }
+
     /*//////////////////////////////////////////////////////////////
                               THE WEEKLY ROLL
     //////////////////////////////////////////////////////////////*/
 
     function rollOpen(uint256 spotSeed, uint256 rungSeed, uint256 sizeSeed) external {
         attempted++;
-        if (uint8(vault.phase()) != 0 || vault.writesHalted()) {
+        // Idle, not halted, not stranded (`rollOpen` refuses `StillStranded`), and the vault able to
+        // approve and move its Stock Token into Valorem.
+        if (uint8(vault.phase()) != 0 || vault.writesHalted() || vault.isStranded() || _vaultBlockedOnNvda()) {
             _skip();
             return;
         }
@@ -662,7 +730,10 @@ contract VaultHandler is Test {
     ///      live spot and a random spot would mostly skip. Size is bounded on the claim's total.
     function writeMore(uint256 sizeSeed, uint256 spotSeed) external {
         attempted++;
-        if (uint8(vault.phase()) != 1 || vault.writesHalted() || block.timestamp >= vault.cycleExerciseTs()) {
+        if (
+            uint8(vault.phase()) != 1 || vault.writesHalted() || block.timestamp >= vault.cycleExerciseTs()
+                || _vaultBlockedOnNvda()
+        ) {
             _skip();
             return;
         }
@@ -709,6 +780,10 @@ contract VaultHandler is Test {
         uint256 e = vault.epochId();
         // Priced like instant redeem, virtual share included (`_settleQueue`).
         uint256 expected = (q * (vault.idleAssets() + 1)) / (vault.totalSupply() + 1);
+        // While a claim is stranded the epoch also takes q/supply of what live shares still own of it.
+        bool stranded = vault.isStranded();
+        uint256 expectedWad = stranded ? (vault.strandedRemainingWad() * q) / vault.totalSupply() : 0;
+        uint256 remainingBefore = vault.strandedRemainingWad();
         uint256 before = nvda.balanceOf(address(vault));
         vm.prank(address(uint160(uint256(keccak256(abi.encode(whoSeed, "settler"))))));
         try vault.settleQueue() {
@@ -717,6 +792,15 @@ contract VaultHandler is Test {
             assertEq(assetsR, expected, "settled at something other than the flat pro-rata slice");
             assertEq(vault.queuedShares(), 0, "queue not emptied");
             assertEq(nvda.balanceOf(address(vault)), before, "settleQueue moved asset");
+            assertEq(vault.epochStrandWad(e), expectedWad, "the epoch's share of the stranded claim is not q/supply");
+            assertEq(
+                vault.strandedRemainingWad(),
+                remainingBefore - expectedWad,
+                "live shares' share of the claim not reduced"
+            );
+            if (expectedWad != 0) {
+                assertEq(vault.epochStrandGen(e), vault.strandGen(), "epoch tagged with the wrong gen");
+            }
             succeeded++;
             cSettleQueue++;
         } catch (bytes memory err) {
@@ -781,6 +865,11 @@ contract VaultHandler is Test {
             _skip();
             return;
         }
+        // The buyer's USDG cannot reach a frozen vault, and nothing moves while USDG is paused.
+        if (_usdgOutBlocked()) {
+            _skip();
+            return;
+        }
 
         OrderComponents memory c = _rebuildLive();
         bytes32 h = seaport.getOrderHash(c);
@@ -830,6 +919,11 @@ contract VaultHandler is Test {
             return;
         }
         if (vault.claimKey() == 0) {
+            _skip();
+            return;
+        }
+        // The buyer pays the strike into Clear: a paused USDG or a frozen Clear refuses it.
+        if (usdg.paused() || usdg.isFrozen(address(clear))) {
             _skip();
             return;
         }
@@ -909,15 +1003,174 @@ contract VaultHandler is Test {
         }
 
         uint256 assignedBefore = vault.contractsAssigned();
+        // Whether Valorem's redeem can go through right now: its USDG leg (Clear -> vault) is refused
+        // by a pause or a freeze of either end, its NVDA leg by a blocklist of the vault, each only
+        // when non-zero. The close must reach Idle EITHER WAY (F-02); this decides which way.
+        bool redeemBlocked = (vault.claimedExerciseProceeds() != 0 && _redeemUsdgLegBlocked())
+            || (vault.lockedAssets() != 0 && _vaultBlockedOnNvda());
+        uint256 key = vault.claimKey();
+        uint256 gen = vault.strandGen();
         if (!asKeeper) vm.prank(address(uint160(uint256(keccak256(abi.encode(whoSeed, "closer"))))));
         try vault.rollClose() {
             if (assignedBefore != 0) cAssignedCycles++;
+            assertEq(uint8(vault.phase()), 0, "rollClose did not reach Idle");
+            if (redeemBlocked) {
+                assertTrue(vault.isStranded(), "a close whose redeem was blocked did not strand");
+                assertEq(vault.claimKey(), key, "the stranded claim was not kept");
+                assertEq(vault.strandGen(), gen + 1, "stranding did not open a new generation");
+                assertFalse(vault.canRedeemInstantly(), "instant redemption open over a stranded claim");
+                cStrands++;
+            } else {
+                assertFalse(vault.isStranded(), "a close whose redeem was possible stranded anyway");
+                assertEq(vault.claimKey(), 0, "the claim was not redeemed");
+            }
             live.active = false;
             succeeded++;
             cClose++;
         } catch (bytes memory err) {
             _reverted("rollClose", err);
         }
+    }
+
+    /// @notice Anyone retries a stranded claim. Refused `StillStranded` while the cause persists, and
+    ///         on success the redeem's two legs are split between the settled epochs' share (into the
+    ///         reserves, to the base unit) and live shares.
+    function retryStrandedClaim(uint256 whoSeed) external {
+        attempted++;
+        if (!vault.isStranded()) {
+            _skip();
+            return;
+        }
+        uint256 usdgLeg = vault.claimedExerciseProceeds();
+        uint256 nvdaLeg = vault.lockedAssets();
+        bool refused = (usdgLeg != 0 && _redeemUsdgLegBlocked()) || (nvdaLeg != 0 && _vaultBlockedOnNvda());
+        uint256 gen = vault.strandGen();
+        uint256 queueWad = 1e18 - vault.strandedRemainingWad();
+        uint256 reservedBefore = vault.reservedAssets();
+        uint256 usdgReservedBefore = vault.usdgReservedForQueue();
+        uint256 before = nvda.balanceOf(address(vault));
+        uint256 usdgBefore = usdg.balanceOf(address(vault));
+        uint256 pendingFeeBefore = vault.pendingFeeUsdg();
+
+        vm.prank(address(uint160(uint256(keccak256(abi.encode(whoSeed, "retrier"))))));
+        try vault.retryStrandedClaim() {
+            assertFalse(refused, "retryStrandedClaim succeeded while a redeem leg was blocked");
+            assertEq(vault.claimKey(), 0, "the claim was not redeemed");
+            assertFalse(vault.isStranded(), "still stranded after a successful retry");
+            assertEq(vault.lastResolvedGen(), gen, "generation not marked resolved");
+            assertTrue(vault.canRedeemInstantly(), "flat again but instant redemption refused");
+            assertEq(nvda.balanceOf(address(vault)) - before, nvdaLeg, "the redeem returned other than the locked NVDA");
+            // The retry's harvest also sweeps a protocol fee the stranded close could not push, so
+            // the USDG that arrived is the balance delta plus whatever fee left in the same call. No
+            // fee is charged INSIDE the retry: the claim's USDG is fee-free like any strike proceeds.
+            uint256 feeSwept = pendingFeeBefore - vault.pendingFeeUsdg();
+            assertEq(
+                usdg.balanceOf(address(vault)) + feeSwept - usdgBefore,
+                usdgLeg,
+                "the redeem returned other than the claim USDG"
+            );
+            (uint256 assetsIn, uint256 usdgIn, uint256 wadLeft, uint256 assetsLeft, uint256 usdgLeft) =
+                vault.strands(gen);
+            assertEq(assetsIn, nvdaLeg, "generation recorded the wrong NVDA");
+            assertEq(usdgIn, usdgLeg, "generation recorded the wrong USDG");
+            assertEq(wadLeft, queueWad, "the queue's share of the claim is not what the epochs took");
+            assertEq(assetsLeft, (nvdaLeg * queueWad) / 1e18, "queue NVDA is not its pro-rata floor");
+            assertEq(usdgLeft, (usdgLeg * queueWad) / 1e18, "queue USDG is not its pro-rata floor");
+            assertEq(vault.reservedAssets() - reservedBefore, assetsLeft, "reserve did not grow by the queue's NVDA");
+            assertEq(
+                vault.usdgReservedForQueue() - usdgReservedBefore,
+                usdgLeft,
+                "USDG reserve did not grow by the queue's USDG"
+            );
+            succeeded++;
+            cRetries++;
+        } catch (bytes memory err) {
+            if (refused && bytes4(err) == Vault.StillStranded.selector) {
+                succeeded++;
+                cRetriesRefused++;
+            } else {
+                _reverted("retryStrandedClaim", err);
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ISSUER ACTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev WHY THE ISSUER ACTIONS ROLL A HASH, NOT THE RAW SEED. The fuzzer's seeds are dictionary-
+    ///      biased towards round numbers, so `seed % 10 == 0` fired on a third of the calls rather than a
+    ///      tenth and left the vault blocklisted or USDG paused for most of a run: no deposit, no open,
+    ///      no fill, and the anti-vacuity floors in {VaultInvariantTest.afterInvariant} fired (observed:
+    ///      10 blocklist flips in 600 calls, 0 cycles opened). Hashing the seed with a salt makes the
+    ///      rate what it says.
+    ///
+    ///      THE RATES ARE ASYMMETRIC AND STATE-AWARE. An issuer action switches ON rarely and OFF
+    ///      readily, so a run spends roughly a tenth of its time under each restriction: enough for a
+    ///      close to strand and a payout to defer its USDG leg in a good share of runs, without starving
+    ///      the fill, exercise, deposit and open paths the other invariants need (with symmetric rates
+    ///      a run with 25 actions opened no cycle at all about once in six hundred sequences). And while
+    ///      a claim is stranded the restriction that strands it lifts on the NEXT call of its toggle:
+    ///      the stranded interval still lasts a couple of dozen handler calls of settlements,
+    ///      collections, refused retries and refused deposits, but a run cannot spend its second half
+    ///      unable to open a cycle because the fuzzer never rolled the unpause.
+    function _roll(uint256 seed, string memory salt) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encode(seed, salt)));
+    }
+
+    /// @dev One in `onEvery` calls switches the restriction on; one in two switches it off, or every
+    ///      call while a claim is stranded.
+    function _flip(uint256 r, bool on, uint256 onEvery) internal view returns (bool) {
+        if (!on) return r % onEvery == 0;
+        return vault.isStranded() || r % 2 == 0;
+    }
+
+    /// @notice Paxos pauses or unpauses USDG. Blocks `transfer`, `transferFrom` and `approve` for
+    ///         everyone; the vault must keep closing, settling and paying its Stock Token leg through it.
+    function toggleUsdgPause(uint256 seed) external {
+        attempted++;
+        bool on = usdg.paused();
+        if (!_flip(_roll(seed, "usdg-pause"), on, 12)) {
+            _skip();
+            return;
+        }
+        if (on) usdg.unpause();
+        else usdg.pause();
+        succeeded++;
+        cUsdgPauseToggles++;
+    }
+
+    /// @notice Paxos freezes or unfreezes the vault (the redeem's USDG recipient, every payout's sender)
+    ///         or Clear (the redeem's USDG sender) on USDG.
+    function toggleUsdgFreeze(uint256 seed) external {
+        attempted++;
+        uint256 r = _roll(seed, "usdg-freeze");
+        address target = r % 2 == 0 ? address(vault) : address(clear);
+        bool on = usdg.isFrozen(target);
+        if (!_flip(r >> 1, on, 12)) {
+            _skip();
+            return;
+        }
+        if (on) usdg.unfreeze(target);
+        else usdg.freeze(target);
+        succeeded++;
+        cUsdgFreezeToggles++;
+    }
+
+    /// @notice The Stock Token issuer blocklists or unblocks the vault. Stops every NVDA transfer to or
+    ///         from it, including the redeem's NVDA leg in any week that is not fully assigned. Rarer
+    ///         still to switch on: while it holds nothing can be deposited, written or paid out.
+    function toggleNvdaBlock(uint256 seed) external {
+        attempted++;
+        bool on = nvda.isBlocked(address(vault));
+        if (!_flip(_roll(seed, "nvda-block"), on, 20)) {
+            _skip();
+            return;
+        }
+        if (on) nvda.unblockAccount(address(vault));
+        else nvda.blockAccount(address(vault));
+        succeeded++;
+        cNvdaBlockToggles++;
     }
 
     /// @notice The issuer seizes Stock Tokens straight out of the vault. `adminBurn` on the live token
@@ -970,7 +1223,9 @@ contract VaultHandler is Test {
         }
         uint256 shortBefore = reserved > bal ? reserved - bal : 0;
         uint256 navBefore = vault.totalAssets();
-        uint256 lockedBefore = vault.lockedAssets();
+        // The part of the locked collateral NAV counts: all of it, or the live shares' share of a
+        // stranded claim ({Vault.totalAssets}).
+        uint256 lockedBefore = navLocked();
 
         try nvda.adminBurn(address(vault), amount) {
             totalBurned += amount;
@@ -998,17 +1253,36 @@ contract VaultHandler is Test {
     }
 
     /// @notice Free-running time, so phases are not always entered at the same instant.
+    /// @dev THE RANGE IS THE RUN'S TIME BUDGET. Nothing else moves the clock towards expiry on an
+    ///      unfilled week (`exercise` warps only when the buyer holds inventory, and `rollClose`
+    ///      deliberately never warps), so a 600-call run sees about `600 / actions` warps and
+    ///      exactly as many cycles as their sum covers. The four issuer actions added for F-02
+    ///      took the handler from 21 to 25 actions, a sixth fewer warps a run, and the first
+    ///      full-depth run with a late first open and only eight warps left never reached
+    ///      `cycleExerciseTs` and tripped the "no cycle was ever closed" floor in
+    ///      {VaultInvariantTest.afterInvariant}. Three days rather than two puts the budget back
+    ///      at roughly five weekly cycles a run; the seed is hashed ({_roll}) so the mean is
+    ///      really the middle of the range rather than whatever the dictionary favours. The one
+    ///      seed kept raw is `type(uint256).max`, which `bound` pins to the top of the range: the
+    ///      deterministic self-checks below use it to walk the clock to expiry in a known number
+    ///      of calls.
     function warpAhead(uint256 seed) external {
         attempted++;
-        vm.warp(block.timestamp + bound(seed, 1 hours, 2 days));
+        uint256 r = seed == type(uint256).max ? seed : _roll(seed, "warp");
+        vm.warp(block.timestamp + bound(r, 1 hours, 3 days));
         succeeded++;
     }
 
     /// @notice Halting must never block a redemption, a claim or a close. Flip it often enough
     ///         that a run spends real time halted, but leave writing possible most of the time.
+    /// @dev One call in four asks for a halt, three in four for a lift, so a run is halted about a
+    ///      quarter of the time. Hashed ({_roll}) for the same reason the issuer toggles are: on
+    ///      the raw seed, `% 4 == 0` fired on about half the calls (0, 8_000_000, 1e11 and every
+    ///      other round number the dictionary likes), and a run spent half its length unable to
+    ///      open a cycle, which is how the vacuity floor first fired after the F-02 actions landed.
     function toggleHalt(uint256 seed) external {
         attempted++;
-        bool halt = seed % 4 == 0;
+        bool halt = _roll(seed, "halt") % 4 == 0;
         if (halt == vault.writesHalted()) {
             _skip();
             return;
@@ -1058,11 +1332,37 @@ contract VaultHandler is Test {
     ///      asserted with NO allowance at all in
     ///      {VaultInvariantTest.invariant_reservesAreReal}.
     function maxIndexRoundingDrift() external view returns (uint256) {
-        return (cDeposit + cMint + 2 * cClose) * HOLDER_SLOTS;
+        // A `retryStrandedClaim` harvests exactly as a close does, so it can distribute twice too.
+        return (cDeposit + cMint + 2 * cClose + 2 * cRetries) * HOLDER_SLOTS;
+    }
+
+    /// @notice The locked collateral as NAV counts it: the raw claim figure in an ordinary cycle, the
+    ///         live shares' `strandedRemainingWad` of it while a claim is stranded.
+    function navLocked() public view returns (uint256) {
+        uint256 locked = vault.lockedAssets();
+        if (locked == 0 || !vault.isStranded()) return locked;
+        return (locked * vault.strandedRemainingWad()) / 1e18;
     }
 
     function _skip() internal {
         skipped++;
+    }
+
+    /// @dev The issuer states that decide which vault calls can move a token right now. Mirrors the
+    ///      tokens' own gates (src/mocks/MockERC20.sol, src/mocks/MockStockToken.sol), which mirror
+    ///      the live USDG and Stock Token (integrations/usdg.md, integrations/robinhood-chain.md).
+    function _vaultBlockedOnNvda() internal view returns (bool) {
+        return nvda.isBlocked(address(vault));
+    }
+
+    /// @dev USDG cannot leave the vault: pause, or the vault frozen as the sender.
+    function _usdgOutBlocked() internal view returns (bool) {
+        return usdg.paused() || usdg.isFrozen(address(vault));
+    }
+
+    /// @dev The redeem's USDG leg (Clear -> vault) cannot move: pause, or either end frozen.
+    function _redeemUsdgLegBlocked() internal view returns (bool) {
+        return usdg.paused() || usdg.isFrozen(address(vault)) || usdg.isFrozen(address(clear));
     }
 
     /// @dev A guarded call that still reverted, which always means a guard is wrong.
@@ -1218,9 +1518,10 @@ contract VaultHandler is Test {
 }
 
 /// @notice Stateful invariants for {Vault} (tasks I-01, I-02).
-/// @dev The six properties below are the ones that, if they ever stop holding, mean someone
+/// @dev The ten properties below are the ones that, if they ever stop holding, mean someone
 ///      cannot be paid. They are checked after every single handler call, in every phase, with
-///      collateral locked, orders half filled, buyers assigned and redeemers queued.
+///      collateral locked, orders half filled, buyers assigned, redeemers queued, USDG paused or
+///      frozen, the vault blocklisted on its Stock Token and claims stranded (F-02).
 /// forge-config: default.invariant.runs = 64
 /// forge-config: default.invariant.depth = 600
 /// forge-config: default.invariant.fail-on-revert = true
@@ -1263,7 +1564,7 @@ contract VaultInvariantTest is BaseTest {
 
         holders = [alice, bob, carol, buyer, address(vault)];
 
-        bytes4[] memory selectors = new bytes4[](21);
+        bytes4[] memory selectors = new bytes4[](25);
         selectors[0] = VaultHandler.deposit.selector;
         selectors[1] = VaultHandler.mintShares.selector;
         selectors[2] = VaultHandler.instantRedeem.selector;
@@ -1285,6 +1586,10 @@ contract VaultInvariantTest is BaseTest {
         selectors[18] = VaultHandler.settleQueue.selector;
         selectors[19] = VaultHandler.invalidateStaleListing.selector;
         selectors[20] = VaultHandler.adminBurn.selector;
+        selectors[21] = VaultHandler.retryStrandedClaim.selector;
+        selectors[22] = VaultHandler.toggleUsdgPause.selector;
+        selectors[23] = VaultHandler.toggleUsdgFreeze.selector;
+        selectors[24] = VaultHandler.toggleNvdaBlock.selector;
 
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
@@ -1367,8 +1672,12 @@ contract VaultInvariantTest is BaseTest {
         for (uint256 i; i < holders.length; i++) {
             staged += vault.owedQueueUsdg(holders[i]);
         }
+        // Plus the settled epochs' USDG share of every redeemed stranded claim not yet folded in
+        // (`strands[gen].usdgLeft`, F-02); see the asset leg in {invariant_reservesAreReal}.
         assertEq(
-            vault.usdgReservedForQueue(), inEpochs + staged, "queue USDG reserve != unsettled epochs + staged balances"
+            vault.usdgReservedForQueue(),
+            inEpochs + staged + handler.strandUsdgLeft(),
+            "queue USDG reserve != unsettled epochs + staged balances + uncollected stranded-claim shares"
         );
     }
 
@@ -1451,12 +1760,14 @@ contract VaultInvariantTest is BaseTest {
         );
         // And NAV is the formula, not a paraphrase of it: the reserve comes off the whole book and
         // only the final figure saturates (F-05). Stated here because a burn is the only action that
-        // can make `balance + locked < reserved`, and this is where the two formulas diverged.
-        uint256 gross = balance + vault.lockedAssets();
+        // can make `balance + locked < reserved`, and this is where the two formulas diverged. While
+        // a claim is stranded only the live shares' `strandedRemainingWad` of the locked collateral
+        // counts: the rest is owed to epochs that settled while it was stranded (F-02).
+        uint256 gross = balance + handler.navLocked();
         assertEq(
             vault.totalAssets(),
             gross > reserved ? gross - reserved : 0,
-            "totalAssets != max(balance + locked - reserved, 0)"
+            "totalAssets != max(balance + locked x live share - reserved, 0)"
         );
     }
 
@@ -1474,10 +1785,16 @@ contract VaultInvariantTest is BaseTest {
             assertEq(room, 0, "maxDeposit quoted room while the balance is below the reserve");
             assertEq(vault.maxMint(alice), 0, "maxMint quoted shares while the balance is below the reserve");
         }
+        // Nobody buys in over a stranded claim: its strike USDG is owed to the holders of record.
+        if (vault.isStranded()) {
+            assertEq(room, 0, "maxDeposit quoted room while a claim is stranded");
+            assertEq(vault.maxMint(alice), 0, "maxMint quoted shares while a claim is stranded");
+        }
         if (room != 0) {
             assertGe(balance, vault.reservedAssets(), "deposits quoted open over an unbacked reserve");
             uint8 p = uint8(vault.phase());
             assertTrue(p == 0 || p == 1, "deposits quoted open outside Idle and Listed");
+            assertFalse(vault.isStranded(), "deposits quoted open over a stranded claim");
             assertEq(room, vault.depositCap() - vault.totalAssets(), "maxDeposit is not cap minus NAV");
         }
     }
@@ -1525,8 +1842,11 @@ contract VaultInvariantTest is BaseTest {
         );
 
         // The asset leg of the same split-settlement decomposition {invariant_usdgBooksBalance}
-        // states for USDG: the reserve is exactly what is still owed inside the open epochs plus
-        // what has been staged against accounts by an earlier `queueRedeem`.
+        // states for USDG: the reserve is exactly what is still owed inside the open epochs, plus
+        // what has been staged against accounts by an earlier `queueRedeem`, plus the settled
+        // epochs' share of every REDEEMED stranded claim that its owners have not folded in yet
+        // (`strands[gen].assetsLeft`, F-02). Stated as an equality with no allowance: the last owner
+        // of a generation takes exactly what is left of it, so no dust ever stays in the reserve.
         uint256 inEpochs;
         uint256 staged;
         for (uint256 e = 1; e <= vault.epochId(); e++) {
@@ -1536,7 +1856,11 @@ contract VaultInvariantTest is BaseTest {
         for (uint256 i; i < holders.length; i++) {
             staged += vault.owedAssets(holders[i]);
         }
-        assertEq(vault.reservedAssets(), inEpochs + staged, "asset reserve != unsettled epochs + staged balances");
+        assertEq(
+            vault.reservedAssets(),
+            inEpochs + staged + handler.strandAssetsLeft(),
+            "asset reserve != unsettled epochs + staged balances + uncollected stranded-claim shares"
+        );
 
         // `lockedAssets()` is read straight out of Valorem's position; `contractsWritten` and
         // `contractsAssigned()` come from the vault's own counters and the claim. If those two
@@ -1550,18 +1874,70 @@ contract VaultInvariantTest is BaseTest {
 
     /// @notice Idle means flat. If it does not, instant redemption would pay out collateral
     ///         that is still collateralising somebody's short call.
+    ///
+    ///      THE ONE EXCEPTION IS A STRANDED CLAIM (F-02). `rollClose` reaches Idle even when Valorem's
+    ///      redeem reverts, keeping `claimKey` and `contractsWritten`; that is `isStranded()`, and it
+    ///      is the only way Idle can coexist with an open claim. While it holds the instant path must
+    ///      be shut (the kept `contractsWritten` is what shuts it), deposits must be shut, exactly one
+    ///      generation must be open, and live shares' share of the claim must be a fraction of one.
     function invariant_phaseSanity() public view {
+        bool stranded = vault.isStranded();
         if (vault.contractsWritten() > 0) {
-            assertTrue(uint8(vault.phase()) != 0, "contracts written while Idle");
+            assertTrue(uint8(vault.phase()) != 0 || stranded, "contracts written while Idle and not stranded");
         }
         if (uint8(vault.phase()) == 0) {
-            assertEq(vault.claimKey(), 0, "Idle with an open claim");
-            assertEq(vault.lockedAssets(), 0, "Idle with collateral still locked in Valorem");
-            assertTrue(vault.canRedeemInstantly(), "Idle and flat but instant redemption refused");
+            if (stranded) {
+                assertTrue(vault.claimKey() != 0, "stranded without a claim");
+                assertGt(vault.contractsWritten(), 0, "stranded with nothing written");
+                assertFalse(vault.canRedeemInstantly(), "instant redemption open over a stranded claim");
+                assertEq(vault.maxDeposit(alice), 0, "deposits open over a stranded claim");
+                assertEq(vault.strandGen(), vault.lastResolvedGen() + 1, "not exactly one generation open");
+                assertLe(vault.strandedRemainingWad(), 1e18, "live shares own more than the whole claim");
+            } else {
+                assertEq(vault.claimKey(), 0, "Idle with an open claim");
+                assertEq(vault.lockedAssets(), 0, "Idle with collateral still locked in Valorem");
+                assertTrue(vault.canRedeemInstantly(), "Idle and flat but instant redemption refused");
+                assertEq(vault.strandGen(), vault.lastResolvedGen(), "a generation is open but nothing is stranded");
+            }
+        } else {
+            assertEq(vault.strandGen(), vault.lastResolvedGen(), "a cycle is open over an unresolved generation");
         }
         // Settling is entered and left inside a single `rollClose`, so no outside observer can
         // ever catch the vault in it. If this ever fires, some path left the vault wedged.
         assertTrue(uint8(vault.phase()) != 3, "observed the Settling phase from outside rollClose");
+    }
+
+    /// @notice A stranded claim is owned in full, and by exactly the parties the books name (F-02).
+    /// @dev WAD conservation across the three places a share of a stranded claim can sit: live shares
+    ///      (`strandedRemainingWad`), epochs that settled while it was stranded (`epochStrandWad`) and
+    ///      owners who settled their entry out of such an epoch (`owedStrandWad`). While a generation
+    ///      is open they sum to exactly 1e18; once it is redeemed, what its epochs and owners still
+    ///      hold is exactly the generation's `wadLeft`, which is what makes the last owner's "take
+    ///      what is left" drain the reserves to zero ({Vault._strandSlice}). If a share were ever
+    ///      minted or lost between an epoch and an owner, either the reserve would keep money nobody
+    ///      can claim or an owner would be quoted money the reserve does not hold.
+    function invariant_strandSharesAreConserved() public view {
+        uint256 gens = vault.strandGen();
+        for (uint256 g = 1; g <= gens; g++) {
+            uint256 inEpochs;
+            uint256 inOwners;
+            for (uint256 e = 1; e <= vault.epochId(); e++) {
+                if (vault.epochStrandGen(e) == g) inEpochs += vault.epochStrandWad(e);
+            }
+            for (uint256 i; i < holders.length; i++) {
+                if (vault.owedStrandGen(holders[i]) == g) inOwners += vault.owedStrandWad(holders[i]);
+            }
+            if (g > vault.lastResolvedGen()) {
+                assertEq(
+                    vault.strandedRemainingWad() + inEpochs + inOwners,
+                    1e18,
+                    "an open generation's shares do not sum to the whole claim"
+                );
+            } else {
+                (,, uint256 wadLeft,,) = vault.strands(g);
+                assertEq(inEpochs + inOwners, wadLeft, "a redeemed generation's outstanding shares != wadLeft");
+            }
+        }
     }
 
     /// @notice The protocol fee is a cut of PREMIUM, never of principal. Everything the fee
@@ -1648,6 +2024,13 @@ contract VaultInvariantTest is BaseTest {
         emit log_named_uint("issuer burns", handler.cBurn());
         emit log_named_uint("burns that unbacked the reserve", handler.cBurnShortfalls());
         emit log_named_uint("haircut redemptions", handler.cHaircuts());
+        emit log_named_uint("deferred USDG legs", handler.cDeferredUsdgLegs());
+        emit log_named_uint("stranded closes", handler.cStrands());
+        emit log_named_uint("stranded claims redeemed", handler.cRetries());
+        emit log_named_uint("retries refused StillStranded", handler.cRetriesRefused());
+        emit log_named_uint("USDG pause flips", handler.cUsdgPauseToggles());
+        emit log_named_uint("USDG freeze flips", handler.cUsdgFreezeToggles());
+        emit log_named_uint("NVDA blocklist flips", handler.cNvdaBlockToggles());
         emit log_named_uint("cycles with assignment", handler.cAssignedCycles());
 
         emit log_named_uint("index rounding allowance (usdg base units)", handler.maxIndexRoundingDrift());
@@ -1783,6 +2166,25 @@ contract VaultInvariantTest is BaseTest {
         assertGt(handler.cAssignedCycles(), 0, "a cycle closed with an assignment");
 
         // And the invariants still hold at the end of it.
+        _assertAllInvariants();
+    }
+
+    /// @dev The issuer toggles roll a hash of their seed ({VaultHandler._roll}), so a deterministic
+    ///      test walks seeds until the state it wants is reached; each miss is a counted skip and
+    ///      nothing else.
+    function _setUsdgPause(bool want) internal {
+        for (uint256 s; usdg.paused() != want; s++) {
+            handler.toggleUsdgPause(s);
+        }
+    }
+
+    function _setNvdaBlock(bool want) internal {
+        for (uint256 s; nvda.isBlocked(address(vault)) != want; s++) {
+            handler.toggleNvdaBlock(s);
+        }
+    }
+
+    function _assertAllInvariants() internal view {
         invariant_assetConservation();
         invariant_usdgBooksBalance();
         invariant_usdgHolderSolvency();
@@ -1792,6 +2194,116 @@ contract VaultInvariantTest is BaseTest {
         invariant_phaseSanity();
         invariant_feeNeverTouchesStrikeProceeds();
         invariant_depositGateTracksTheReserve();
+        invariant_strandSharesAreConserved();
+    }
+
+    /// @notice Proves the handler reaches a stranded close (F-02), the queue paying its idle slice
+    ///         with the USDG leg deferred under the pause (F-03), a retry refused `StillStranded`, the
+    ///         claim redeemed by a stranger and the epoch paid its share, with every invariant holding
+    ///         at each step.
+    function test_handlerReachesAStrandAndRecovers() public {
+        handler.deposit(0, type(uint256).max); // alice, 6e18
+        handler.deposit(1, type(uint256).max); // bob, 6e18
+        handler.rollOpen(0, 0, type(uint256).max);
+        handler.approveListing(type(uint256).max, 0, 0);
+        handler.fill(type(uint256).max); // the whole listing
+        handler.queueRedeem(1, type(uint256).max); // bob queues everything, into the escrow that earns the week
+        handler.exercise(0, 0); // one contract assigned: the claim now holds strike USDG
+        assertGt(vault.claimedExerciseProceeds(), 0, "assigned");
+        handler.lockBook(0);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+
+        // Paxos pauses USDG before the close: Valorem's redeem cannot push the strike to the vault.
+        _setUsdgPause(true);
+        assertTrue(usdg.paused(), "USDG paused");
+        uint256 key = vault.claimKey();
+        handler.rollClose(1); // a stranger, an hour after expiry
+        assertEq(handler.cStrands(), 1, "the close stranded the claim");
+        assertTrue(vault.isStranded(), "stranded");
+        assertEq(vault.claimKey(), key, "claim kept");
+        assertGt(vault.epochStrandWad(1), 0, "bob's epoch owns a share of the claim");
+        assertEq(vault.maxDeposit(alice), 0, "deposits shut");
+        handler.deposit(2, type(uint256).max); // carol: skipped, not reverted
+        assertEq(handler.cDeposit(), 2, "no deposit landed while stranded");
+        handler.rollOpen(0, 0, 0); // skipped: StillStranded
+        assertEq(handler.cOpen(), 1, "no cycle opened over the stranded claim");
+        _assertAllInvariants();
+
+        // Bob collects his idle slice now; his escrow USDG is deferred by the pause and stays booked.
+        handler.completeRedeem(1);
+        assertEq(handler.cComplete(), 1, "bob collected");
+        assertEq(handler.cDeferredUsdgLegs(), 1, "his USDG leg was deferred");
+        assertGt(vault.owedQueueUsdg(bob), 0, "and is still owed");
+        assertGt(vault.owedStrandWad(bob), 0, "his share of the claim is staged");
+        handler.completeRedeem(1); // skipped: only a blocked USDG leg and an unredeemed share left
+        assertEq(handler.cComplete(), 1);
+        _assertAllInvariants();
+
+        // A retry under the pause is refused; lifting the pause lets a stranger redeem the claim.
+        handler.retryStrandedClaim(0);
+        assertEq(handler.cRetriesRefused(), 1, "refused StillStranded");
+        assertTrue(vault.isStranded(), "still stranded");
+        _setUsdgPause(false);
+        assertFalse(usdg.paused(), "USDG unpaused");
+        handler.retryStrandedClaim(1);
+        assertEq(handler.cRetries(), 1, "the claim was redeemed");
+        assertFalse(vault.isStranded(), "resolved");
+        assertTrue(vault.canRedeemInstantly(), "flat again");
+        assertGt(handler.strandAssetsLeft(), 0, "bob's share of the redeem waits in the reserve");
+        _assertAllInvariants();
+
+        // Bob collects his share of the claim and his deferred USDG; the generation drains to zero.
+        handler.completeRedeem(1);
+        assertEq(handler.cComplete(), 2, "bob collected again");
+        assertEq(handler.strandAssetsLeft(), 0, "the generation's NVDA is fully collected");
+        assertEq(handler.strandUsdgLeft(), 0, "and its USDG");
+        assertEq(vault.owedQueueUsdg(bob), 0, "the deferred USDG leg was paid");
+        assertEq(vault.owedStrandWad(bob), 0, "no share left staged");
+
+        // Deposits reopen and a fresh cycle can start.
+        handler.deposit(2, type(uint256).max);
+        assertEq(handler.cDeposit(), 3, "carol's deposit lands now");
+        handler.rollOpen(0, 0, 0);
+        assertEq(handler.cOpen(), 2, "a new cycle opened");
+
+        assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
+        _assertAllInvariants();
+    }
+
+    /// @notice Proves the NVDA-side strand: the vault blocklisted on the Stock Token in an unassigned
+    ///         week strands the close (the redeem's NVDA leg is refused), the queue's idle slice waits
+    ///         with the claim share because nothing can pay NVDA, and both pay once the block lifts.
+    function test_handlerReachesANvdaBlocklistStrand() public {
+        handler.deposit(0, type(uint256).max);
+        handler.deposit(1, type(uint256).max);
+        handler.rollOpen(0, 0, type(uint256).max);
+        handler.queueRedeem(1, type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+        handler.warpAhead(type(uint256).max);
+
+        _setNvdaBlock(true);
+        assertTrue(nvda.isBlocked(address(vault)), "vault blocklisted on NVDA");
+        handler.rollClose(1);
+        assertEq(handler.cStrands(), 1, "an unassigned week strands on the NVDA leg");
+        assertGt(vault.lockedAssets(), 0, "the collateral is still in Valorem");
+        handler.completeRedeem(1); // skipped: the asset leg cannot move
+        assertEq(handler.cComplete(), 0, "nothing paid while the vault is blocked");
+        handler.retryStrandedClaim(0);
+        assertEq(handler.cRetriesRefused(), 1);
+        _assertAllInvariants();
+
+        _setNvdaBlock(false);
+        handler.retryStrandedClaim(0);
+        assertEq(handler.cRetries(), 1, "redeemed once unblocked");
+        assertEq(vault.usdgReservedForQueue(), 0, "no USDG leg on an unassigned week");
+        handler.completeRedeem(1);
+        assertEq(handler.cComplete(), 1, "bob paid idle slice plus claim share");
+        assertEq(handler.strandAssetsLeft(), 0, "the generation drained");
+        assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
+        _assertAllInvariants();
     }
 
     /// @notice Proves the handler reaches an issuer burn that unbacks the reserve, the shut deposit

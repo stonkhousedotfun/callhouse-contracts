@@ -182,6 +182,68 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     mapping(uint256 => uint256) private _epochAccUsdgPerShare;
 
     /*//////////////////////////////////////////////////////////////
+                        STRANDED CLAIM (AUDIT-FINDINGS F-02)
+    //////////////////////////////////////////////////////////////*/
+
+    // A claim is STRANDED when `rollClose` could not redeem it: Valorem's `redeem` pushes USDG and
+    // then NVDA to the vault in one call, and either token's issuer can make its leg revert (USDG
+    // paused, the vault or Clear frozen on USDG, Clear's USDG burnt; the vault blocklisted on the
+    // Stock Token). Rather than hold every unit of idle collateral and the whole queue hostage to a
+    // stablecoin action, `rollClose` goes to Idle anyway and keeps the claim: `claimKey != 0 &&
+    // phase == Idle` is the stranded state ({isStranded}). While it holds:
+    //   - deposits are refused and instant redemption is off (nobody buys in or leaves at a NAV
+    //     that cannot yet see the claim's USDG); the queue keeps working on the IDLE balance;
+    //   - `rollOpen` reverts `StillStranded`, so there is exactly one stranded claim at a time;
+    //   - every epoch that settles while stranded takes a pro-rata WAD share of the claim, paid when
+    //     the claim is finally redeemed by the permissionless {retryStrandedClaim}.
+    // Each stranding is a GENERATION. A later cycle can strand again only after the earlier claim
+    // was redeemed, so generations resolve strictly in order and an owner never holds unresolved
+    // shares of two generations at once.
+
+    /// @notice How one stranded claim was finally redeemed, and how much of the settled queue's
+    ///         share of it is still waiting to be folded into owners' owed balances.
+    /// @dev `assetsLeft` sits inside `reservedAssets` and `usdgLeft` inside `usdgReservedForQueue`
+    ///      from the moment of redemption; {_materializeStrand} moves them into `owedAssets` /
+    ///      `owedQueueUsdg` owner by owner, the last owner taking whatever is left so the share
+    ///      drains to exactly zero. Zero for an unresolved generation.
+    struct Strand {
+        uint256 assetsIn;
+        uint256 usdgIn;
+        uint256 wadLeft;
+        uint256 assetsLeft;
+        uint256 usdgLeft;
+    }
+
+    /// @notice Stranding generation counter. Bumped every time a `rollClose` strands its claim.
+    uint256 public strandGen;
+
+    /// @notice The last generation whose claim was redeemed. Equal to {strandGen} when nothing is
+    ///         stranded right now.
+    uint256 public lastResolvedGen;
+
+    /// @notice WAD share of the stranded claim still owned by live shares. 1e18 the moment a
+    ///         claim strands; every queue settlement while stranded moves part of it to an epoch.
+    ///         Meaningful only while {isStranded}.
+    uint256 public strandedRemainingWad;
+
+    /// @notice Per generation, what the redeem returned and what the queue's share still holds.
+    mapping(uint256 => Strand) public strands;
+
+    /// @notice WAD share of a stranded claim owned by an epoch that settled while stranded, drawn
+    ///         down as its entries settle. Zero for an epoch that settled while flat.
+    mapping(uint256 => uint256) public epochStrandWad;
+
+    /// @notice The generation {epochStrandWad} belongs to.
+    mapping(uint256 => uint256) public epochStrandGen;
+
+    /// @notice WAD share of a stranded claim staged against an account by a settled queue entry,
+    ///         not yet folded into `owedAssets` / `owedQueueUsdg`.
+    mapping(address => uint256) public owedStrandWad;
+
+    /// @notice The generation {owedStrandWad} belongs to.
+    mapping(address => uint256) public owedStrandGen;
+
+    /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
@@ -214,9 +276,24 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     event ReserveHaircut(address indexed owner, uint256 booked, uint256 paid);
     event RollOpen(uint32 indexed cycleNumber, uint256 indexed optionId, uint112 contractsCount, uint256 strikeUsdg);
     event BookLocked(uint32 indexed cycleNumber);
+    /// @dev On a stranded close `assetsReturned` and `usdgFromAssignment` are both 0 and a
+    ///      {ClaimStranded} is emitted immediately before; the claim's proceeds are reported by the
+    ///      {ClaimRedeemed} and {StrandedClaimRecovered} of the later `retryStrandedClaim`.
     event RollClose(
         uint32 indexed cycleNumber, uint256 assetsReturned, uint256 usdgFromAssignment, uint256 contractsAssignedCount
     );
+    /// @dev `rollClose` could not redeem the cycle's claim and went to Idle keeping it (F-02).
+    event ClaimStranded(uint32 indexed cycleNumber, uint256 indexed claimKey, uint256 gen);
+    /// @dev An epoch settled while a claim was stranded and owns `wad` (of 1e18) of generation
+    ///      `gen`'s claim, on top of the idle assets and USDG in its {QueueSettled}.
+    event EpochStrandShare(uint256 indexed epochId, uint256 gen, uint256 wad);
+    /// @dev A stranded claim was redeemed. `queueWad` of its `assets` and `usdgOut` went to the
+    ///      reserves for the epochs that settled while it was stranded; the rest to live shares.
+    event StrandedClaimRecovered(uint256 indexed gen, uint256 assets, uint256 usdgOut, uint256 queueWad);
+    /// @dev An owner's `wad` share of a redeemed stranded claim was folded into `owedAssets` /
+    ///      `owedQueueUsdg`. Like {QueueEntrySettled}, it moves no token; the payout is the
+    ///      {CompleteRedeem} that follows.
+    event StrandShareSettled(address indexed owner, uint256 indexed gen, uint256 wad, uint256 assets, uint256 usdgOut);
     event Harvest(uint32 indexed cycleNumber, uint256 grossUsdg, uint256 feeUsdg, uint256 netUsdg);
     event WritesHalted(bool halted);
     event PolicyUpdated(PolicyParams params);
@@ -262,6 +339,12 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     error UsdgLegBlocked(uint256 usdgOwed);
     error WriteWindowClosed(uint40 exerciseTs);
     error ListingStillValid();
+    /// @dev `retryStrandedClaim` was called while no claim is stranded.
+    error NotStranded();
+    /// @dev The stranded claim still cannot be redeemed (`retryStrandedClaim`), a new cycle cannot
+    ///      open over it (`rollOpen`), or a `completeRedeem` had nothing collectable but a share of
+    ///      it that is not yet redeemed.
+    error StillStranded();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -365,10 +448,35 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      the vault's collateral as a whole, so it comes off the whole; only the final figure
     ///      saturates. Deposits are refused for as long as the balance sits below the reserve
     ///      ({_depositRefused}).
+    ///
+    ///      WHILE A CLAIM IS STRANDED only the live shares' part of it counts. Every epoch that
+    ///      settled while stranded owns a WAD share of the claim ({epochStrandWad}) that is paid to
+    ///      those redeemers at {retryStrandedClaim}, not through the share price, so the locked
+    ///      collateral enters NAV scaled by {strandedRemainingWad}. Deposits and instant redemption
+    ///      are both off while stranded, so this only ever corrects what a viewer is quoted; nothing
+    ///      is bought or sold at it.
     function totalAssets() public view returns (uint256) {
-        uint256 gross = asset.balanceOf(address(this)) + lockedAssets();
+        uint256 gross = asset.balanceOf(address(this)) + _lockedForNav();
         uint256 reserved = reservedAssets;
         return gross > reserved ? gross - reserved : 0;
+    }
+
+    /// @dev The locked collateral that belongs to live shares: all of it in an ordinary cycle, the
+    ///      un-settled fraction of a stranded claim otherwise. {lockedAssets} itself stays the raw
+    ///      claim figure, because that is what the claim will actually return.
+    function _lockedForNav() private view returns (uint256) {
+        uint256 locked = lockedAssets();
+        if (locked == 0 || !isStranded()) return locked;
+        return locked.mulDiv(strandedRemainingWad, 1e18);
+    }
+
+    /// @notice True while `rollClose` has left a claim it could not redeem (AUDIT-FINDINGS F-02).
+    /// @dev Idle with a claim still open is the one state only a failed redeem can produce: every
+    ///      other path into Idle clears `claimKey` first. Deposits and instant redemption are shut,
+    ///      `rollOpen` reverts `StillStranded`, the queue keeps settling on the idle balance, and
+    ///      {retryStrandedClaim} is the way out.
+    function isStranded() public view returns (bool) {
+        return phase == Phase.Idle && claimKey != 0;
     }
 
     /// @notice Idle asset base units available to write against right now.
@@ -416,6 +524,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     }
 
     /// @notice True when a redemption settles in the same transaction.
+    /// @dev Idle AND flat. The second half is what keeps the instant path shut while a claim is
+    ///      stranded ({isStranded}): `contractsWritten` is cleared only by a successful redeem, so an
+    ///      Idle vault with a claim it could not redeem still says "use the queue", and nobody can
+    ///      leave at a NAV that does not yet see the claim's strike USDG.
     function canRedeemInstantly() public view returns (bool) {
         return phase == Phase.Idle && contractsWritten == 0;
     }
@@ -656,18 +768,24 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // earlier epoch can still be collected by someone who has since queued again.
         uint256 shares = (queued != 0 && e < epochId) ? _settleEpochEntry(owner) : 0;
 
+        // A share of a stranded claim that has since been redeemed is folded into the owed
+        // balances here, so it is paid in the same call as everything else.
+        bool folded = _materializeStrand(owner);
+
         // Judged on what was BOOKED, not on what was paid: a reserve haircut can round a booked
         // asset leg down to zero, and that collection still happened.
         bool hadAssets = owedAssets[owner] != 0;
         (assets, usdgOut) = _payoutOwed(owner, receiver);
 
-        if (shares == 0 && !hadAssets && usdgOut == 0) {
+        if (shares == 0 && !hadAssets && !folded && usdgOut == 0) {
             if (queued != 0) revert EpochNotSettled(e, epochId);
             // The only thing left to collect was USDG and it could not move. Say so rather than
             // "nothing queued": the money is still owed and the caller should retry later or to
             // another receiver.
             uint256 blocked = owedQueueUsdg[owner];
             if (blocked != 0) revert UsdgLegBlocked(blocked);
+            // Likewise for a share of a claim that is still stranded: it is owed, not absent.
+            if (owedStrandWad[owner] != 0) revert StillStranded();
             revert NothingQueued();
         }
 
@@ -696,6 +814,17 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         uint256 usdgOut = _entryUsdg(owner, e, shares, ep);
         _queueAccDebt[owner] = 0;
 
+        // An epoch that settled while a claim was stranded also owns a share of that claim. It is
+        // drawn down like the assets, pro rata by shares with the last claimant taking the rest, and
+        // staged as a WAD against the owner: it becomes assets and USDG only once the claim is
+        // redeemed ({_materializeStrand}).
+        uint256 w = epochStrandWad[e];
+        if (w != 0) {
+            uint256 mine = shares == ep.sharesRemaining ? w : w.mulDiv(shares, ep.sharesRemaining);
+            epochStrandWad[e] = w - mine;
+            _stageStrandShare(owner, epochStrandGen[e], mine);
+        }
+
         ep.assetsRemaining -= assets;
         ep.usdgRemaining -= usdgOut;
         ep.sharesRemaining -= shares;
@@ -706,6 +835,55 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         owedQueueUsdg[owner] += usdgOut;
 
         emit QueueEntrySettled(owner, e, shares, assets, usdgOut);
+    }
+
+    /// @dev Stage `wad` of generation `gen`'s stranded claim against `owner`.
+    ///
+    ///      ONE GENERATION PER ACCOUNT. Generations resolve strictly in order (`rollOpen` refuses to
+    ///      open over a stranded claim, so a second claim can strand only after the first was
+    ///      redeemed), and an account's queue slot only ever moves forward through the epochs. So
+    ///      whenever the share being staged belongs to a different generation than the one already
+    ///      staged, the staged one is older and already resolved: fold it into the owed balances
+    ///      first, and the account is left holding shares of a single generation.
+    function _stageStrandShare(address owner, uint256 gen, uint256 wad) private {
+        if (owedStrandWad[owner] != 0 && owedStrandGen[owner] != gen) _materializeStrand(owner);
+        owedStrandWad[owner] += wad;
+        owedStrandGen[owner] = gen;
+    }
+
+    /// @dev Fold `owner`'s staged share of a stranded claim into `owedAssets` / `owedQueueUsdg`,
+    ///      if that claim has been redeemed. Pure bookkeeping: the assets and USDG already sit in the
+    ///      reserves since {retryStrandedClaim} put them there, so this moves a figure from the
+    ///      generation's `*Left` to the owner and nothing else. The last owner of a generation takes
+    ///      exactly what is left, so a generation drains to zero with no dust ({_strandSlice}).
+    /// @return folded True if a share was folded, whether or not it rounded to anything.
+    function _materializeStrand(address owner) private returns (bool folded) {
+        uint256 w = owedStrandWad[owner];
+        if (w == 0) return false;
+        uint256 gen = owedStrandGen[owner];
+        if (gen > lastResolvedGen) return false;
+
+        Strand storage s = strands[gen];
+        (uint256 a, uint256 u) = _strandSlice(s, w);
+        s.wadLeft -= w;
+        s.assetsLeft -= a;
+        s.usdgLeft -= u;
+
+        owedStrandWad[owner] = 0;
+        owedAssets[owner] += a;
+        owedQueueUsdg[owner] += u;
+
+        emit StrandShareSettled(owner, gen, w, a, u);
+        return true;
+    }
+
+    /// @dev What `w` (of 1e18) of a redeemed stranded claim is worth: the pro-rata floor of what
+    ///      the redeem returned, or, for the owner whose share is the last one outstanding, exactly
+    ///      what the queue's part still holds. The floors of the others sum to at most the queue's
+    ///      part, so the last slice is never short of its own floor.
+    function _strandSlice(Strand storage s, uint256 w) private view returns (uint256 assets, uint256 usdgOut) {
+        if (w == s.wadLeft) return (s.assetsLeft, s.usdgLeft);
+        return (s.assetsIn.mulDiv(w, 1e18), s.usdgIn.mulDiv(w, 1e18));
     }
 
     /// @dev Pay out whatever `owner` is owed. This is the only leg that touches tokens, so it
@@ -785,11 +963,18 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice What a queued position is worth once its epoch has settled.
     /// @dev Quotes the asset leg after the reserve haircut ({_haircut}), so it is exactly what
     ///      `completeRedeem` pays now. The USDG leg is quoted as booked; whether it MOVES depends
-    ///      on the stablecoin's pause and freeze state at the time of the call.
+    ///      on the stablecoin's pause and freeze state at the time of the call. A share of a
+    ///      stranded claim counts only once that claim has been redeemed, folded in the same order
+    ///      and with the same rounding as `completeRedeem` ({_stageStrandShare},
+    ///      {_materializeStrand}); a share still stranded is quoted as nothing, because nothing
+    ///      can be collected for it yet.
     function previewCompleteRedeem(address owner) external view returns (uint256 assets, uint256 usdgOut) {
         // Anything already settled out of an epoch but not yet collected.
         assets = owedAssets[owner];
         usdgOut = owedQueueUsdg[owner];
+
+        uint256 w = owedStrandWad[owner];
+        uint256 gen = owedStrandGen[owner];
 
         uint256 shares = queuedSharesOf[owner];
         uint256 e = queuedEpochOf[owner];
@@ -798,7 +983,27 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
             if (ep.sharesRemaining != 0) {
                 assets += (ep.assetsRemaining * shares) / ep.sharesRemaining;
                 usdgOut += _entryUsdg(owner, e, shares, ep);
+
+                uint256 we = epochStrandWad[e];
+                if (we != 0) {
+                    uint256 mine = shares == ep.sharesRemaining ? we : we.mulDiv(shares, ep.sharesRemaining);
+                    uint256 ge = epochStrandGen[e];
+                    if (w != 0 && gen != ge) {
+                        // The staged share is of an older, resolved generation: folded first.
+                        (uint256 a, uint256 u) = _strandSlice(strands[gen], w);
+                        assets += a;
+                        usdgOut += u;
+                        w = 0;
+                    }
+                    w += mine;
+                    gen = ge;
+                }
             }
+        }
+        if (w != 0 && gen <= lastResolvedGen) {
+            (uint256 a, uint256 u) = _strandSlice(strands[gen], w);
+            assets += a;
+            usdgOut += u;
         }
         if (assets != 0) assets = _haircut(assets, reservedAssets);
     }
@@ -822,6 +1027,11 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @param contractsCount Whole lots to write.
     function rollOpen(uint256 optionId_, uint112 contractsCount) external onlyRole(KEEPER_ROLE) nonReentrant {
         if (phase != Phase.Idle) revert WrongPhase(Phase.Idle, phase);
+        // No new cycle over a stranded claim. Explicit rather than left to the write gate: with
+        // `claimKey` non-zero the gate would read this as a top-up of last week's claim, and the
+        // stranded claim's proceeds belong to the holders of record at the close that stranded it,
+        // so they must be collected ({retryStrandedClaim}) before anyone writes against the book.
+        if (claimKey != 0) revert StillStranded();
 
         (uint256 strikeUsdg, uint32 number, uint40 exerciseTs, uint40 expiryTs) = _write(optionId_, contractsCount);
 
@@ -985,6 +1195,19 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @dev Strike proceeds from the claim are credited to holders fee-free; see {_accrueHarvest}.
     /// @dev Callable by the keeper from expiry, and by anyone an hour later. The vault must
     ///      not depend on a hot key staying alive for depositors to get their money back.
+    ///
+    ///      THE CLOSE NEVER DEPENDS ON THE CLAIM REDEEMING (AUDIT-FINDINGS F-02). Valorem's `redeem`
+    ///      pushes the strike USDG and the unassigned NVDA to the vault in one call, and either
+    ///      token's issuer can make that push revert on the spot: USDG paused, the vault or Clear
+    ///      frozen on USDG, Clear's USDG burnt by a supply controller, the vault blocklisted on the
+    ///      Stock Token. An earlier draft let that revert take `rollClose` down, and `rollClose` was
+    ///      the only exit from Listed/Exercisable, so a stablecoin-side action froze every idle unit
+    ///      of collateral and the whole queue indefinitely. Now a failed redeem STRANDS the claim:
+    ///      the vault still goes to Idle, the harvest and the queue settlement still run on what is
+    ///      idle, and the claim is kept for {retryStrandedClaim}. The epoch settled here records its
+    ///      pro-rata share of the claim ({_settleQueue}), deposits and instant redemption stay shut
+    ///      ({isStranded}), and a gas-starved call cannot fake the failure
+    ///      ({ValoremLib.tryRedeemClaim}).
     function rollClose() external nonReentrant {
         Phase p = phase;
         if (p != Phase.Listed && p != Phase.Exercisable) revert WrongPhase(Phase.Exercisable, p);
@@ -1000,17 +1223,69 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // Kill any listing that is somehow still live before the inventory becomes worthless.
         if (listingHash != bytes32(0)) _invalidateAllListings();
 
-        // Read the assignment BEFORE redeeming: `_redeemClaim` zeroes `claimKey`, and the view
-        // returns 0 from then on. An earlier draft emitted a hardcoded 0 here, which made every
-        // assigned week look unassigned in the public cycle tape.
+        // Read the assignment BEFORE redeeming: a successful `_tryRedeemClaim` zeroes `claimKey`,
+        // and the view returns 0 from then on. An earlier draft emitted a hardcoded 0 here, which
+        // made every assigned week look unassigned in the public cycle tape.
         uint256 assignedCount = contractsAssigned();
-        (uint256 assetsReturned, uint256 usdgFromAssignment) = _redeemClaim(asset, usdg);
+        (bool ok, uint256 assetsReturned, uint256 usdgFromAssignment) = _tryRedeemClaim(asset, usdg);
+        if (!ok) {
+            // Stranded. The claim, `optionId` and `contractsWritten` are all kept: the first keeps
+            // {lockedAssets} honest and gives {retryStrandedClaim} something to redeem, the last
+            // keeps the instant path shut. Live shares own all of the claim until an epoch settles.
+            uint256 gen = ++strandGen;
+            strandedRemainingWad = 1e18;
+            emit ClaimStranded(cycleNumber, claimKey, gen);
+        }
         emit RollClose(cycleNumber, assetsReturned, usdgFromAssignment, assignedCount);
 
         _harvest(usdgFromAssignment);
         _settleQueue();
 
         phase = Phase.Idle;
+    }
+
+    /// @notice Redeem a claim that `rollClose` could not, and pay out what it returns. Anyone.
+    /// @dev Permissionless and callable any number of times: it reverts {StillStranded} while the
+    ///      cause persists and settles the claim the first time Valorem lets it through. Nothing
+    ///      here needs the keeper, the guardian or the admin.
+    ///
+    ///      WHO GETS WHAT. Every epoch that settled while the claim was stranded took its pro-rata
+    ///      WAD share of it out of {strandedRemainingWad}. That part of what the redeem returned,
+    ///      `1e18 − strandedRemainingWad` of both legs, is moved into `reservedAssets` and
+    ///      `usdgReservedForQueue` and folded into each owner's owed balances as they collect
+    ///      ({_materializeStrand}). The rest belongs to the shares still live: the NVDA is simply in
+    ///      the balance again, so NAV rises by it, and the USDG goes through the ordinary harvest
+    ///      fee-free, exactly as strike proceeds do on a close that did not strand ({_harvest}). The
+    ///      queue's USDG is marked accounted before the harvest so the harvest never sees it as
+    ///      premium.
+    function retryStrandedClaim() external nonReentrant {
+        if (!isStranded()) revert NotStranded();
+
+        (bool ok, uint256 assetsReturned, uint256 usdgReturned) = _tryRedeemClaim(asset, usdg);
+        if (!ok) revert StillStranded();
+
+        uint256 gen = strandGen;
+        uint256 queueWad = 1e18 - strandedRemainingWad;
+        uint256 queueAssets = assetsReturned.mulDiv(queueWad, 1e18);
+        uint256 queueUsdg = usdgReturned.mulDiv(queueWad, 1e18);
+
+        strands[gen] = Strand({
+            assetsIn: assetsReturned,
+            usdgIn: usdgReturned,
+            wadLeft: queueWad,
+            assetsLeft: queueAssets,
+            usdgLeft: queueUsdg
+        });
+        lastResolvedGen = gen;
+        strandedRemainingWad = 0;
+
+        reservedAssets += queueAssets;
+        usdgReservedForQueue += queueUsdg;
+        _markUsdgAccounted(usdgAccounted + queueUsdg);
+
+        emit StrandedClaimRecovered(gen, assetsReturned, usdgReturned, queueWad);
+
+        _harvest(usdgReturned - queueUsdg);
     }
 
     /// @notice Settle the redeem queue while the vault is flat. Anyone.
@@ -1021,12 +1296,16 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      idle, e.g. the last holder with half a token) froze a queuer's shares indefinitely
     ///      while everyone who had not queued could still redeem instantly.
     ///
-    ///      While Idle the vault is flat (`rollClose` clears `contractsWritten` on the way in), so
-    ///      {idleAssets} is the whole NAV and settling now pays exactly what an instant redemption
-    ///      of the same shares would, virtual share included (see {_settleQueue}). The harvest checkpoint first folds any USDG that arrived
-    ///      since the last close into the index, so the escrow's accrual is paid to the queuers.
-    ///      It moves no tokens, so it works under an issuer freeze and while halted; the payout
-    ///      is `completeRedeem`, as always.
+    ///      While Idle and flat {idleAssets} is the whole NAV and settling now pays exactly what an
+    ///      instant redemption of the same shares would, virtual share included (see
+    ///      {_settleQueue}). The harvest checkpoint first folds any USDG that arrived since the last
+    ///      close into the index, so the escrow's accrual is paid to the queuers. It moves no
+    ///      tokens, so it works under an issuer freeze and while halted; the payout is
+    ///      `completeRedeem`, as always.
+    ///
+    ///      WHILE A CLAIM IS STRANDED this is the exit: instant redemption is off, and an epoch
+    ///      settled here is paid its slice of the idle balance now and its pro-rata share of the
+    ///      stranded claim at {retryStrandedClaim} ({_settleQueue}).
     function settleQueue() external nonReentrant {
         if (phase != Phase.Idle) revert WrongPhase(Phase.Idle, phase);
         if (queuedShares == 0) revert NothingQueued();
@@ -1125,6 +1404,23 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // seed 3 wei, donate, let a victim round down to one share, then queue and settle out
         // with part of the victim's deposit. The virtual share now keeps its slice on both paths.
         uint256 payoutAssets = q.mulDiv(idleAssets() + 1, totalSupply() + 1);
+
+        // A claim still open here is a STRANDED one: this is either the `rollClose` that could not
+        // redeem it, or a flat `settleQueue` while it waits. The idle price above then values the
+        // claim at nothing, so the epoch also takes the escrow's `q / supply` of whatever live
+        // shares still own of the claim, as a WAD share paid when {retryStrandedClaim} redeems it.
+        // Measured against the supply BEFORE the burn below, which still counts the escrow.
+        if (claimKey != 0) {
+            uint256 remaining = strandedRemainingWad;
+            uint256 share = remaining.mulDiv(q, totalSupply());
+            if (share != 0) {
+                strandedRemainingWad = remaining - share;
+                uint256 gen = strandGen;
+                epochStrandWad[epochId] = share;
+                epochStrandGen[epochId] = gen;
+                emit EpochStrandShare(epochId, gen, share);
+            }
+        }
 
         queuedShares = 0;
         _burn(address(this), q);
