@@ -34,7 +34,8 @@ struct PolicyParams {
 ///          base units, i.e. 6 decimals. $180.00 => 180_000_000.
 ///        - `strikeUsdg` is Valorem's `exerciseAmount` for ONE lot, also USDG 6 decimals.
 ///        - `contracts` is a whole number of lots. One lot = 1e18 asset base units.
-///        - `premiumUsdg` is gross premium in USDG base units, before Overcall's 5% cut.
+///        - `premiumUsdg` is the premium a buyer pays in USDG base units. Every listing has ONE
+///          consideration item (USDG to the vault), so gross and net premium are the same figure.
 library Policy {
     /*//////////////////////////////////////////////////////////////
                               HARD CAPS
@@ -70,15 +71,14 @@ library Policy {
     /// @dev Protocol fee can never exceed 20% of harvested premium.
     uint16 internal constant PROTOCOL_FEE_CEIL_BPS = 2_000;
 
-    /// @dev At most three signed listings per cycle (README "Policy (launch)").
+    /// @dev At most three authorised listings per cycle (README "Policy (launch)"). Every
+    ///      `approveListing` spends one, cancelled or not: under write-on-fill a listing is a
+    ///      standing offer sized to capacity, so a relist is a REPRICE, and three reprices a week
+    ///      is the ceiling on how far a keeper can walk the quote before the guardian must act.
     uint8 internal constant MAX_LISTINGS_PER_CYCLE = 3;
 
-    /// @dev Overcall's cut of gross premium, in bps. Their fee is the second Seaport
-    ///      consideration item in the same fill; the vault receives the remainder.
-    uint16 internal constant OVERCALL_FEE_BPS = 500;
-
-    /// @dev One lot of the underlying. Stock Tokens are 18 decimals and Overcall's lot size
-    ///      is exactly 1.0000 Stock Token per contract.
+    /// @dev One lot of the underlying. Stock Tokens are 18 decimals and every option type the
+    ///      vault will arm has `underlyingAmount == LOT`: exactly 1.0000 Stock Token per contract.
     uint256 internal constant LOT = 1e18;
 
     /*//////////////////////////////////////////////////////////////
@@ -164,9 +164,10 @@ library Policy {
                                PREMIUM
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Minimum acceptable GROSS premium for `contracts` lots at `spotUsdg`.
-    /// @dev Gross, i.e. before Overcall's 5% cut. Spot notional is spot x contracts because
-    ///      one contract covers exactly one lot.
+    /// @notice Minimum acceptable premium for `contracts` lots at `spotUsdg`.
+    /// @dev Spot notional is spot x contracts because one contract covers exactly one lot. The
+    ///      Valorem engine fee, when switched on, is added ON TOP of this by the fill gate
+    ///      ({ValoremLib.writeOnFill}), valued at spot.
     function minPremium(uint256 spotUsdg, uint256 contractsCount, PolicyParams memory p)
         internal
         pure
@@ -183,46 +184,6 @@ library Policy {
     {
         uint256 floorUsdg = minPremium(spotUsdg, contractsCount, p);
         if (premiumUsdg < floorUsdg) revert PremiumBelowMinimum(premiumUsdg, floorUsdg);
-    }
-
-    /// @notice Splits a listing premium into the vault's consideration item and Overcall's 5%.
-    /// @param unitPriceUsdg Premium asked for ONE contract, in USDG base units.
-    /// @param contractsCount Number of contracts offered.
-    /// @return toVault Amount for consideration[0], paid to the vault.
-    /// @return toOvercall Amount for consideration[1], paid to Overcall's fee recipient.
-    /// @return grossUsdg unitPrice * contracts, i.e. what a full fill costs the buyer.
-    ///
-    /// @dev THE ROUNDING HERE IS NOT A STYLE CHOICE. Overcall's order builder computes the
-    ///      fee PER CONTRACT and then multiplies, not on the total:
-    ///
-    ///          feePerContract    = unitPrice * 500 / 10_000     (integer division)
-    ///          writerPerContract = unitPrice - feePerContract
-    ///          consideration[1]  = feePerContract    * N
-    ///          consideration[0]  = writerPerContract * N
-    ///
-    ///      Rounding on the total instead produces amounts that still sign and still pass
-    ///      `validate`, but Seaport then rejects a partial fill with `InexactFraction`
-    ///      because the consideration is no longer divisible by the order size. Since every
-    ///      Overcall listing is PARTIAL_OPEN, that would quietly make the listing fillable
-    ///      only in full, and an order the buyer's UI cannot fill is an unfilled week.
-    ///      Confirmed against Overcall's live client bundle; see ops/recon/R3-overcall-api.md.
-    function splitPremium(uint256 unitPriceUsdg, uint256 contractsCount)
-        internal
-        pure
-        returns (uint256 toVault, uint256 toOvercall, uint256 grossUsdg)
-    {
-        uint256 feePerContract = (unitPriceUsdg * OVERCALL_FEE_BPS) / BPS;
-        uint256 writerPerContract = unitPriceUsdg - feePerContract;
-        toOvercall = feePerContract * contractsCount;
-        toVault = writerPerContract * contractsCount;
-        grossUsdg = unitPriceUsdg * contractsCount;
-    }
-
-    /// @notice The smallest per-contract premium whose 5% fee does not round away to nothing.
-    /// @dev Overcall's schema rejects a zero-amount second consideration item, so a unit price
-    ///      below this is unlistable however well it clears the policy floor.
-    function minListableUnitPrice() internal pure returns (uint256) {
-        return BPS / OVERCALL_FEE_BPS;
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -49,7 +49,7 @@ contract AF02_UsdgFreezeRollClose is BaseTest {
     ///      the buyer exercises `assigned` contracts in the window.
     function _setupWeek(uint112 assigned) internal returns (uint256 bobShares) {
         _deposit(alice, 20e18);
-        optionId = _rollOpen(10);
+        optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
         _fill(c, 10);
 
@@ -108,11 +108,11 @@ contract AF02_UsdgFreezeRollClose is BaseTest {
         vm.expectRevert(Vault.UseQueue.selector);
         vault.redeem(aliceShares, alice, alice);
 
-        // A fresh option type for next week exists; the vault still refuses to write over the claim.
+        // Whatever type the keeper names, the vault refuses to arm a cycle over the claim.
         uint256 nextOption = optionIds[RUNG_PICK];
         vm.prank(keeper);
         vm.expectRevert(Vault.StillStranded.selector);
-        vault.rollOpen(nextOption, 1);
+        vault.rollOpen(nextOption);
 
         vm.expectRevert(Vault.StillStranded.selector);
         vault.retryStrandedClaim();
@@ -443,7 +443,7 @@ contract AF02_UsdgFreezeRollClose is BaseTest {
         feed.setAnswer(SPOT_FEED);
         uint256 carolShares = _deposit(carol, 30e18);
         uint256 supply = vault.totalSupply();
-        optionId = _rollOpen(10);
+        optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
         _fill(c, 10);
         vm.prank(carol);

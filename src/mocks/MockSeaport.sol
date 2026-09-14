@@ -137,6 +137,12 @@ contract MockSeaport is ISeaport {
 
         filled[h] += fillAmount;
 
+        // Seaport moves the OFFER items first and the consideration items second
+        // (OrderFulfiller `_applyFractionsAndTransferEach`), so a buyer's `onERC1155Received`
+        // runs before its USDG has left. Kept in that order so a re-entering buyer sees the same
+        // intermediate state here as on the real runtime.
+        IERC1155Minimal(item.token).safeTransferFrom(o.offerer, msg.sender, item.identifierOrCriteria, fillAmount, "");
+
         for (uint256 i; i < o.consideration.length; i++) {
             ConsiderationItem calldata c = o.consideration[i];
             // Seaport rejects a fraction it cannot express exactly.
@@ -144,8 +150,6 @@ contract MockSeaport is ISeaport {
             uint256 pay = (c.startAmount * fillAmount) / total;
             if (pay != 0) IERC20(c.token).safeTransferFrom(msg.sender, c.recipient, pay);
         }
-
-        IERC1155Minimal(item.token).safeTransferFrom(o.offerer, msg.sender, item.identifierOrCriteria, fillAmount, "");
 
         if (restricted) {
             zp.orderHashes = new bytes32[](1);

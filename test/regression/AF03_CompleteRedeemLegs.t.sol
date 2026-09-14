@@ -5,7 +5,6 @@ import {BaseTest} from "../Base.t.sol";
 import {Vault} from "../../src/Vault.sol";
 import {MockERC20} from "../../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
-import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 
 /// @title AF-03 regression: `completeRedeem` pays the NVDA leg even when the USDG leg cannot move
 /// @notice Ported from the audit PoC `PoC_completeredeem_all_or_nothing_legs.t.sol` (AUDIT-FINDINGS F-03,
@@ -23,13 +22,11 @@ contract AF03_CompleteRedeemLegs is BaseTest {
         _rollClose();
     }
 
-    /// @dev alice & bob deposit 20e18; 10 contracts filled at $2; alice queues all 20e18.
+    /// @dev alice & bob deposit 20e18; 10 contracts filled at $1.90; alice queues all 20e18.
     function _setupFilledWeekWithAliceQueued() internal {
         _deposit(alice, 20e18);
         _deposit(bob, 20e18);
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
         vm.prank(alice);
         vault.queueRedeem(20e18);
     }

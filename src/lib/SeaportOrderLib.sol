@@ -11,33 +11,42 @@ import {
     ItemType,
     OrderType
 } from "../interfaces/ISeaport.sol";
-import {Policy} from "../Policy.sol";
 
 /// @title SeaportOrderLib
 /// @notice Validation and encoding for the vault's Seaport listings.
 /// @dev DEPLOYMENT NOTE: these functions are `public`, so this compiles to a standalone
 ///      library that {Vault} reaches by DELEGATECALL and that must be deployed and linked
-///      before the vault. That is not a style preference. Seaport's order structs nest
-///      dynamic arrays, and the three encoders the vault needs (`getOrderHash`, `validate`,
-///      `cancel`) cost several kilobytes inlined, which pushed the vault past the EIP-170
-///      24 KB runtime limit. Foundry links this automatically in tests; `script/Deploy.s.sol`
-///      deploys it explicitly.
+///      before the vault. Seaport's order structs nest dynamic arrays, and the three encoders
+///      the vault needs (`getOrderHash`, `validate`, `cancel`) cost several kilobytes inlined.
+///      Chain 4663 enforces a 98,304 B code limit rather than EIP-170's 24,576 B, so the split
+///      is no longer forced; it is kept because the library has its own Verify check and a
+///      smaller vault is a smaller audit surface. Foundry links this automatically in tests;
+///      `script/Deploy.s.sol` deploys it explicitly.
 ///
 ///      DELEGATECALL SEMANTICS MATTER HERE. Because a `public` library function runs in the
 ///      caller's context, `address(this)` inside these functions is the VAULT, and the calls
 ///      made out to Seaport carry the vault as `msg.sender`. That is exactly what `validate`
 ///      and `cancel` require: Seaport only accepts them from the offerer.
+///
+///      THE ORDER SHAPE UNDER WRITE-ON-FILL. A listing is a PARTIAL_RESTRICTED order whose zone
+///      is the vault itself, offering option tokens the vault does NOT yet hold. Seaport 1.6
+///      calls the zone's `authorizeOrder` before it moves anything, and that hook writes exactly
+///      the filled amount into Valorem (see {Vault.authorizeOrder}). The order therefore commits,
+///      through its hash, to the one zone that can perform the write, to a partial-fill type
+///      (so a buyer can take a fraction and the rest stays offered), and to a single USDG
+///      consideration item paid to the vault. Nothing else is listable.
 library SeaportOrderLib {
     /// @dev Everything the shape check needs from the vault's own state, in one struct so
     ///      the checks stay inside the EVM stack limit.
     struct Checks {
-        address zone;
         bytes32 conduitKey;
-        address overcallFeeRecipient;
         address usdgToken;
         address clearAddress;
         uint256 expectedOptionId;
-        uint256 availableContracts;
+        /// @dev Contracts the vault could still write this cycle: `Policy.maxContracts(NAV)`
+        ///      less `contractsWritten`. An order may not offer more than that, or a full fill
+        ///      would be refused by the size gate at the hook and the listing would be dead weight.
+        uint256 capacityContracts;
         uint40 exerciseTimestamp;
         uint256 strikeUsdg;
     }
@@ -57,16 +66,13 @@ library SeaportOrderLib {
     error BadOfferIdentifier(uint256 expected, uint256 got);
     error DutchAuctionNotAllowed();
     error OfferAmountZero();
-    error OfferExceedsInventory(uint256 requested, uint256 available);
+    error OfferExceedsCapacity(uint256 requested, uint256 capacity);
     error BadConsiderationLength(uint256 got);
     error BadConsiderationItemType(ItemType got);
     error BadConsiderationToken(address expected, address got);
     error BadConsiderationIdentifier(uint256 got);
     error BadVaultRecipient(address expected, address got);
-    error BadOvercallRecipient(address expected, address got);
-    error BadFeeSplit(uint256 expectedToVault, uint256 gotToVault, uint256 expectedToOvercall, uint256 gotToOvercall);
     error PremiumNotDivisibleByOrderSize(uint256 grossUsdg, uint256 amount);
-    error OvercallFeeRoundsToZero(uint256 unitPriceUsdg, uint256 minimum);
     error UnitPriceExceedsStrike(uint256 unitPriceUsdg, uint256 strikeUsdg);
     error BadCounter(uint256 expected, uint256 got);
     error ListingOutlivesExercise(uint256 endTime, uint256 exerciseTimestamp);
@@ -82,6 +88,12 @@ library SeaportOrderLib {
 
     /// @notice Check a proposed order against the vault's state, then mark it valid on Seaport.
     /// @dev Runs by DELEGATECALL, so `address(this)` is the vault throughout.
+    ///
+    ///      WHY `validate()` AND NOT A SIGNATURE. Seaport skips signature verification for an
+    ///      order the offerer has validated on chain, and for every later fill of a validated
+    ///      order (`OrderValidator.sol:270`). The vault has no signing key and no EIP-1271 hook,
+    ///      so pre-validation is the ONLY thing that makes an empty-signature fill succeed, and
+    ///      killing a listing is therefore `cancel` or `incrementCounter`, never a state flag.
     function approve(ISeaport seaport, OrderComponents calldata c, Checks memory k)
         public
         returns (bytes32 orderHash, uint256 grossUsdg, uint256 amount)
@@ -128,20 +140,26 @@ library SeaportOrderLib {
                              SHAPE CHECKS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Who the order is from, and what it is selling.
+    /// @dev Who the order is from, who may authorise its fills, and what it is selling.
     function _checkOffer(OrderComponents calldata c, Checks memory k) private view returns (uint256 amount) {
         if (c.offerer != address(this)) revert BadOfferer(c.offerer);
-        if (c.zone != k.zone) revert BadZone(k.zone, c.zone);
+        // THE ZONE IS THE VAULT, AND NOTHING ELSE. Seaport 1.6 calls the zone's `authorizeOrder`
+        // before any transfer of a restricted order, and that hook is where the vault writes the
+        // filled contracts into Valorem. An order naming any other zone would be a promise to
+        // deliver option tokens the vault never mints; Seaport would then fail the transfer, but
+        // refusing it here keeps the keeper from publishing a dead listing at all. The hash
+        // commits to the zone, so a foreign order cannot borrow this vault's authorisation.
+        if (c.zone != address(this)) revert BadZone(address(this), c.zone);
         if (c.conduitKey != k.conduitKey) revert BadConduitKey(k.conduitKey, c.conduitKey);
-        // Overcall's schema refuses any non-zero zone hash, and a listing has no zone to pass
-        // data to anyway.
+        // The vault passes no data to itself through the zone hash.
         if (c.zoneHash != bytes32(0)) revert BadZoneHash(c.zoneHash);
 
-        // Restricted orders hand a third party a veto over every fill. Contract orders are a
-        // different mechanism entirely. Neither belongs on a vault listing.
-        if (c.orderType != OrderType.FULL_OPEN && c.orderType != OrderType.PARTIAL_OPEN) {
-            revert BadOrderType(c.orderType);
-        }
+        // PARTIAL_RESTRICTED and only that. Restricted, because the fill must run the vault's
+        // hooks (an open order would let Seaport move tokens the vault does not have, and a fill
+        // that skipped `authorizeOrder` would skip the write). Partial, because a buyer takes what
+        // they want and the remainder stays offered; a FULL_RESTRICTED order could only ever be
+        // filled in one shot. CONTRACT orders are a different mechanism entirely.
+        if (c.orderType != OrderType.PARTIAL_RESTRICTED) revert BadOrderType(c.orderType);
 
         if (c.offer.length != 1) revert BadOfferLength(c.offer.length);
         OfferItem calldata o = c.offer[0];
@@ -155,58 +173,42 @@ library SeaportOrderLib {
         if (o.startAmount != o.endAmount) revert DutchAuctionNotAllowed();
         amount = o.startAmount;
         if (amount == 0) revert OfferAmountZero();
-        if (amount > k.availableContracts) revert OfferExceedsInventory(amount, k.availableContracts);
+        if (amount > k.capacityContracts) revert OfferExceedsCapacity(amount, k.capacityContracts);
     }
 
-    /// @dev Who gets paid, how much, and in what.
+    /// @dev Who gets paid, how much, and in what: ONE consideration item, USDG, to the vault.
+    ///      There is no third-party fee item any more. The vault is not listed on any venue that
+    ///      takes a cut, and paying one for flow it did not provide would be a pure depositor cost.
     function _checkConsideration(OrderComponents calldata c, Checks memory k, uint256 amount)
         private
         view
         returns (uint256 grossUsdg)
     {
-        if (c.consideration.length != 2) revert BadConsiderationLength(c.consideration.length);
+        if (c.consideration.length != 1) revert BadConsiderationLength(c.consideration.length);
 
         ConsiderationItem calldata toVault = c.consideration[0];
-        ConsiderationItem calldata toOvercall = c.consideration[1];
-
         if (toVault.itemType != ItemType.ERC20) revert BadConsiderationItemType(toVault.itemType);
-        if (toOvercall.itemType != ItemType.ERC20) revert BadConsiderationItemType(toOvercall.itemType);
         if (toVault.token != k.usdgToken) revert BadConsiderationToken(k.usdgToken, toVault.token);
-        if (toOvercall.token != k.usdgToken) revert BadConsiderationToken(k.usdgToken, toOvercall.token);
         if (toVault.identifierOrCriteria != 0) revert BadConsiderationIdentifier(toVault.identifierOrCriteria);
-        if (toOvercall.identifierOrCriteria != 0) revert BadConsiderationIdentifier(toOvercall.identifierOrCriteria);
         if (toVault.startAmount != toVault.endAmount) revert DutchAuctionNotAllowed();
-        if (toOvercall.startAmount != toOvercall.endAmount) revert DutchAuctionNotAllowed();
 
-        // The vault must be paid, and Overcall must be paid their fee. Getting recipient[0]
-        // wrong is how a compromised keeper would route the premium to itself.
+        // Getting the recipient wrong is how a compromised keeper would route the premium to
+        // itself. No address but the vault is accepted.
         if (toVault.recipient != address(this)) revert BadVaultRecipient(address(this), toVault.recipient);
-        if (toOvercall.recipient != k.overcallFeeRecipient) {
-            revert BadOvercallRecipient(k.overcallFeeRecipient, toOvercall.recipient);
-        }
 
-        grossUsdg = toVault.startAmount + toOvercall.startAmount;
+        grossUsdg = toVault.startAmount;
 
-        // Every Overcall listing is PARTIAL_OPEN, so both consideration amounts must divide
-        // evenly by the order size or Seaport rejects a fraction with InexactFraction. That
-        // starts with the gross being an exact multiple of the contract count.
+        // A partial fill pays `gross * k / amount`, and Seaport rejects a fraction it cannot
+        // express exactly with `InexactFraction`. The gross must therefore be a whole multiple of
+        // the contract count, which also makes the per-contract price the hooks re-check at fill
+        // time an exact figure rather than a rounded one.
         if (grossUsdg % amount != 0) revert PremiumNotDivisibleByOrderSize(grossUsdg, amount);
         uint256 unitPriceUsdg = grossUsdg / amount;
 
-        // Below this the 5% fee floors to zero, and Overcall's schema rejects a zero-amount
-        // consideration item, so the listing would never reach a buyer.
-        uint256 minUnit = Policy.minListableUnitPrice();
-        if (unitPriceUsdg < minUnit) revert OvercallFeeRoundsToZero(unitPriceUsdg, minUnit);
-
         // A premium above the strike is never a real quote; it is a fat finger or a corrupted
-        // price feed. Overcall rejects it server-side too.
+        // price feed.
         if (k.strikeUsdg != 0 && unitPriceUsdg > k.strikeUsdg) {
             revert UnitPriceExceedsStrike(unitPriceUsdg, k.strikeUsdg);
-        }
-
-        (uint256 expVault, uint256 expOvercall,) = Policy.splitPremium(unitPriceUsdg, amount);
-        if (toVault.startAmount != expVault || toOvercall.startAmount != expOvercall) {
-            revert BadFeeSplit(expVault, toVault.startAmount, expOvercall, toOvercall.startAmount);
         }
     }
 
@@ -215,7 +217,9 @@ library SeaportOrderLib {
         if (c.startTime > block.timestamp) revert ListingStartsInFuture(c.startTime);
         if (c.endTime <= block.timestamp) revert ListingAlreadyEnded(c.endTime);
         // A listing that outlives the exercise window could be filled after the buyer's right
-        // to exercise has already begun, which is not a call anyone should be selling.
+        // to exercise has already begun, which is not a call anyone should be selling. Seaport
+        // treats `endTime` as exclusive, so `endTime == exerciseTimestamp` fills up to the second
+        // before the window and not on the tick; the fill hook enforces the same edge itself.
         if (c.endTime > exerciseTimestamp) revert ListingOutlivesExercise(c.endTime, exerciseTimestamp);
 
         uint256 counter = seaport.getCounter(address(this));

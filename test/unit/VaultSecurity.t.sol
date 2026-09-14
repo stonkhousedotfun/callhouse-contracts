@@ -3,8 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseTest} from "../Base.t.sol";
 import {Vault} from "../../src/Vault.sol";
-import {ValoremLib} from "../../src/lib/ValoremLib.sol";
-import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
+import {IValoremClear} from "../../src/interfaces/IValoremClear.sol";
 import {Distributor} from "../../src/Distributor.sol";
 
 /// @notice Regression tests for the findings of the 2026-09-12 adversarial security audit.
@@ -40,9 +39,7 @@ contract VaultSecurityTest is BaseTest {
     function test_critical_cannotDepositAfterAssignmentCrashesNav() public {
         _deposit(alice, 20e18);
 
-        uint256 optionId = _rollOpen(19);
-        OrderComponents memory c = _approveListing(optionId, 19, _okUnitPrice());
-        _fill(c, 19);
+        (uint256 optionId,) = _openAndSell(19);
 
         uint256 navBefore = vault.totalAssets();
         assertEq(navBefore, 20e18, "NAV is whole while the call is live");
@@ -76,9 +73,7 @@ contract VaultSecurityTest is BaseTest {
     ///      reopen it. This is the whole point of the fix.
     function test_critical_windowClosesEvenIfNobodyEverCallsLockBook() public {
         _deposit(alice, 20e18);
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
 
         // One second before the window opens, a deposit is still legitimate.
         vm.warp(uint256(exerciseTs) - 1);
@@ -101,9 +96,7 @@ contract VaultSecurityTest is BaseTest {
     /// @dev Closing the deposit window must not trap anyone. Every exit stays open.
     function test_critical_closedWindowStillLetsEveryoneOut() public {
         _deposit(alice, 20e18);
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        (uint256 optionId,) = _openAndSell(10);
 
         _warpToExercise();
         _exercise(optionId, 4);
@@ -133,29 +126,26 @@ contract VaultSecurityTest is BaseTest {
         valorem-adapter-3 / access-control-02.
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev The Overcall registry is owned by a single third-party EOA, and its `setCycle` bounds
-    ///      the expiry only from BELOW (`exerciseAt + MIN_EXERCISE_WINDOW`). Nothing stops it
-    ///      setting an expiry years out, by malice or by fat finger. The vault snapshots that
-    ///      expiry, and `rollClose` then refuses to run until it passes — so up to 95% of
-    ///      depositor collateral would sit locked in Valorem for the whole tenor with no
-    ///      redemption path for anyone. A skipped week is strictly better than that.
+    /// @dev `newOptionType` is permissionless and Valorem bounds an expiry only from BELOW (one
+    ///      minute after exercise). Nothing stops a keeper, by malice or by fat finger, arming a
+    ///      type whose expiry is years out. The vault snapshots that expiry, and `rollClose` then
+    ///      refuses to run until it passes — so everything sold would sit locked in Valorem for
+    ///      the whole tenor with no redemption path for anyone. A skipped week is strictly better
+    ///      than that.
     function test_high_refusesAnAbsurdlyLongCycleBeforeAnyCollateralMoves() public {
         _deposit(alice, 20e18);
 
         uint40 farExercise = uint40(block.timestamp + 1 days);
         uint40 farExpiry = uint40(block.timestamp + 3650 days);
 
-        uint256[] memory ids = new uint256[](1);
-        uint96[] memory ks = new uint96[](1);
-        ids[0] = clear.newOptionType(address(nvda), 1e18, address(usdg), 231_000_000, farExercise, farExpiry);
-        ks[0] = 231_000_000;
-        registry.setCycleWithStrikes(ids, ks, farExercise, farExpiry);
-
-        assertTrue(registry.isWritingOpen(), "the registry is perfectly happy with this cycle");
+        uint256 far = clear.newOptionType(address(nvda), 1e18, address(usdg), 231_000_000, farExercise, farExpiry);
+        assertEq(
+            uint8(clear.tokenType(far)), uint8(IValoremClear.TokenType.Option), "Valorem is perfectly happy with it"
+        );
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(Vault.BadCycleWindow.selector, farExercise, farExpiry));
-        vault.rollOpen(ids[0], 10);
+        vault.rollOpen(far);
 
         // Nothing moved: the check runs before the write.
         assertEq(uint8(vault.phase()), 0, "still Idle");
@@ -166,31 +156,30 @@ contract VaultSecurityTest is BaseTest {
     /// @dev A normal weekly cycle is unaffected by the bound.
     function test_high_normalWeeklyCycleStillWrites() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
         assertEq(uint8(vault.phase()), 1, "a 7-day cycle is nowhere near the 21-day ceiling");
     }
 
-    /// @dev The vault must not depend on the registry having validated the option it writes. The
-    ///      whole deposit gate rests on "assignment cannot happen before `cycleExerciseTs`", and
-    ///      that only holds if the option actually written shares that timestamp.
-    function test_high_refusesAnOptionWhoseWindowDiffersFromTheCycle() public {
+    /// @dev The whole deposit gate rests on "assignment cannot happen before `cycleExerciseTs`", so
+    ///      the vault's window must be the OPTION'S OWN, read from Valorem, where the tuple is
+    ///      immutable. There is no second source of truth (the registry that used to describe the
+    ///      cycle is gone), so there is nothing for the option to disagree with: whatever type the
+    ///      keeper arms, the vault closes deposits at exactly that type's exercise timestamp.
+    function test_high_cycleWindowIsTheOptionsOwn() public {
         _deposit(alice, 20e18);
 
-        // An option whose exercise time is a day earlier than the cycle claims.
-        uint40 rogueExercise = exerciseTs - 1 days;
-        uint256 rogue = clear.newOptionType(address(nvda), 1e18, address(usdg), 231_000_000, rogueExercise, expiryTs);
-
-        uint256[] memory ids = new uint256[](2);
-        uint96[] memory ks = new uint96[](2);
-        ids[0] = optionIds[RUNG_PICK];
-        ks[0] = strikes[RUNG_PICK];
-        ids[1] = rogue;
-        ks[1] = 231_000_001;
-        registry.setCycleWithStrikes(ids, ks, exerciseTs, expiryTs);
+        // A type whose window opens a day earlier than this week's ladder.
+        uint40 earlyExercise = exerciseTs - 1 days;
+        uint256 early = clear.newOptionType(address(nvda), 1e18, address(usdg), 231_000_000, earlyExercise, expiryTs);
 
         vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(ValoremLib.OptionWindowMismatch.selector, rogueExercise, expiryTs));
-        vault.rollOpen(rogue, 10);
+        vault.rollOpen(early);
+        assertEq(vault.cycleExerciseTs(), earlyExercise, "the snapshot is the type's own exercise timestamp");
+        assertEq(vault.cycleExpiryTs(), expiryTs, "and its own expiry");
+
+        // Deposits close on THAT timestamp, not on the ladder's.
+        vm.warp(earlyExercise);
+        assertEq(vault.maxDeposit(bob), 0, "deposits shut at the armed type's exercise timestamp");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -206,9 +195,7 @@ contract VaultSecurityTest is BaseTest {
     ///      The push is now best-effort and {Vault.sweepFee} is the recovery path.
     function test_medium_blockedFeeRecipientDoesNotFreezeTheVault() public {
         _deposit(alice, 20e18);
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
 
         // The stablecoin issuer blocklists our fee Safe.
         usdg.freeze(feeSafe);
@@ -256,10 +243,11 @@ contract VaultSecurityTest is BaseTest {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Valorem's engine fee is 15 bps of notional charged ON TOP of the collateral, so the
-    ///      write pulls collateral + fee. Approving only the collateral made every `rollOpen`
-    ///      revert on allowance once the switch flipped — which meant `acceptValoremFee` was
-    ///      still non-functional even after the flag was wired through to the adapter. With no
+    ///      write pulls collateral + fee. Approving only the collateral made every write revert on
+    ///      allowance once the switch flipped — which meant `acceptValoremFee` was still
+    ///      non-functional even after the flag was wired through to the adapter. With no
     ///      upgradeability, that would have ended the product's ability to write, permanently.
+    ///      Under write-on-fill the write happens inside the fill, so that is where the fee is paid.
     function test_medium_acceptedValoremFeeActuallyLetsTheVaultWrite() public {
         _deposit(alice, 20e18);
         mockClear.setFeesEnabled(true);
@@ -269,15 +257,14 @@ contract VaultSecurityTest is BaseTest {
         // Refused until governance accepts, which is the intended gate.
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(Vault.ValoremFeeNotAccepted.selector, uint8(15)));
-        vault.rollOpen(optionId, 10);
+        vault.rollOpen(optionId);
 
         vm.prank(admin);
         vault.acceptValoremFee(true);
 
         // And now it genuinely writes, paying the 15 bps on top of the collateral.
         uint256 before = nvda.balanceOf(address(vault));
-        vm.prank(keeper);
-        vault.rollOpen(optionId, 10);
+        _openAndSell(10);
 
         assertEq(uint8(vault.phase()), 1, "written");
         assertEq(vault.contractsWritten(), 10);

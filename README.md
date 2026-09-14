@@ -3,11 +3,16 @@
 The Callhouse vault. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
 
 One non-upgradeable vault on Robinhood Chain (chain id 4663) that runs a weekly covered call on
-the NVDA Stock Token: depositors put in NVDA and receive `cNVDA` shares, the vault writes
-out-of-the-money calls on Valorem Clear and sells them through Seaport 1.6 on Overcall's order
-book, and the USDG premium accrues to holders through a per-share index. The protocol fee is 5%
-of premium only; strike proceeds from an assignment are credited to holders fee-free. Nothing is
-deployed yet, and the contracts are unaudited.
+the NVDA Stock Token: depositors put in NVDA and receive `cNVDA` shares, the keeper ARMS an
+out-of-the-money Valorem Clear option type each week and lists it on Seaport 1.6 with the vault as
+the order's zone, and every fill of that listing WRITES exactly the filled contracts into Valorem
+inside Seaport's `authorizeOrder` hook (**write on fill**: the vault never holds an unsold option
+token, so `written == sold` by construction). The USDG premium accrues to holders through a
+per-share index. The protocol fee is 5% of premium only; strike proceeds from an assignment are
+credited to holders fee-free. There is no dependency on Overcall's registry or order book: the
+vault validates the option type from the clearinghouse itself and sells through its own fill page.
+Nothing is deployed yet, and the contracts are **unaudited** (owner decision 2026-09-13: no
+external audit; the gate is the test suite described below, and that is the whole gate).
 
 This repository is the audit target. The app (keeper, indexer, web, ops) lives in
 leekzor/callhouse and mounts this repository as a git submodule at `contracts/`.
@@ -32,23 +37,27 @@ src/
   Vault.sol                 shares, deposits, the redeem queue, the phase machine, the roll
   Policy.sol                pure bounds maths; the hard caps live in bytecode here
   Distributor.sol           the USDG accrual index, settle-on-transfer, claims
-  AdapterValorem.sol        write, redeem, claim and position accounting
-  AdapterSeaport.sol        listing lifecycle, EIP-1271, the conduit approval
+  AdapterValorem.sol        per-cycle claim accounting, redeem, the mint-only ERC-1155 receiver
+  AdapterSeaport.sol        listing lifecycle (PARTIAL_RESTRICTED, zone == the vault), the conduit approval
   lib/SeaportOrderLib.sol   order shape validation and Seaport's three encoders  (LINKED LIBRARY)
-  lib/ValoremLib.sol        the one write gate (rollOpen, writeMore), write/redeem against Valorem, oracle read  (LINKED LIBRARY)
-  interfaces/               IValoremClear, IOvercallRegistry, ISeaport, IStockToken, IChainlinkFeed
-  mocks/                    MockClear, MockRegistry, MockSeaport, MockStockToken, MockERC20, MockFeed
+  lib/ValoremLib.sol        the arm gate (rollOpen) and the fill gate (writeOnFill), redeem, oracle read  (LINKED LIBRARY)
+  interfaces/               IValoremClear, ISeaport (+ IZone, ZoneParameters), IStockToken, IChainlinkFeed
+  mocks/                    MockClear (bucketed, upstream-faithful), MockSeaport (1.6 hook order), MockStockToken, MockERC20, MockFeed
 test/
-  Base.t.sol                the shared fixture; mirrors the live NVDA market
-  unit/                     per-surface suites
-  invariant/                stateful campaign, eight invariants
-  fork/                     against live chain 4663
+  Base.t.sol                the shared fixture; mirrors the live NVDA market, creates its own option types
+  helpers/                  RealClearBase (real Valorem 6436c82 bytecode), RealSeaportBase (real Seaport 1.6 runtime, etched)
+  fixtures/                 the vendored Clear artifact and the 4663 Seaport 1.6 / ConduitController runtimes
+  unit/                     per-surface suites, incl. VaultWriteOnFill (mock hooks) and VaultRealSeaport (every real fulfil path)
+  regression/               the five audit PoCs (AF-01..AF-05), each asserting the FIXED behaviour
+  invariant/                stateful campaign, ten invariants, with a third-party writer in the vault's bucket
+  fork/                     against live chain 4663 (write on fill through the live Seaport and Clear)
 script/
-  Deploy.s.sol              constructor args, with an on-chain preflight
+  Deploy.s.sol              constructor args, with an on-chain preflight (decimals, Clear fee state, Seaport 1.6)
+  DeployClear.s.sol         OPTIONAL: our own ValoremOptionsClearinghouse from the vendored artifact
   Configure.s.sol           keeper and guardian grants: from the admin key, or as a Safe batch
   HandoverAdmin.s.sol       move DEFAULT_ADMIN_ROLE from the bootstrap key to the Safe
-  Verify.s.sol              read-only post-deploy check, bytecode included
-  rehearse-deploy.sh        both admin paths on an anvil fork, with real Safes
+  Verify.s.sol              read-only post-deploy check, bytecode and Seaport runtime hash included
+  rehearse-deploy.sh        both admin paths on an anvil fork (--code-size-limit 98304), with real Safes
   rehearsal/                ExecuteSafeBatch.s.sol (anvil only)
 docs/                       AUDIT-SCOPE.md, ACCOUNTING.md, DEPLOY.md
 lib/                        forge-std, openzeppelin-contracts (git submodules)
@@ -56,8 +65,48 @@ lib/                        forge-std, openzeppelin-contracts (git submodules)
 
 `Distributor`, `AdapterValorem` and `AdapterSeaport` are **abstract bases the vault inherits**, not
 separate deployments. Valorem mints the claim NFT to `msg.sender` and `redeem` reverts for anyone
-else; Seaport only accepts `validate` and `cancel` from the offerer. The code has to run in the
-vault's own context.
+else; Seaport only accepts `validate` and `cancel` from the offerer and calls the zone's hooks on
+the zone. The code has to run in the vault's own context.
+
+## Write on fill (decision D1, A(ii)) and no registry (decision D16)
+
+The 2026-09-13 audit's F-01 (High) was that the vault wrote calls ahead of selling them and never
+exercised the unsold ones: anyone could write the same Valorem option id into the vault's bucket
+and self-exercise, taking `unsold × (spot − strike)` of depositor principal every in-the-money
+week. The redesign closes it by construction rather than by bounding it:
+
+- `rollOpen(optionId)` (keeper) **arms** a cycle and writes nothing. The vault reads the option
+  tuple back from the clearinghouse (`tokenType == Option`, our asset and USDG, lot exactly 1e18,
+  exercise at least 1 hour out, a window of at least 1 day, a tenor of at most 21 days, Valorem
+  fee off or accepted, oracle live, strike inside the OTM band with BOTH bounds) and snapshots
+  the strike and window. The keeper creates the weekly type itself with `clear.newOptionType`,
+  which is permissionless; nothing outside the vault numbers its cycles.
+- `approveListing` authorises ONE `PARTIAL_RESTRICTED` Seaport order with **zone == the vault**,
+  one ERC-1155 offer item (the armed id, at most the remaining capacity) and ONE consideration
+  item (USDG to the vault; there is no venue fee item). The vault pre-validates it on Seaport, so
+  an empty signature fills. The vault has no signing key and no EIP-1271 hook.
+- Seaport 1.6 calls the vault's `authorizeOrder` **before any transfer and before recording the
+  fill, on every fulfilment path**. The hook checks the order is the live listing, the phase is
+  Listed and writes are not halted, then `ValoremLib.writeOnFill` re-runs the clock, the fee
+  switch, the oracle, the band FLOOR and the premium floor at live spot (plus fee × spot when the
+  engine fee is on), sizes `written + k` on the total, and writes exactly `k`: `clear.write(
+  optionId, k)` on the first fill (recording the claim) or `clear.write(claimKey, k)` afterwards.
+  Seaport then moves the freshly minted tokens to the buyer. `validateOrder` runs after every
+  transfer and reverts `InventoryLeftBehind` unless the vault's option balance is back at its
+  pre-fill baseline (kept in transient storage, so the same listing can appear twice in one
+  `fulfillAvailableAdvancedOrders`).
+- The vault never calls a Seaport fulfil function, so the one caller Seaport exempts from the
+  hooks (the zone) never fills. The ERC-1155 receiver accepts only mints from the clearinghouse
+  (`from == address(0)`), so nobody can donate option tokens or a claim into the vault.
+- `rollClose` with `claimKey == 0` (an unsold week) skips the redeem, harvests, settles the queue
+  and returns to Idle, where instant redemption works again.
+
+`test/regression/AF01_UnsoldInventory.t.sol` replays the audit's unsteered and steered attacks on
+the real Clear bytecode and asserts the depositor ends exactly where the honest week left her.
+`test/unit/VaultRealSeaport.t.sol` drives every real Seaport 1.6 fulfilment path against the vault
+(`fulfillOrder`, `fulfillAdvancedOrder`, `fulfillAvailableAdvancedOrders` with the same listing
+twice, `matchAdvancedOrders`, `fulfillBasicOrder`), including the whole-transaction revert when
+two occurrences overfill the remainder.
 
 ---
 
@@ -83,8 +132,9 @@ FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
 profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
 verbosity.
 
-Current state: **349 unit and invariant tests across 15 suites, 22 fork tests, all passing**
-(measured 2026-09-13 on the uncommitted second-pass fixes over `634bf55`).
+Current state: **397 unit, regression and invariant tests across 23 suites, 16 fork tests** (the
+fork suite runs with `FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC`; it needs the live RPC
+and is not part of the offline gate). Measured 2026-09-13 on branch `redesign/s3-parallel`.
 
 ### CI, and why the local gate is the gate
 
@@ -93,22 +143,30 @@ non-blocking coverage summary), and the fork tests against chain 4663, using the
 when it is set and the public endpoint otherwise. Every GitHub Actions run on the leekzor account
 currently dies with `startup_failure` at the account level (billing), before any step runs. Until
 that is fixed CI proves nothing, and the gate is the four commands above run locally:
-`forge fmt --check`, `forge build --sizes`, the unit and invariant suite, and the fork suite.
+`forge fmt --check`, `forge build --sizes`, the unit and invariant suite, and the fork suite. Run
+them with `set -o pipefail` when piping: a piped failure that hides behind `tee` is a passed gate
+that did not pass.
+
+There is no external audit (owner decision D14, 2026-09-13) and no separate security gauntlet.
+The contracts are unaudited. What stands behind them is the gate above: 397 tests including the
+five audit proofs of concept re-asserted as fixed behaviour on the real Valorem bytecode, the
+real Seaport 1.6 runtime driven through every fulfilment path, a 64 × 600 stateful campaign with a
+third-party writer in the vault's bucket, and the fork suite against chain 4663.
 
 ---
 
 ## Four things that will bite you
 
-**1. `Vault` is over EIP-170's 24,576 B, and that is fine on this chain.** Robinhood Chain 4663
-(and testnet 46630) enforce a **98,304 B** contract code limit, proven with create probes on
-2026-09-13 (a 98,304 B deploy succeeds, 98,305 B fails `max code size exceeded`; a default anvil
-fails at 24,577). `foundry.toml` sets `code_size_limit = 98304` so tests and scripts deploy the
-real Vault, and `script/rehearse-deploy.sh` must start anvil with `--code-size-limit 98304`. The
-Vault runtime is 25,636 B after the AF-02 stranded-claim state machine (2026-09-13), so
-`forge build --sizes` prints a negative "margin" and exits 1: that exit code is forge measuring
-against EIP-170 and is ignored by the gate; the sizes it prints are still recorded in every stage
-report. Nothing is trimmed for bytes any more, and a chain whose limit really is 24,576 B is not a
-deployment target for this Vault without a library extraction.
+**1. `Vault` is above EIP-170's 24,576 B, and that is fine on chain 4663.** Robinhood Chain
+enforces a **98,304 B** contract code limit (verified with `eth_call --create` probes: 98,304 B
+deploys, 98,305 B fails `max code size exceeded`; decision D17), so `foundry.toml` sets
+`code_size_limit = 98304` and forge's 24,576 B warnings are noise here. The Vault runtime is
+25,470 B after the redesign and the AF-02 stranded-claim state machine (ValoremLib 5,993 B,
+SeaportOrderLib 5,170 B); `forge build --sizes` therefore prints a negative "margin" and exits 1,
+which is forge measuring against EIP-170 and is ignored by the gate. Two things follow:
+a default `anvil` REFUSES the Vault — `script/rehearse-deploy.sh` requires and probes for
+`--code-size-limit 98304` — and the contracts are not portable to a chain with the EIP-170 limit
+without a library extraction. Sizes are still reported by `forge build --sizes`.
 
 **2. The test tree is near solc's tag-space limit.** Each unit suite deploys the whole fixture and
 compiles to roughly 100–122 KB of deployed bytecode. With via-IR on, adding another fixture-heavy
@@ -122,8 +180,9 @@ Assembly exception for bytecode: Tag too large for reserved space
 If it appears, factor shared sequences into helpers on `BaseTest` rather than repeating them.
 
 **3. `vm.expectRevert` arms the NEXT external call.** If you compute an argument with a helper that
-itself makes an external call — anything reading the vault, the registry or the fixture — hoist it
-into a local first. This has caused eight false failures in this repo already.
+itself makes an external call — anything reading the vault, the clearinghouse or the fixture — hoist
+it into a local first. This has caused eight false failures in this repo already. `vm.expectEmit`
+has the same rule: an `approve` between the cheatcode and the fill is the call it will judge.
 
 **4. Clear `cache/invariant` after changing contract behaviour.** Foundry replays persisted
 counterexamples, and a stale one surfaces as a mystery failure in an unrelated test.
@@ -183,11 +242,15 @@ recipient, deposit cap, policy inside the hard caps, role grants). `Verify.s.sol
 deployed vault and libraries byte for byte with this commit's build and checks every immutable,
 parameter, role and Safe setting.
 
-`Deploy.s.sol` runs an on-chain preflight before broadcasting: it refuses to deploy against a
-registry whose `collateralToken`, `exerciseToken` or `clearinghouse` do not match, and it checks the
-price feed answers and has 8 decimals. That guard exists because Overcall's frontend config carries
-a top-level `registry` key that is the **JUGGERNAUT** market, not NVDA, and wiring it would
-collateralise NVDA calls with the wrong token.
+`Deploy.s.sol` runs an on-chain preflight before broadcasting: the asset has 18 decimals and USDG 6
+(every unit convention in `Policy` rests on that), the clearinghouse reports `feeBps() == 15` with
+the fee switch off and is ERC-1155, Seaport's `information()` reports version 1.6 with the canonical
+ConduitController, and the price feed answers with 8 decimals. There is no registry to point at any
+more. `CLEARINGHOUSE` defaults to Overcall's unmodified Clear instance
+(`0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0`, whose `feeTo` key holds only the 15 bps fee switch,
+which the vault treats as opt-in); `script/DeployClear.s.sol` deploys an instance of our own from the
+vendored upstream artifact if that dependency is not wanted. `Verify.s.sol` also pins the live
+Seaport runtime's `extcodehash` to the 4663 Seaport 1.6 runtime the tests were run against.
 
 Blockscout for chain 4663 sits behind a Cloudflare challenge that keys on the **absence** of a
 `Referer` header, which `forge` never sends. `ops/bsproxy.js` (leekzor/callhouse) is a tiny local
@@ -200,18 +263,20 @@ proxy that injects one so `forge verify-contract` works.
 | Role | Holder | Powers |
 |---|---|---|
 | `DEFAULT_ADMIN_ROLE` | 2/3 Safe | set the keeper, the fee recipient, the policy inside hard caps, the deposit cap, `maxPriceAge`, accept the Valorem fee, unhalt |
-| `KEEPER_ROLE` | hot wallet | `rollOpen`, `writeMore` (a further tranche into this cycle's claim, `Listed` and before the exercise timestamp), `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
-| `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites`, `cancelListing`, `invalidateAllListings` |
-| anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `sweepFee` whenever a fee is pending; `settleQueue` while `Idle` with shares queued; `invalidateStaleListing` when the live listing's strike is below the band floor or its gross below the premium floor at live spot, or the Stock Token oracle is paused |
+| `KEEPER_ROLE` | hot wallet | `rollOpen(optionId)` (arms a type it or anyone created on the clearinghouse), `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
+| `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites` (stops arms, listings AND fills instantly), `cancelListing`, `invalidateAllListings` |
+| Seaport 1.6 | the protocol contract | `authorizeOrder` / `validateOrder`, the zone hooks that write on every fill; nobody else may call them (`NotSeaport`) |
+| anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `sweepFee` whenever a fee is pending; `settleQueue` while `Idle` with shares queued; buying the listed calls through any Seaport fulfil function |
 
 The keeper cannot move a token, but it sets the sale price inside policy, and a compromised keeper
 (or the bootstrap admin, which can loosen policy and grant itself the keeper role) can sell at the
 floor to itself. SECURITY.md §3 has the bound per week.
 
-A halt blocks `rollOpen`, `writeMore` and `approveListing` **only**. `queueRedeem`,
-`settleQueue`, `completeRedeem`, `claimUsdg`, `cancelListing`, `invalidateAllListings`,
-`invalidateStaleListing`, `lockBook` and `rollClose` all keep working, because a halt must never
-trap a depositor.
+A halt blocks `rollOpen`, `approveListing` and every fill (`authorizeOrder` refuses) **only**.
+`queueRedeem`, `settleQueue`, `completeRedeem`, `claimUsdg`, `cancelListing`,
+`invalidateAllListings`, `lockBook` and `rollClose` all keep working, because a halt must never
+trap a depositor. Inside `fulfillAvailable*` a refused hook SKIPS the vault's order rather than
+reverting the buyer's batch; on every other path the fill reverts.
 
 Deposits close on the cycle's exercise **timestamp**, whether or not anyone calls `lockBook`:
 after it, `deposit`/`mint` revert `DepositsClosed` and `maxDeposit`/`maxMint` return 0 (the same
@@ -234,8 +299,8 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 | `protocolFeeBps` | 500 (5% of premium) | ceiling 2000. The fee base is premium only: strike proceeds from assignment are excluded in `Vault._accrueHarvest`, at any setting |
 | `maxContractsCap` | 50 | must be non-zero |
 | `maxPriceAge` | 4 days | 1 hour to 7 days |
-| listing price cuts per cycle | 3 | constant; the first listing and each strictly lower unit price spend one, a relist at or above the lowest price is free (`listingsThisCycle` counts cuts) |
-| cycle tenor | 7 days (Overcall's) | **ceiling 21 days**, `ValoremLib.MAX_CYCLE_TENOR` — a bad cycle from the registry EOA skips a week, it cannot lock collateral for years |
+| listings per cycle | 3 | constant `Policy.MAX_LISTINGS_PER_CYCLE`; every `approveListing` spends one, cancelled or not. A listing is sized to capacity and Seaport tracks the fraction filled, so a relist is a reprice |
+| exercise lead / window / tenor | 1 hour / 1 day / 7 days | `ValoremLib.MIN_LEAD` (exercise at least 1 hour after the arm), `MIN_EXERCISE_WINDOW` (at least 1 day), **`MAX_CYCLE_TENOR` 21 days** — a bad option type skips a week, it cannot lock collateral for years or be assigned in the block it was sold |
 
 ---
 

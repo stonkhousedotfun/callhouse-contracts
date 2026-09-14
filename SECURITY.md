@@ -16,6 +16,53 @@ are in `ops/alerts.md` (leekzor/callhouse).
 
 ---
 
+## 0. The 2026-09-13 redesign: write on fill, no registry
+
+The 2026-09-13 audit (`AUDIT-FINDINGS-2026-09-13.md` in the project handoff folder) found five
+things, the first of them High: **the vault wrote calls before selling them and never exercised
+the unsold ones** (F-01). Valorem assigns an exercise pro rata by amount WRITTEN across every
+writer of an option id, so anyone could write the same id into the vault's bucket, self-exercise,
+and take `unsold × (spot − strike)` of depositor principal every in-the-money week; with the
+settlement seed fixed at the option key the assignment walk is public and the attack steers.
+Bounding it (a cap on unsold inventory) was rejected in favour of closing it:
+
+- **Write on fill (decision D1, A(ii)).** `rollOpen(optionId)` ARMS a cycle and writes nothing.
+  Every listing is a `PARTIAL_RESTRICTED` Seaport 1.6 order whose zone is the vault, and the
+  vault's `authorizeOrder` hook, which Seaport calls before any transfer and before recording the
+  fill on every fulfilment path, writes exactly the filled contracts into Valorem in the same call
+  that moves them to the buyer. `validateOrder`, after every transfer, reverts the fill unless the
+  vault's option balance is back at its pre-fill baseline. The vault never holds an unsold option
+  token, so `written == sold` by construction and the vault can be assigned on at most what it
+  sold, every contract of which earned a premium. The vault never calls a Seaport fulfil function
+  (the zone is the one caller Seaport exempts from the hooks), has no signing key and no EIP-1271
+  hook (pre-validation on Seaport is the only authorisation path), and its ERC-1155 receiver
+  accepts only mints from the clearinghouse. `writeMore`, `invalidateStaleListing`, the price-cut
+  slots and the Overcall fee item are gone.
+- **No registry (decision D16).** The vault used to read the approved rung, the strike and the
+  cycle number from Overcall's per-market registry, a contract owned by one third-party EOA. It now
+  validates the option type from the clearinghouse itself (`tokenType == Option`, our asset and
+  USDG, lot 1e18, exercise ≥ 1 hour out, window ≥ 1 day, tenor ≤ 21 days, fee off or accepted,
+  oracle live, strike inside the band with both bounds) and numbers its own cycles. The
+  clearinghouse stays a deploy-time choice: Overcall's unmodified instance (whose key holds only the
+  15 bps fee switch, opt-in for the vault) or one of our own from `script/DeployClear.s.sol`.
+- **The other four** (AF-02 stranded-claim state machine, AF-03 split payout legs, AF-04 utilisation
+  ceiling 9,985 plus a post-write reserve check, AF-05 honest NAV with one deposit gate and a
+  pro-rata reserve haircut) are recorded in `docs/ACCOUNTING.md` and in the regressions under
+  `test/regression/`, one file per finding, each asserting the FIXED behaviour on the real Valorem
+  bytecode where the loss lived in Valorem's bucket engine.
+
+**What stands behind this, and what does not (decision D14).** There is no external audit and no
+separate internal security gauntlet. The contracts are unaudited. The gate is the test suite:
+`forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (397 tests;
+the invariant campaign runs 64 × 600 calls with a third-party writer and exerciser in the vault's
+bucket and asserts after every call that the vault holds no option token and is assigned on no more
+than it sold), the real Seaport 1.6 runtime driven through every fulfilment path (single, advanced
+fractions, the same listing twice in one `fulfillAvailableAdvancedOrders` within and beyond the
+remainder, match, basic, skip-versus-revert, a hostile contract buyer), and the fork suite against
+chain 4663 (first fill and top-up fill through the live Seaport and Clear, exercising transient
+storage on the live EVM). Findings 9, 12, 13, 16 and 17 in §4 describe mechanisms the redesign
+removed (`writeMore`, price-cut slots, `invalidateStaleListing`); they stay as history.
+
 ## 1. The one-sentence model
 
 **No off-chain component can transfer a token out of the vault, but the keeper chooses the price
@@ -55,47 +102,46 @@ These are not conventions; they are checks in the deployed code, each with regre
   If the asset balance has been burnt below the reserve, every uncollected reserved claimant takes
   the same `balance / reservedAssets` fraction (`ReserveHaircut`), never first come, first served.
   See AUDIT-FINDINGS F-03 and F-05.
-- **Cycle tenor is capped at 21 days** by a compiled-in constant (`ValoremLib.MAX_CYCLE_TENOR`).
-  The registry that sets the weekly cycle is a single third-party EOA; a hostile or fat-fingered
-  cycle must produce a skipped week, not a years-long lock on depositor principal.
-- **One write gate.** `rollOpen` and `writeMore` both reach Valorem only through
-  `ValoremLib.write`, which runs every pre-write check in one place, so a check added for one
-  cannot be forgotten for the other. The next four properties are checks inside it.
-- **A contract is exactly one token.** The OTM band, the premium floor and the utilisation cap
-  are all computed per 1e18 of the Stock Token, so a write reverts `UnexpectedLotSize` unless
-  the cycle's lot is exactly 1e18. A lot change by the registry owner costs skipped weeks, not
-  in-the-money calls written against principal. See §4, finding 6.
-- **The written option's window must equal the cycle's window.** The deposit gate rests on
-  "assignment cannot happen before `cycleExerciseTs`", which only holds if the option actually
-  written shares that timestamp. A write reverts `OptionWindowMismatch` otherwise.
+- **The vault never holds an unsold option token** (§0). Nothing is written at `rollOpen`;
+  `authorizeOrder` writes exactly what Seaport is moving to a buyer in the same call, and
+  `validateOrder` reverts the fill if anything stayed behind. The vault is assigned on at most
+  what it sold. `test/regression/AF01_UnsoldInventory.t.sol`, `test/unit/VaultWriteOnFill.t.sol`,
+  `test/unit/VaultRealSeaport.t.sol`, `invariant_vaultHoldsNoOptionTokens`.
+- **Only Seaport can make the vault write, and only for its own live listing.** Both hooks refuse
+  any caller but Seaport (`NotSeaport`); `authorizeOrder` refuses any order whose hash is not
+  `listingHash` or whose offerer is not the vault (`NotLiveListing`), and the hash commits to the
+  zone, the order type, the items, the salt and the counter. A stranger's restricted order naming
+  the vault as zone cannot make it write.
+- **The arm gate.** `ValoremLib.open` reads the option tuple back from the clearinghouse and
+  refuses a claim id or an unknown id (`NotAnOptionType`), another underlying or exercise asset,
+  any lot but exactly 1e18 (`UnexpectedLotSize`: the band, the floor and utilisation are all per
+  token, §4 finding 6), an exercise timestamp less than `MIN_LEAD` (1 hour) away
+  (`ExerciseTooSoon`: nothing sold can be assigned in the same tick), a window under
+  `MIN_EXERCISE_WINDOW` (1 day) or a tenor over `MAX_CYCLE_TENOR` (21 days) (`BadCycleWindow`: a
+  bad type skips a week, it cannot lock principal for years), the engine fee on and unaccepted, a
+  paused or stale oracle, and a strike outside the band, BOTH bounds.
+- **The fill gate, at the fill's own spot.** `ValoremLib.writeOnFill` refuses a fill at or after
+  `cycleExerciseTs` (`WriteWindowClosed`), while halted, while the engine fee is on and unaccepted,
+  on a paused or stale oracle, with the strike inside the band FLOOR (ceiling not re-checked: a
+  sell-off makes the call safer, decision D9), with the premium under the floor at live spot plus
+  fee × spot when the fee is on (`PremiumBelowFloorAtFill`), or with `written + k` past
+  `maxContractsCap` or `maxUtilizationBps` of `totalAssets()` at that moment. After the write the
+  asset balance must still cover `reservedAssets` (`ReserveBreached`, AF-04). The approval to the
+  clearinghouse is sized to collateral plus fee and zeroed afterwards.
 - **The Valorem engine fee is opt-in.** While `clear.feesEnabled()` is on and governance has
-  not accepted, a write reverts `ValoremFeeNotAccepted`. 15 bps of notional on a weekly
-  out-of-the-money call is a governance decision, not a keeper one.
-- **A tranche write is a new decision at today's state, sized on the week's total.** `writeMore`
-  adds contracts to this cycle's existing Valorem claim, and only in `Listed`, only before
-  `cycleExerciseTs` (`WriteWindowClosed`; nothing written can be assignable before the deposit
-  window shuts), only while the registry's live cycle is still the one the vault snapshotted, and
-  only if `clear.write` hands back the same claim id (`WriteReturnedWrongClaim`). It re-runs the
-  halt, the registry's write window and approval, the fee switch, the oracle and the strike band
-  **at live spot**, so a rally that pulled the strike inside the band floor stops further writes
-  of that rung. Size is checked on `contractsWritten + n` against idle plus locked, so tranches
-  can never add up past `maxUtilizationBps` or `maxContractsCap`. See §4, finding 9.
+  not accepted, an arm and every fill revert `ValoremFeeNotAccepted`. 15 bps of notional on a
+  weekly out-of-the-money call is a governance decision, not a keeper one.
 - **A queue made while the vault is flat can always be settled.** `settleQueue()` is
   permissionless in `Idle`: it checkpoints the harvest and settles the epoch, moving no tokens,
   so it works while halted and under an issuer freeze. It prices the epoch exactly like an
   instant redemption, virtual share included, so it is never a better exit than `redeem` and
   cannot turn donation inflation into a profit. See §4, findings 8 and 15.
-- **The listing budget limits price cuts, not listings.** The first listing of a cycle, and any
-  listing whose unit price is strictly below the lowest authorised this cycle, spends one of
-  `MAX_LISTINGS_PER_CYCLE = 3` slots; a relist at or above that lowest price is free. So at most
-  three descending price levels per cycle, while repricing up or relisting a larger tranche is
-  unlimited. See §4, finding 12.
-- **A listing the policy would no longer authorise can be killed by anyone, and only such a
-  listing.** `approveListing` refuses a strike below the live band floor and a gross below the
-  live premium floor; `invalidateStaleListing()` bumps the Seaport counter only when one of those
-  two floors, read through the same `_listingFloors`, now refuses the live listing, or when the
-  Stock Token oracle is paused. With a live spot at which `approveListing` would accept the
-  listing it reverts `ListingStillValid`; with a stale feed it reverts. See §4, findings 12 and 13.
+- **Three listings per cycle.** Every `approveListing` spends one of `MAX_LISTINGS_PER_CYCLE = 3`,
+  cancelled or not. A listing is sized to capacity and Seaport tracks the fraction filled, so a
+  relist is a reprice, and three reprices a week is how far a keeper can walk the quote before the
+  guardian must act. `approveListing` also refuses a strike below the live band floor and a gross
+  below the live premium floor, as an early refusal for the keeper; the fill gate is the line of
+  defence, so a stale listing is simply unfillable rather than needing a permissionless kill.
 - **The protocol fee push is best-effort.** A blocklisted fee recipient, a paused USDG, or a
   recipient that reverts on receive must not freeze `rollClose` — the only function that
   redeems the claim and settles the queue. The fee accrues into `pendingFeeUsdg` and is
@@ -115,12 +161,13 @@ These are not conventions; they are checks in the deployed code, each with regre
 
 | Key | Power | Worst case |
 |---|---|---|
-| Keeper (hot) | pick the rung and size inside policy (`rollOpen`, `writeMore`), propose every order and its price (`approveListing`), cancel, call the rolls | **value leakage, not only a wasted week.** It can write the lowest rung in the band at the utilisation limit and list everything at exactly the premium floor to a buyer it controls; a first listing at the floor spends one slot and every relist at that price is free, and a colluding fill can follow the authorisation immediately, before a guardian can react. At launch policy (3% OTM floor, 0.40% premium floor on gross) a 7-day 3%-OTM NVDA call is worth about 1.5% of spot at 50% implied volatility, so about **1.1% of the written notional per week** (up to 95% of NAV written) goes to the buyer in expectation; about 2.7% at 80% IV. It cannot move a token, sell above strike, list past `cycleExerciseTs`, or write outside the band and the caps |
+| Keeper (hot) | create and arm a rung inside policy (`rollOpen`), propose every order and its price and size up to capacity (`approveListing`), cancel, call the rolls | **value leakage, not only a wasted week.** It can arm the lowest rung in the band and list the whole capacity at exactly the premium floor to a buyer it controls, and a colluding fill (which is what writes) can follow the authorisation immediately, before a guardian can react. At launch policy (3% OTM floor, 0.40% premium floor on gross) a 7-day 3%-OTM NVDA call is worth about 1.5% of spot at 50% implied volatility, so about **1.1% of the written notional per week** (up to 95% of NAV written) goes to the buyer in expectation; about 2.7% at 80% IV. It cannot move a token, sell above strike, list past `cycleExerciseTs`, or write outside the band and the caps |
 | Bootstrap admin (the deployer EOA holding `DEFAULT_ADMIN_ROLE` until `HandoverAdmin.s.sol` completes; no timelock) | everything the Admin Safe row has, from one hot-signable key | everything the keeper row has, and worse: `setPolicy` to the compiled floors (1% OTM, 0.10% premium, 100% utilisation), `grantRole(KEEPER_ROLE, itself)`, then write and sell to itself within a block or two. A 7-day 1%-OTM call is worth about 2.3% of spot at 50% IV, so about **2.2% of the written notional per week** (about 3.9% at 80% IV), plus a 20% fee on whatever premium is left, routed where it likes. Still no path to transfer a token |
-| Guardian | halt writes (`rollOpen`, `writeMore`, `approveListing`), cancel, invalidate all listings | denial of new writes until the admin unhalts, and burnt premium; exits stay open |
+| Guardian | halt (`rollOpen`, `approveListing` and every fill), cancel, invalidate all listings | denial of new sales until the admin unhalts, and burnt premium; exits stay open |
 | Admin Safe (2/3) | policy inside caps, fee recipient, Valorem fee acceptance, deposit cap, role grants | the bootstrap admin row, needing two of three signers instead of one key. No timelock on any of it |
-| Anyone | `lockBook`, `rollClose` after expiry + 1 hour, `sweepFee`, `settleQueue` while `Idle`, `invalidateStaleListing` | a counter bump on a listing `approveListing` would already refuse at live spot, or on a paused oracle; settling a flat queue at the instant-redeem price. Neither moves value |
-| Registry owner (third-party EOA) | sets the weekly cycle for the whole market: option ids, strike ladder, exercise and expiry timestamps, which rungs are approved, and (between cycles) the lot size | since `6ed528f`: skipped weeks for as long as it withholds a usable cycle or keeps the lot at anything but one token, a cycle of up to 21 days, and a strike ladder anywhere inside the OTM band; the band, the tenor ceiling, the option-window check and the one-token lot check refuse anything worse. **Before `6ed528f` this row was wrong:** a lot above one token with an unrescaled ladder let the keeper's ordinary `rollOpen` write in-the-money calls against principal (§4, finding 6) |
+| Anyone | `lockBook`, `rollClose` after expiry + 1 hour, `sweepFee`, `settleQueue` while `Idle`, buying through Seaport, writing the same option id on Valorem and exercising | settling a flat queue at the instant-redeem price; a fill at the listed price inside the fill gate; being assigned alongside the vault pro rata on what the vault SOLD. None moves value from depositors beyond the priced covered call (§0) |
+| Clear `feeTo` (Overcall's EOA on the default instance) | the 15 bps engine fee switch, `setFeeTo`, the URI generator, sweeping fee balances | a week the vault refuses to arm or fill until governance accepts the fee (`ValoremFeeNotAccepted`); nothing on collateral. Removable entirely by deploying our own instance (`script/DeployClear.s.sol`) |
+| Seaport 1.6 | no admin, not upgradeable; the zone hooks run on every fill | none beyond the verified 1.6 hook order the design rests on; `Verify.s.sol` pins the runtime hash |
 | Stock Token issuer | freeze transfers, pause the oracle, upgrade the proxy | settlement stops. Disclosed, not coded around — see §5 |
 
 **How the leakage figures are computed.** Black-Scholes value of a 7-day call at zero rates,
@@ -232,15 +279,16 @@ library link sites (two `SeaportOrderLib`, five `ValoremLib`).
   stop). There is no technical mitigation — that is the asset.
 - **USDG and the Stock Token are upgradeable proxies.** Their admin keys are outside our
   control. The fee push is best-effort partly because of this.
-- **The registry owner is a single EOA.** Bounded by §2 and the table in §3: since `6ed528f`,
-  skipped weeks, a cycle of up to 21 days, and its choice of strikes inside the band. Before
-  `6ed528f` a lot change could put principal at risk (finding 6).
+- **There is no registry any more.** The option type is validated from the clearinghouse (§0);
+  the only third-party key left on the path is Clear's `feeTo`, bounded to the opt-in fee switch.
 - **Pricing discretion leaks value inside policy.** A compromised keeper, a compromised bootstrap
   admin, or an honest keeper on a book with no fills can sell at the premium floor, below fair
   value. §3 quantifies it and lists the mitigations that were considered and not built.
-- **Valorem assigns across all writers of an option id.** Whatever the vault holds unsold at
-  exercise can be assigned by someone else's exercise. Tranche writes (finding 9) bound that by
-  the live listing's unfilled part only when the keeper writes per listing.
+- **Valorem assigns across all writers of an option id, pro rata by amount written, and the walk
+  is public** (Zellic Jan-2023 3.2/3.3 were never fixed upstream). Under write on fill the vault
+  has written exactly what it sold, so the most a third-party writer and exerciser can do is assign
+  the vault fully on the calls it was paid a premium for: the priced covered-call exposure, not a
+  loss beyond it (`AF01_UnsoldInventory`, steered and unsteered).
 - **Anyone can settle a flat queue, including someone else's entry.** An entry cannot be withdrawn
   once queued anyway, and `settleQueue` pays it the instant-redeem price at that moment, so a
   third party choosing the moment gains nothing and moves no value.
@@ -253,18 +301,19 @@ library link sites (two `SeaportOrderLib`, five `ValoremLib`).
 
 Tracked in `tasks.md` (leekzor/callhouse) "Open questions":
 
-1. **EIP-1271 vs Overcall's live validator** — never exercised against their production server.
-   One real 1-contract listing is posted before launch (L-04); the self-hosted fill page is
-   the fallback.
+1. **Overcall's order book is not a venue for this vault.** Its schema requires open orders with
+   zone 0 and pre-held inventory; the vault lists restricted orders with itself as zone and holds
+   no inventory. Sales go through the self-hosted fill page and any Seaport fulfil path. Closed by
+   decision D1; L-04 was dropped (D2 = b).
 2. **Keeper prices at exactly the policy floor** — an upward oracle tick between the keeper's
    read and the vault's authorisation reverts `PremiumBelowMinimum` (or `StrikeBelowBand`, since
    `approveListing` also re-checks the band floor). Self-heals next tick; a margin is under
    consideration. Pricing at the floor is also the leakage in §3.
 3. **Deposit-time harvest checkpoint gas cost** — to be measured on the first live week.
-4. **Tranche writing in the keeper is not committed.** `writeMore` is in the vault, and the keeper
-   change that writes per listing (first tranche at `rollOpen`, the next after a sell-through) sits
-   uncommitted in the leekzor/callhouse working tree. Until it ships and runs, finding 9's bound on
-   unsold assignment exposure is inert.
+4. **The keeper, indexer and web are not yet ported to write on fill.** `rollOpen(optionId)`,
+   PARTIAL_RESTRICTED orders with the vault as zone, an empty signature, no Overcall POST, and
+   fills detected from `OrderFulfilled` (a batch that skips the vault's order still succeeds) are
+   the app-side changes; until they land the vault can be operated only by hand.
 5. **The open decisions in §3**: an admin timelock, higher compiled floors, a listing start delay,
    vol-model pricing, and no deposits before the Safe handover.
 

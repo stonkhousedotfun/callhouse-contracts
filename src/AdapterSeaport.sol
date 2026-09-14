@@ -7,19 +7,30 @@ import {Policy} from "./Policy.sol";
 import {SeaportOrderLib} from "./lib/SeaportOrderLib.sol";
 
 /// @title AdapterSeaport
-/// @notice Listing the cycle's option tokens on Seaport 1.6 with the vault as offerer.
+/// @notice Listing the cycle's option tokens on Seaport 1.6 with the vault as offerer AND as zone.
 /// @dev An abstract base inherited by {Vault}.
 ///
 ///      WHY THE VAULT IS THE OFFERER.
 ///      The obvious shortcut is to let the keeper sign as offerer, but that requires the
 ///      option ERC-1155 to sit in the keeper's wallet, which hands a hot key custody of the
-///      depositors' collateral. Instead the vault offers, holds the tokens, and authorises a
-///      specific order hash. The keeper can only propose; it can never move inventory.
+///      depositors' collateral. Instead the vault offers, and authorises a specific order hash.
+///      The keeper can only propose; it can never move inventory.
 ///
-///      TWO AUTHORISATION PATHS, ON PURPOSE.
-///      `validate()` marks the order on-chain so it fills with an empty signature, and
-///      EIP-1271 answers for the hash if a filler supplies one anyway. Overcall's API and
-///      their UI may take either route, and an unfillable listing is an unfilled week.
+///      WHY THE VAULT IS ALSO THE ZONE.
+///      Under write-on-fill the vault holds NO option tokens between fills. Every listing is a
+///      PARTIAL_RESTRICTED order whose zone is the vault, so Seaport 1.6 calls the vault's
+///      `authorizeOrder` before it moves anything; that hook writes exactly the filled amount into
+///      Valorem, and Seaport then transfers those freshly minted tokens to the buyer
+///      ({Vault.authorizeOrder}). The order hash commits to the zone, so no order that names another
+///      zone can ever be filled against this vault, and no order that names this vault as zone can
+///      be filled unless it IS the vault's live listing.
+///
+///      ONE AUTHORISATION PATH.
+///      `validate()` marks the order on chain, and Seaport skips signature verification for a
+///      validated order on every later fill. There is no signing key and no EIP-1271 hook: the
+///      vault answers for no digest, which also keeps its USDG out of reach of USDG's own
+///      EIP-3009 / permit paths (integrations/usdg.md G7). Killing a listing is therefore
+///      `cancel` or `incrementCounter` on Seaport, never a flag in vault storage.
 ///
 ///      ORDER SHAPE IS CHECKED ON CHAIN.
 ///      Everything the keeper proposes is verified here against the vault's own state before
@@ -27,33 +38,17 @@ import {SeaportOrderLib} from "./lib/SeaportOrderLib.sol";
 ///      compromised keeper cannot list the inventory to itself or for a dollar.
 abstract contract AdapterSeaport {
     /*//////////////////////////////////////////////////////////////
-                              CONSTANTS
-    //////////////////////////////////////////////////////////////*/
-
-    /// @dev EIP-1271 magic value for a valid signature.
-    bytes4 internal constant EIP1271_MAGIC = 0x1626ba7e;
-    bytes4 internal constant EIP1271_INVALID = 0xffffffff;
-
-    /*//////////////////////////////////////////////////////////////
                               IMMUTABLES
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Seaport 1.6. Mainnet 4663: 0x0000000000000068F116a894984e2DB1123eB395.
     ISeaport public immutable seaport;
 
-    /// @notice The Overcall fee recipient that must receive the 5% consideration item.
-    /// @dev Copied from a real filled Overcall order at deploy time. If this is wrong the
-    ///      listing is still valid Seaport, but Overcall will not surface it.
-    address public immutable overcallFeeRecipient;
-
-    /// @notice The conduit key Overcall's orders use. Zero means Seaport pulls directly.
+    /// @notice The conduit key every listing uses. Zero means Seaport pulls directly.
     bytes32 public immutable conduitKey;
 
     /// @notice The address Seaport will pull the ERC-1155 from: the conduit, or Seaport itself.
     address public immutable transferApprovalTarget;
-
-    /// @notice The zone Overcall's orders use. Zero for fully open orders.
-    address public immutable seaportZone;
 
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
@@ -62,37 +57,25 @@ abstract contract AdapterSeaport {
     /// @notice Hash of the currently authorised listing. Zero when nothing is listed.
     bytes32 public listingHash;
 
-    /// @notice Gross USDG the live listing asks for, before Overcall's 5%.
+    /// @notice USDG the live listing asks for in full: `listingAmount` contracts at one unit price.
     uint256 public listingGrossUsdg;
 
-    /// @notice Option contracts the live listing offers.
+    /// @notice Option contracts the live listing offers. The ORDER's size, not the unfilled
+    ///         remainder; Seaport tracks the fraction filled.
     uint256 public listingAmount;
 
-    /// @notice PRICE LEVELS spent this cycle: how many listings set a new lowest unit price.
-    ///         Capped at {Policy.MAX_LISTINGS_PER_CYCLE} to stop a keeper ratcheting the price
-    ///         down all week.
-    /// @dev The name is kept for ABI stability; it no longer counts every authorisation.
-    ///
-    ///      WHY SLOTS COUNT PRICE CUTS. The cap used to count every approval, and a cancel never
-    ///      refunded one. After a mid-week rally the keeper's honest move is to reprice UP, or to
-    ///      relist a bigger tranche after {Vault.writeMore}; each of those burned a slot, so three
-    ///      repricings left the vault unable to list at all while a stale listing sat on the book.
-    ///      The threat the cap exists for is a ratchet DOWN. So the first listing of a cycle, and
-    ///      any listing whose unit price (gross / amount) is strictly below the lowest authorised
-    ///      so far, spends a slot and becomes the new lowest; a listing at or above the lowest is
-    ///      free. That still allows at most three descending price levels per cycle.
+    /// @notice Listings authorised this cycle, capped at {Policy.MAX_LISTINGS_PER_CYCLE}.
+    /// @dev Every `approveListing` spends one, cancelled or not. Under write-on-fill a listing is
+    ///      sized to capacity and Seaport tracks partial fills, so nothing is ever relisted for
+    ///      size; a relist is a reprice, and the cap bounds how far a keeper can walk the quote
+    ///      in a week before the guardian must step in.
     uint8 public listingsThisCycle;
-
-    /// @notice The lowest gross unit price (USDG base units per contract) authorised this cycle.
-    ///         Zero before the first listing of a cycle.
-    uint256 public lowestListedUnitUsdg;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev `seq` is {listingsThisCycle} after this approval: the number of price levels spent,
-    ///      NOT a running count of authorisations. Two listings can share a `seq`.
+    /// @dev `seq` is {listingsThisCycle} after this approval.
     event ListingApproved(
         bytes32 indexed orderHash, uint256 indexed optionId, uint256 amount, uint256 grossUsdg, uint8 seq
     );
@@ -111,11 +94,9 @@ abstract contract AdapterSeaport {
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    constructor(ISeaport seaport_, address overcallFeeRecipient_, bytes32 conduitKey_, address seaportZone_) {
+    constructor(ISeaport seaport_, bytes32 conduitKey_) {
         seaport = seaport_;
-        overcallFeeRecipient = overcallFeeRecipient_;
         conduitKey = conduitKey_;
-        seaportZone = seaportZone_;
 
         // Resolve where the ERC-1155 approval has to point. With a zero conduit key Seaport
         // moves tokens itself; otherwise the conduit does, and approving Seaport would leave
@@ -130,26 +111,13 @@ abstract contract AdapterSeaport {
     }
 
     /*//////////////////////////////////////////////////////////////
-                                EIP-1271
+                                 VIEWS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice EIP-1271. Answers only for the single order hash the vault has authorised.
-    /// @dev The signature bytes are ignored on purpose: authorisation is the on-chain
-    ///      `listingHash`, not a key. Anything else returns the invalid magic value, so a
-    ///      stale or forged order cannot be filled against the vault.
-    function isValidSignature(bytes32 digest, bytes calldata) external view returns (bytes4) {
-        bytes32 live = listingHash;
-        if (live == bytes32(0)) return EIP1271_INVALID;
-        if (digest == live) return EIP1271_MAGIC;
-        if (digest == _eip712Digest(live)) return EIP1271_MAGIC;
-        return EIP1271_INVALID;
-    }
-
-    /// @dev Seaport asks the offerer to sign the EIP-712 digest of the order hash. The domain
-    ///      separator is read live rather than cached so a chain-id change cannot strand it.
-    function _eip712Digest(bytes32 orderHash) internal view returns (bytes32) {
-        (, bytes32 domainSeparator,) = seaport.information();
-        return keccak256(abi.encodePacked(hex"1901", domainSeparator, orderHash));
+    /// @notice The zone every listing must name: this vault. Kept as a view so deploy tooling and
+    ///         the keeper read the same answer the shape check enforces.
+    function seaportZone() external view returns (address) {
+        return address(this);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -159,19 +127,19 @@ abstract contract AdapterSeaport {
     /// @dev Validate a keeper-proposed order against vault state, authorise it on Seaport,
     ///      and record it. Reverts unless every field is exactly what this vault expects.
     /// @param components The full order the keeper intends to publish.
-    /// @param expectedOptionId The option type the vault wrote this cycle.
-    /// @param availableContracts Option tokens the vault still holds and may offer.
-    /// @param usdgToken The USDG address both consideration items must use.
+    /// @param expectedOptionId The option type the vault armed this cycle.
+    /// @param capacityContracts Contracts the vault could still write this cycle.
+    /// @param usdgToken The USDG address the consideration item must use.
     /// @param clearAddress The clearinghouse, i.e. the ERC-1155 the offer item must reference.
     /// @param exerciseTimestamp The cycle's exercise time; the listing must end by then.
     /// @param strikeUsdg The option's exerciseAmount per contract, used as a sanity ceiling.
     /// @return orderHash The authorised hash.
-    /// @return grossUsdg Gross premium asked, before Overcall's cut.
+    /// @return grossUsdg USDG asked for the whole order.
     /// @return amount Contracts offered.
     function _approveListing(
         OrderComponents calldata components,
         uint256 expectedOptionId,
-        uint256 availableContracts,
+        uint256 capacityContracts,
         address usdgToken,
         address clearAddress,
         uint40 exerciseTimestamp,
@@ -179,32 +147,24 @@ abstract contract AdapterSeaport {
     ) internal returns (bytes32 orderHash, uint256 grossUsdg, uint256 amount) {
         if (listingHash != bytes32(0)) revert PreviousListingLive(listingHash);
 
+        uint8 used = listingsThisCycle;
+        if (used >= Policy.MAX_LISTINGS_PER_CYCLE) revert TooManyListings(used, Policy.MAX_LISTINGS_PER_CYCLE);
+
         (orderHash, grossUsdg, amount) = SeaportOrderLib.approve(
             seaport,
             components,
             SeaportOrderLib.Checks({
-                zone: seaportZone,
                 conduitKey: conduitKey,
-                overcallFeeRecipient: overcallFeeRecipient,
                 usdgToken: usdgToken,
                 clearAddress: clearAddress,
                 expectedOptionId: expectedOptionId,
-                availableContracts: availableContracts,
+                capacityContracts: capacityContracts,
                 exerciseTimestamp: exerciseTimestamp,
                 strikeUsdg: strikeUsdg
             })
         );
 
-        // The library already refused a gross that is not an exact multiple of `amount`.
-        uint256 unitPrice = grossUsdg / amount;
-        uint256 lowest = lowestListedUnitUsdg;
-        uint8 used = listingsThisCycle;
-        if (lowest == 0 || unitPrice < lowest) {
-            if (used >= Policy.MAX_LISTINGS_PER_CYCLE) revert TooManyListings(used, Policy.MAX_LISTINGS_PER_CYCLE);
-            listingsThisCycle = ++used;
-            lowestListedUnitUsdg = unitPrice;
-        }
-
+        listingsThisCycle = ++used;
         listingHash = orderHash;
         listingGrossUsdg = grossUsdg;
         listingAmount = amount;
@@ -248,7 +208,6 @@ abstract contract AdapterSeaport {
     /// @dev Reset the per-cycle listing budget. Called on roll open.
     function _resetListingBudget() internal {
         listingsThisCycle = 0;
-        lowestListedUnitUsdg = 0;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -257,7 +216,8 @@ abstract contract AdapterSeaport {
 
     /// @dev Approve the conduit (or Seaport) to move the vault's option tokens. Set once;
     ///      the approval is scoped to the clearinghouse's ERC-1155, which only ever holds
-    ///      option and claim tokens this vault wrote.
+    ///      option and claim tokens this vault wrote. It also covers the claim NFT, which is
+    ///      safe only because {SeaportOrderLib} pins the offer item to the cycle's option id.
     function _approveOptionTransfers(address clearAddress) internal {
         IERC1155Minimal(clearAddress).setApprovalForAll(transferApprovalTarget, true);
     }

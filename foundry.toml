@@ -23,6 +23,9 @@ fs_permissions = [
     # runtime bytecode read from chain 4663. Tests etch or deployCode them; nothing under out/ is
     # relied on for third-party code.
     { access = "read", path = "./test/fixtures" },
+    # script/DeployClear.s.sol deploys our own ValoremOptionsClearinghouse from the same vendored
+    # artifact, copied here so a script never reads test fixtures.
+    { access = "read", path = "./script/artifacts" },
     # script/Configure.s.sol writes the Safe Transaction Builder batch here (gitignored)
     { access = "read-write", path = "./broadcast" },
 ]

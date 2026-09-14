@@ -27,10 +27,11 @@ admin from block one and every admin action is a Safe transaction (path B below)
 
 | Script | What it does |
 |---|---|
-| `script/Deploy.s.sol` | preflight against the live registry and feed, then libraries + vault. Warns loudly when the admin is a plain key |
+| `script/Deploy.s.sol` | preflight (asset 18 / USDG 6 decimals, Clear `feeBps == 15` and switch off, Seaport 1.6 with the canonical ConduitController, feed), then libraries + vault. Warns loudly when the admin is a plain key |
+| `script/DeployClear.s.sol` | OPTIONAL: deploys our own ValoremOptionsClearinghouse from the vendored upstream artifact (`feeTo` = our admin) and asserts `feeBps() == 15`, `feesEnabled() == false`; pass its address to Deploy as `CLEARINGHOUSE` |
 | `script/Configure.s.sol` | grants `KEEPER_ROLE` and `GUARDIAN_ROLE`. With `ADMIN_PK` it broadcasts from that key (refuses a key without admin); without, it only writes a Safe Transaction Builder batch |
 | `script/HandoverAdmin.s.sol` | `STEP=grant` gives the admin role to the Safe and writes a harmless smoke batch; `STEP=renounce` removes the key's admin role, and refuses until the Safe has executed a transaction after the grant |
-| `script/Verify.s.sol` | read-only; about 55–64 checks depending on phase (below). Reverts if any fail |
+| `script/Verify.s.sol` | read-only; the check count is re-derived on the next rehearsal (the redesign added the zone, interface, Seaport runtime-hash, Clear fee-state and decimals checks and removed the registry and Overcall-fee ones). Reverts if any fail |
 | `script/rehearsal/ExecuteSafeBatch.s.sol` | rehearsal only: runs a batch file through a Safe with owner keys. Refuses any node that is not anvil |
 
 ---
@@ -81,9 +82,11 @@ forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-stora
   --verify --verifier blockscout --verifier-url http://127.0.0.1:<bsproxy-port>/api
 ```
 
-The preflight refuses a registry whose collateral, exercise token or clearinghouse do not match
-NVDA / USDG / Valorem, a lot size other than 1e18, and a feed with a non-positive answer or the wrong
-decimals. The script prints a WARNING because the admin is a plain key; that is expected on this path.
+The preflight refuses an asset without 18 decimals or a USDG without 6, a clearinghouse whose
+`feeBps` is not 15 or whose fee switch is on (accept it explicitly after deploy instead), a Seaport
+that is not 1.6 with the canonical ConduitController, and a feed with a non-positive answer or the
+wrong decimals. There is no registry any more. The script prints a WARNING because the admin is a
+plain key; that is expected on this path.
 
 Record from `broadcast/Deploy.s.sol/4663/run-latest.json`: the vault address, both library addresses
 (`.libraries[]`) and the deploy block.
@@ -103,9 +106,11 @@ Every line `ok`, ending `VERIFY PASSED` (55 checks in the rehearsal). What it co
   checked to hold the right library; how many there are is read from the artifact's `linkReferences`,
   7 at this commit, never hard-coded), immutables (each checked by value) and a library's own address
   word masked — this is what proves the compiled-in hard caps and all logic are this commit's;
-- every immutable: asset, USDG, clearinghouse, Seaport, the NVDA registry (not JUGGERNAUT), price
-  feed, Overcall fee recipient, zero conduit key, zero zone, the ERC-1155 approval target and the
-  approval itself on Valorem;
+- every immutable: asset, USDG, clearinghouse, Seaport, price feed, zero conduit key, **the zone is
+  the vault itself**, the ERC-1155 approval target and the approval itself on Valorem, the Seaport
+  1.6 zone interface advertised and EIP-1271 not; the dependencies: `seaport.information()` version
+  1.6 and the canonical ConduitController, the Seaport runtime `extcodehash` equal to the vendored
+  4663 runtime, Clear `feeBps == 15` with the switch off or accepted, token decimals;
 - policy field by field, deposit cap 20 NVDA, price age 4 days, fee recipient, share name, symbol,
   decimals;
 - roles for the phase; keeper, guardian and deployer distinct; role admins;
@@ -184,15 +189,17 @@ In leekzor/callhouse:
   `contracts/out/Vault.sol/Vault.json` and run `pnpm gen:abis` in `indexer/` and `web/`.
 - Web: `NEXT_PUBLIC_VAULT`, `NEXT_PUBLIC_VAULT_FROM_BLOCK`, then **rebuild**. Indexer:
   `VAULT_ADDRESS`, `START_BLOCK`. Keeper: its environment and `KEEPER_PK` (runtime only).
-- Before the first live week: one real 1-contract Overcall listing (L-04) to settle EIP-1271 against
-  Overcall's production validator.
+- Before the first live week: one real 1-contract fill through the self-hosted page (the vault's
+  listing is a restricted Seaport order with the vault as zone; Overcall's book does not list it, and
+  there is no EIP-1271 to settle).
 
 ---
 
 ## Rehearsal record — 2026-09-13
 
-`script/rehearse-deploy.sh` against `anvil --fork-url https://rpc.mainnet.chain.robinhood.com
---chain-id 4663`, fork block **62212405**, every forge call with `--no-storage-caching`, on commit `6ed528f` (after the lot-size and queue-fairness fixes). **Passed.**
+**Predates the redesign; to be re-run.** `script/rehearse-deploy.sh` (which now requires the anvil to
+run with `--code-size-limit 98304`, chain 4663's real limit, and probes for it) against
+`anvil --fork-url https://rpc.mainnet.chain.robinhood.com --chain-id 4663`, fork block **62212405**, every forge call with `--no-storage-caching`, on commit `6ed528f` (after the lot-size and queue-fairness fixes). **Passed.**
 
 Setup: admin Safe `0x40B2B8fAf07563A99203b55377ed2c9148a30468` and fee Safe
 `0x2e91b07AB8c64CF2e0Bb3593945818fEF387BC05`, both 2 of 3, created through the canonical SafeProxyFactory

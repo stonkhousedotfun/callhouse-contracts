@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseTest} from "../Base.t.sol";
 import {Vault} from "../../src/Vault.sol";
-import {Policy} from "../../src/Policy.sol";
+import {SeaportOrderLib} from "../../src/lib/SeaportOrderLib.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
 import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
@@ -66,20 +66,16 @@ contract VaultQueueTest is BaseTest {
         _rollClose();
     }
 
-    /// @dev Register a fresh cycle dated from now, and re-stamp the feed. The fixture's cycle
-    ///      is one-shot: after a roll closes, its write deadline and its price are both stale.
+    /// @dev Create a fresh week's option types dated from now, and re-stamp the feed. The fixture's
+    ///      types are one-shot: after a roll closes they have expired and the price is stale.
     function _nextCycle() internal {
-        exerciseTs = uint40(block.timestamp + 6 days);
-        expiryTs = uint40(block.timestamp + 7 days);
-        _installCycle();
-        feed.setAnswer(SPOT_FEED);
+        _nextWeek();
     }
 
-    /// @dev Open + list + fill in one go, leaving the vault in Listed with premium banked.
+    /// @dev Arm + list + fill in one go, leaving the vault in Listed with `n` written and sold and
+    ///      the premium banked.
     function _openAndFill(uint112 n) internal returns (uint256 optionId_) {
-        optionId_ = _rollOpen(n);
-        OrderComponents memory c = _approveListing(optionId_, n, _okUnitPrice());
-        _fill(c, n);
+        (optionId_,) = _openAndSell(n);
     }
 
     function _queue(address who, uint256 shares) internal returns (uint256 epoch) {
@@ -199,7 +195,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(alice, 20e18);
         _queue(alice, 10e18);
 
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         assertTrue(vault.canRedeemInstantly(), "vault is flat again");
@@ -222,7 +218,7 @@ contract VaultQueueTest is BaseTest {
     function test_completeRedeemRevertsBeforeTheEpochSettles() public {
         _deposit(alice, 20e18);
         _queue(alice, 5e18);
-        _rollOpen(10);
+        _rollOpen();
 
         // Hoisted: reading epochId is an external call and would disarm expectRevert.
         uint256 current = vault.epochId();
@@ -253,7 +249,7 @@ contract VaultQueueTest is BaseTest {
         // Still nothing to collect after someone else's epoch settles.
         _deposit(alice, 10e18);
         _queue(alice, 5e18);
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         vm.prank(bob);
@@ -265,7 +261,7 @@ contract VaultQueueTest is BaseTest {
     function test_completeRedeemCannotBeClaimedTwice() public {
         _deposit(alice, 20e18);
         _queue(alice, 5e18);
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         _complete(alice);
@@ -284,7 +280,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(alice, 20e18);
         _queue(alice, 5e18);
 
-        _rollOpen(10); // written, never listed, never filled
+        _rollOpen(); // armed, never listed, never filled: nothing is written under write-on-fill
 
         _warpToExercise();
         vault.lockBook();
@@ -318,8 +314,8 @@ contract VaultQueueTest is BaseTest {
     ///      exactly the same USDG per share as the half she kept, and Bob — who stayed — must
     ///      earn exactly his own share and not one cent of hers.
     ///
-    ///      20e18 supply, 10 contracts at $2.00: gross $20, Overcall 5% -> $19 to the vault,
-    ///      protocol 5% of that premium -> $0.95, leaving $18.05 to spread over 20e18 shares.
+    ///      20e18 supply, 10 contracts at $1.90: $19 to the vault, protocol 5% of that premium
+    ///      -> $0.95, leaving $18.05 to spread over 20e18 shares.
     ///        indexDelta = 18_050_000 * 1e27 / 20e18 = 902_500_000_000_000, exact (no dust)
     ///        escrow 5e18 -> 4_512_500   Alice 5e18 -> 4_512_500   Bob 10e18 -> 9_025_000
     function test_queuedSharesEarnTheWeeksPremiumNotTheStayers() public {
@@ -333,7 +329,6 @@ contract VaultQueueTest is BaseTest {
 
         _closeCycle();
 
-        assertEq(usdg.balanceOf(overcallFee), 1_000_000, "Overcall's 5%");
         assertEq(usdg.balanceOf(feeSafe), 950_000, "protocol 5% of the $19 premium");
 
         (uint256 sharesR, uint256 assetsR, uint256 usdgR) = vault.epochs(1);
@@ -378,7 +373,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(bob, 10e18);
         _queue(alice, 5e18);
 
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         assertEq(nvda.balanceOf(address(vault)), 20e18, "assets are physically still here");
@@ -396,25 +391,28 @@ contract VaultQueueTest is BaseTest {
     }
 
     /// @dev A settled-but-uncollected reservation is not the vault's asset to lend against,
-    ///      so it must not be writable as collateral for the next cycle either.
+    ///      so it must not be listable or writable as collateral for the next cycle either.
     function test_reservedAssetsAreNotWritableCollateral() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
         _queue(alice, 5e18);
 
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
         _nextCycle();
 
-        // Idle is 15e18, so 95% utilisation allows 14 contracts — not the 19 the raw 20e18
-        // balance would imply.
+        // NAV is 15e18, so 95% utilisation allows 14 contracts — not the 19 the raw 20e18
+        // balance would imply. The capacity is enforced at the listing and again at every fill.
+        uint256 id = _rollOpen();
+        OrderComponents memory tooBig = _buildOrder(id, 15, _okUnitPrice());
         vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(Policy.ContractsAboveUtilization.selector, uint256(15), uint256(14)));
-        vault.rollOpen(optionIds[RUNG_PICK], 15);
+        vm.expectRevert(abi.encodeWithSelector(SeaportOrderLib.OfferExceedsCapacity.selector, uint256(15), uint256(14)));
+        vault.approveListing(tooBig);
 
-        vm.prank(keeper);
-        vault.rollOpen(optionIds[RUNG_PICK], 14);
-        assertEq(vault.contractsWritten(), 14, "capped by idle net of the reservation");
+        OrderComponents memory c = _approveListing(id, 14, _okUnitPrice());
+        _fill(c, 14);
+        assertEq(vault.contractsWritten(), 14, "capped by NAV net of the reservation");
+        assertGe(nvda.balanceOf(address(vault)), vault.reservedAssets(), "the reserve is untouched by the write");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -575,7 +573,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(alice, 20e18);
         _queue(alice, 5e18);
 
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
         assertEq(vault.epochId(), 2, "epoch 1 settled");
         assertEq(vault.reservedAssets(), 5e18, "epoch 1 still uncollected");
@@ -610,7 +608,7 @@ contract VaultQueueTest is BaseTest {
 
     /// @dev The auto-settle above must be visible off-chain: it moves real value out of an
     ///      epoch and into the owner's owed balances, and before the event existed an indexer
-    ///      saw the epoch drain with no claim against it. 10 contracts filled at $2.00 gross
+    ///      saw the epoch drain with no claim against it. 10 contracts filled at $1.90
     ///      pays the vault 19_000_000; the 500 bps protocol fee on that premium (950_000) leaves
     ///      18_050_000 over 20 whole shares, and the escrow's quarter of the supply accrues
     ///      exactly 5e18 * (18_050_000 * 1e27 / 20e18) / 1e27 = 4_512_500.
@@ -636,7 +634,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(alice, 20e18);
         _queue(alice, 5e18);
 
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         vm.expectEmit(true, true, true, true, address(vault));
@@ -656,7 +654,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(bob, 20e18);
         _queue(alice, 5e18);
 
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle(); // epoch 1 settles; alice does not collect
         _nextCycle();
 
@@ -704,7 +702,7 @@ contract VaultQueueTest is BaseTest {
         assertEq(vault.maxDeposit(carol), 0, "full while every token backs a live share");
 
         _queue(alice, 30e18);
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         assertEq(nvda.balanceOf(address(vault)), 50e18, "the asset is all still physically here");
@@ -729,7 +727,7 @@ contract VaultQueueTest is BaseTest {
     ///      pointer would name a slot that settlement had already walked past.
     function test_settlementWithAnEmptyQueueIsANoOp() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         assertEq(vault.epochId(), 1, "epoch id does not advance on an empty queue");
@@ -743,7 +741,7 @@ contract VaultQueueTest is BaseTest {
         // The id really was not consumed: the next real queue still settles INTO epoch 1.
         _nextCycle();
         assertEq(_queue(alice, 5e18), 1, "the untouched id is still the live one");
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         (uint256 s2, uint256 a2, uint256 u2) = vault.epochs(1);
@@ -762,7 +760,7 @@ contract VaultQueueTest is BaseTest {
     ///      guardian key quietly becomes a freeze key.
     function test_queueAndCollectWorkWhileWritesAreHalted() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _rollOpen();
 
         vm.prank(guardian);
         vault.haltWrites();
@@ -788,7 +786,7 @@ contract VaultQueueTest is BaseTest {
         _nextCycle();
         vm.prank(keeper);
         vm.expectRevert(Vault.WritesAreHalted.selector);
-        vault.rollOpen(optionIds[RUNG_PICK], 5);
+        vault.rollOpen(optionIds[RUNG_PICK]);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -801,7 +799,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(alice, 20e18);
         assertEq(vault.previewRedeem(5e18), 5e18, "the instant path quotes honestly while flat");
 
-        _rollOpen(10);
+        _rollOpen();
         assertFalse(vault.canRedeemInstantly(), "a call is open");
         assertEq(vault.previewRedeem(5e18), 0, "previewRedeem must not quote the queue");
         assertEq(vault.previewWithdraw(5e18), 0, "previewWithdraw must not quote the queue");
@@ -984,8 +982,7 @@ contract VaultQueueTest is BaseTest {
     ///        cycle 1  supply 40e18, held 40e18, Alice queues 10e18, nothing sold
     ///                 epoch1 = (10e18 shares, 40e18 * 10/40 = 10e18 assets, 0 USDG)
     ///                 reservedAssets 10e18 | supply 30e18 | NAV 40 - 10 = 30e18 | price 1.0
-    ///        cycle 2  Bob queues 10e18, 12 contracts fill at $2.00
-    ///                 gross $24.00, Overcall 5% = $1.20, so $22.80 reaches the vault
+    ///        cycle 2  Bob queues 10e18, 12 contracts fill at $1.90, so $22.80 reaches the vault
     ///                 protocol 5% of the $22.80 premium = $1.14 to feeSafe, $21.66 to spread
     ///                 indexDelta = 21_660_000 * 1e27 / 30e18 = 722_000_000_000_000, exact
     ///                   escrow 10e18 -> 7_220_000   Alice 10e18 -> 7_220_000   Bob 10e18 -> 7_220_000
@@ -1008,7 +1005,7 @@ contract VaultQueueTest is BaseTest {
 
         // ---- cycle 1: Alice queues, the week goes unsold ----
         _queue(alice, 10e18);
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         assertEq(vault.epochId(), 2, "epoch 1 settled");
@@ -1071,7 +1068,7 @@ contract VaultQueueTest is BaseTest {
         assertEq(_phase(), 0, "Idle");
         assertEq(_queue(alice, 1e18), 1, "queued from Idle");
 
-        _rollOpen(10);
+        _rollOpen();
         assertEq(_phase(), 1, "Listed");
         assertEq(_queue(alice, 2e18), 1, "queued from Listed");
 
@@ -1101,8 +1098,7 @@ contract VaultQueueTest is BaseTest {
     ///      settled into their claimable pot on the way out. Get this wrong and every full
     ///      exit silently donates its back-premium to whoever stayed.
     ///
-    ///      HAND ARITHMETIC  cycle 1: 10 contracts at $2.00 -> $20.00 gross, $1.00 to Overcall,
-    ///      $19.00 to the vault, $0.95 protocol fee (5% of that premium), $18.05 spread over a
+    ///      HAND ARITHMETIC  cycle 1: 10 contracts at $1.90 -> $19.00 to the vault, $0.95 protocol fee (5% of that premium), $18.05 spread over a
     ///      20e18 supply = $0.9025 per 1e18 shares (indexDelta 902_500_000_000_000, exact).
     ///      Alice and Bob earn 9_025_000 each and neither claims.
     ///      Cycle 2 is unsold, so the escrow itself earns nothing and the epoch's USDG leg is 0
@@ -1123,7 +1119,7 @@ contract VaultQueueTest is BaseTest {
         assertEq(vault.balanceOf(alice), 0, "no share balance left to accrue against");
         assertEq(vault.claimableUsdg(alice), 9_025_000, "settled into her pot on the way into escrow");
 
-        _rollOpen(5); // unsold week
+        _rollOpen(); // unsold week
         _closeCycle();
 
         (, uint256 assetsR, uint256 usdgR) = vault.epochs(1);
@@ -1161,7 +1157,7 @@ contract VaultQueueTest is BaseTest {
         _deposit(bob, 9e18);
 
         _queue(alice, 21e18);
-        _rollOpen(10);
+        _rollOpen();
         _closeCycle();
 
         assertEq(nvda.balanceOf(address(vault)), 30e18, "the asset is all still physically here");
@@ -1207,8 +1203,8 @@ contract VaultQueueTest is BaseTest {
         vm.prank(alice);
         (uint256 assets, uint256 usdgOut) = vault.completeRedeem(carol);
 
-        // 20e18 supply, 10 contracts: $19.00 to the vault, $0.95 fee (5% of premium), $18.05
-        // over 20e18. Alice's escrowed 5e18 is a quarter of that supply -> $4.5125.
+        // 20e18 supply, 10 contracts at $1.90: $19.00 to the vault, $0.95 fee (5% of premium),
+        // $18.05 over 20e18. Alice's escrowed 5e18 is a quarter of that supply -> $4.5125.
         assertEq(assets, 5e18, "asset leg");
         assertEq(usdgOut, 4_512_500, "USDG leg");
         assertEq(nvda.balanceOf(carol), carolNvdaBefore + 5e18, "asset routed to the receiver");
@@ -1240,7 +1236,7 @@ contract VaultQueueTest is BaseTest {
     ///
     ///      HAND ARITHMETIC — supply is 20e18 when the order fills and when Carol's deposit
     ///      forces the checkpoint.
-    ///        10 contracts at $2.00  -> $20.00 gross, Overcall 5% = $1.00, $19.00 to the vault
+    ///        10 contracts at $1.90  -> $19.00 to the vault
     ///        protocol 5% of the $19.00 premium = $0.95, leaving $18.05 to index over 20e18
     ///        indexDelta = 18_050_000 * 1e27 / 20e18 = 902_500_000_000_000, exact
     ///          Alice (5e18, kept)   -> 4_512_500
@@ -1330,17 +1326,23 @@ contract VaultQueueTest is BaseTest {
         assertEq(vault.totalSupply(), 0, "and the vault is empty");
     }
 
-    /// @dev The second PoC: the sole holder with half a lot. Nothing can ever be written, so the
-    ///      queue could never settle through a roll.
+    /// @dev The second PoC: the sole holder with half a lot. Nothing can ever be sold (the
+    ///      capacity is zero, so no listing can be authorised), so the queue could never settle
+    ///      through a roll; the keeper would not even arm a week it cannot list.
     function test_settleQueue_freesTheLastHolderBelowOneLot() public {
         uint256 start = nvda.balanceOf(carol);
         _deposit(carol, 0.5e18);
         _queue(carol, 0.5e18);
 
-        uint256 id = optionIds[RUNG_PICK];
+        // Prove the capacity really is zero on a scratch arm, then rewind: a keeper that finds no
+        // capacity has no reason to arm the week at all, and the vault stays Idle.
+        uint256 snap = vm.snapshotState();
+        uint256 id = _rollOpen();
+        OrderComponents memory one = _buildOrder(id, 1, _okUnitPrice());
         vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(Policy.ContractsAboveUtilization.selector, 1, 0));
-        vault.rollOpen(id, 1);
+        vm.expectRevert(abi.encodeWithSelector(SeaportOrderLib.OfferExceedsCapacity.selector, 1, 0));
+        vault.approveListing(one);
+        vm.revertToState(snap);
 
         vault.settleQueue();
         (uint256 assets,) = _complete(carol);
@@ -1425,7 +1427,7 @@ contract VaultQueueTest is BaseTest {
         vault.settleQueue();
 
         _deposit(alice, 10e18);
-        _rollOpen(5);
+        _rollOpen();
         _queue(alice, 1e18);
         vm.expectRevert(abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Idle, Vault.Phase.Listed));
         vault.settleQueue();

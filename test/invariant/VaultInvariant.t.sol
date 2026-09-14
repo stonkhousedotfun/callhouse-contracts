@@ -8,14 +8,15 @@ import {Policy} from "../../src/Policy.sol";
 import {MockClear} from "../../src/mocks/MockClear.sol";
 import {MockERC20} from "../../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
-import {MockRegistry} from "../../src/mocks/MockRegistry.sol";
 import {MockSeaport} from "../../src/mocks/MockSeaport.sol";
 import {MockFeed} from "../../src/mocks/MockFeed.sol";
+import {IValoremClear} from "../../src/interfaces/IValoremClear.sol";
 import {OrderComponents, OfferItem, ConsiderationItem, ItemType, OrderType} from "../../src/interfaces/ISeaport.sol";
 
 /// @notice Drives the vault through random but LEGAL sequences: deposits, mints, instant
 ///         redemptions, share transfers, the redeem queue, USDG claims, and full roll cycles
-///         (open, list, partial fill, partial assignment, lock, close) across many weeks.
+///         (arm, list, partial fills that WRITE, a third party writing into and exercising the
+///         same bucket, partial assignment, lock, close) across many weeks.
 /// @dev Every action is guarded by the same preconditions the vault enforces, so a run is a
 ///      sequence of calls a real user or keeper could actually make. Actions that cannot
 ///      legally run right now count as SKIPPED rather than reverting, and everything that does
@@ -41,11 +42,13 @@ contract VaultHandler is Test {
     MockStockToken internal immutable nvda;
     MockERC20 internal immutable usdg;
     MockClear internal immutable clear;
-    MockRegistry internal immutable registry;
     MockSeaport internal immutable seaport;
     MockFeed internal immutable feed;
     address internal immutable buyer;
-    address internal immutable overcallFee;
+    /// @dev A third-party writer and exerciser on the SAME option id (AUDIT-FINDINGS F-01). It writes
+    ///      into the vault's bucket before any exercise and exercises whenever it likes; under write on
+    ///      fill it can only ever assign the vault on contracts the vault sold.
+    address internal immutable mallory;
     address internal immutable admin;
     address internal immutable guardian;
 
@@ -59,7 +62,9 @@ contract VaultHandler is Test {
     uint256 public totalDeposited;
     /// @notice Asset base units users have taken out, instant redemptions and the queue alike.
     uint256 public totalWithdrawn;
-    /// @notice Asset base units handed to option buyers through assignment. Gone for good.
+    /// @notice Asset base units the vault's claim gave up to exercisers, MEASURED as the drop in
+    ///         `lockedAssets()` across each exercise (the vault's pro-rata share of a bucket, not the
+    ///         exerciser's size: other writers share the bucket). Gone for good.
     uint256 public totalAssignedOut;
     /// @notice Asset base units the issuer has burnt out of the vault with `adminBurn`. Gone for good.
     uint256 public totalBurned;
@@ -75,9 +80,9 @@ contract VaultHandler is Test {
                   GHOST STATE FOR THE PROTOCOL FEE BOUND
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Every fee-bearing USDG base unit that ever reached the vault: the vault's leg of
-    ///         each successful Overcall fill, MEASURED as the vault's USDG balance delta across
-    ///         the `fulfil` call rather than recomputed from the order.
+    /// @notice Every fee-bearing USDG base unit that ever reached the vault: the premium of each
+    ///         successful fill, MEASURED as the vault's USDG balance delta across the `fulfil` call
+    ///         rather than recomputed from the order.
     /// @dev The protocol fee may only ever be charged on this. Strike proceeds are deliberately
     ///      NOT counted: they arrive inside `rollClose` when the Valorem claim is redeemed, and
     ///      they are the assigned depositors' own principal. The handler never donates USDG to
@@ -128,9 +133,10 @@ contract VaultHandler is Test {
     uint256 public cExercise;
     uint256 public cLock;
     uint256 public cClose;
-    uint256 public cWriteMore;
     uint256 public cSettleQueue;
-    uint256 public cStaleKill;
+    /// @notice Third-party writes into the vault's option id, and exercises by that writer.
+    uint256 public cThirdPartyWrite;
+    uint256 public cThirdPartyExercise;
     uint256 public cBurn;
     /// @notice Burns that took the balance below `reservedAssets`.
     uint256 public cBurnShortfalls;
@@ -153,6 +159,9 @@ contract VaultHandler is Test {
 
     /// @notice Cycles that ended with at least one contract assigned.
     uint256 public cAssignedCycles;
+    /// @notice Fills that opened the cycle's claim, and fills that topped an existing claim up.
+    uint256 public cFirstFills;
+    uint256 public cTopUpFills;
 
     /*//////////////////////////////////////////////////////////////
                              CYCLE FIXTURE
@@ -188,11 +197,10 @@ contract VaultHandler is Test {
         MockStockToken nvda_,
         MockERC20 usdg_,
         MockClear clear_,
-        MockRegistry registry_,
         MockSeaport seaport_,
         MockFeed feed_,
         address buyer_,
-        address overcallFee_,
+        address mallory_,
         address admin_,
         address guardian_,
         address[3] memory actors_
@@ -201,11 +209,10 @@ contract VaultHandler is Test {
         nvda = nvda_;
         usdg = usdg_;
         clear = clear_;
-        registry = registry_;
         seaport = seaport_;
         feed = feed_;
         buyer = buyer_;
-        overcallFee = overcallFee_;
+        mallory = mallory_;
         admin = admin_;
         guardian = guardian_;
         actors = actors_;
@@ -216,9 +223,14 @@ contract VaultHandler is Test {
         strikes.push(241_000_000);
         strikes.push(246_000_000);
 
-        // Standing approvals for the buyer so a fill or an exercise is never blocked on one.
+        // Standing approvals for the buyer so a fill or an exercise is never blocked on one, and for
+        // the third-party writer so a write or an exercise is not either.
         vm.startPrank(buyer_);
         usdg_.approve(address(seaport_), type(uint256).max);
+        usdg_.approve(address(clear_), type(uint256).max);
+        vm.stopPrank();
+        vm.startPrank(mallory_);
+        nvda_.approve(address(clear_), type(uint256).max);
         usdg_.approve(address(clear_), type(uint256).max);
         vm.stopPrank();
     }
@@ -619,21 +631,20 @@ contract VaultHandler is Test {
                               THE WEEKLY ROLL
     //////////////////////////////////////////////////////////////*/
 
-    function rollOpen(uint256 spotSeed, uint256 rungSeed, uint256 sizeSeed) external {
+    /// @dev ARM a cycle on a freshly created in-band option type. Writes nothing (decision D1): the
+    ///      collateral moves only inside `fill`. No idle collateral is needed to arm, and none is
+    ///      required here, so the fill guard is the one place capacity is judged.
+    function rollOpen(uint256 spotSeed, uint256 rungSeed) external {
         attempted++;
-        // Idle, not halted, not stranded (`rollOpen` refuses `StillStranded`), and the vault able to
-        // approve and move its Stock Token into Valorem.
-        if (uint8(vault.phase()) != 0 || vault.writesHalted() || vault.isStranded() || _vaultBlockedOnNvda()) {
-            _skip();
-            return;
-        }
-        if (vault.idleAssets() < LOT) {
+        // Idle, not halted, not stranded (`rollOpen` refuses `StillStranded`). Arming moves no token,
+        // so a Stock Token blocklist of the vault does not stop it: the fills are what it stops.
+        if (uint8(vault.phase()) != 0 || vault.writesHalted() || vault.isStranded()) {
             _skip();
             return;
         }
 
-        // A fresh cycle every week, exactly as the registry does it. New timestamps mean new
-        // Valorem option ids, which keeps each cycle's claim isolated from the last one's.
+        // A fresh cycle every week, as the keeper does it with `newOptionType`. New timestamps mean
+        // new Valorem option ids, which keeps each cycle's claim isolated from the last one's.
         _installFreshCycle();
 
         uint256 spot = _refreshSpot(spotSeed);
@@ -643,14 +654,12 @@ contract VaultHandler is Test {
             return;
         }
 
-        uint256 maxN = _maxContracts();
-        if (maxN == 0) {
-            _skip();
-            return;
-        }
-        uint112 n = uint112(bound(sizeSeed, 1, maxN));
-
-        try vault.rollOpen(optionId, n) {
+        uint256 number = vault.cycleNumber();
+        try vault.rollOpen(optionId) {
+            assertEq(vault.contractsWritten(), 0, "arming wrote something");
+            assertEq(vault.claimKey(), 0, "arming opened a claim");
+            assertEq(vault.optionId(), optionId, "armed the wrong type");
+            assertEq(vault.cycleNumber(), number + 1, "the vault's own counter did not advance");
             succeeded++;
             cOpen++;
         } catch (bytes memory err) {
@@ -681,14 +690,15 @@ contract VaultHandler is Test {
         }
 
         uint256 optionId = vault.optionId();
-        uint256 available = clear.balanceOf(address(vault), optionId);
+        // CAPACITY, NOT INVENTORY: what the size gate would still admit this cycle.
+        uint256 available = _capacityLeft();
         if (available == 0) {
             _skip();
             return;
         }
 
         // approveListing re-checks the band's lower bound at live spot, so keep spot at or below
-        // the highest price whose band floor still admits the written strike.
+        // the highest price whose band floor still admits the armed strike.
         (uint16 minOtmBps,, uint16 minPremiumBps,,,) = vault.policy();
         uint256 maxSpot = (vault.cycleStrikeUsdg() * BPS) / (BPS + minOtmBps);
         if (maxSpot > 232_000_000) maxSpot = 232_000_000;
@@ -698,12 +708,10 @@ contract VaultHandler is Test {
         // Clear the 0.40%-of-spot floor per contract, and stay under the strike.
         uint256 floorUnit = (spot * minPremiumBps) / BPS + 1;
         uint256 unitPrice = bound(priceSeed, floorUnit, floorUnit * 6);
-        // Slots count price CUTS. Once three are spent, only a listing at or above the lowest
-        // price authorised this cycle is legal, so lift the price to it rather than skip. The
-        // lowest cleared some earlier floor and the strike ceiling, and lifting a price that
-        // already clears today's floor keeps it clear.
-        if (vault.listingsThisCycle() >= 3 && unitPrice < vault.lowestListedUnitUsdg()) {
-            unitPrice = vault.lowestListedUnitUsdg();
+        // Three authorisations a cycle, cancelled or not.
+        if (vault.listingsThisCycle() >= 3) {
+            _skip();
+            return;
         }
 
         listingNonce += 1;
@@ -722,48 +730,6 @@ contract VaultHandler is Test {
             cList++;
         } catch (bytes memory err) {
             _reverted("approveListing", err);
-        }
-    }
-
-    /// @dev A tranche top-up of this cycle's claim. Spot is set INSIDE the band for the written
-    ///      strike (one base unit clear of either edge), because the gate re-checks the band at
-    ///      live spot and a random spot would mostly skip. Size is bounded on the claim's total.
-    function writeMore(uint256 sizeSeed, uint256 spotSeed) external {
-        attempted++;
-        if (
-            uint8(vault.phase()) != 1 || vault.writesHalted() || block.timestamp >= vault.cycleExerciseTs()
-                || _vaultBlockedOnNvda()
-        ) {
-            _skip();
-            return;
-        }
-
-        (uint16 minOtmBps, uint16 maxOtmBps,, uint16 util,, uint64 cap) = vault.policy();
-        uint256 k = vault.cycleStrikeUsdg();
-        uint256 spot = bound(spotSeed, (k * BPS) / (BPS + maxOtmBps) + 1, (k * BPS) / (BPS + minOtmBps) - 1);
-        feed.setAnswer(int256(spot * 100));
-
-        // Sized on `totalAssets()`, exactly as the gate is: after an issuer burn the reserve can sit
-        // above the balance, and `idle + locked` would then overstate the sizing base.
-        uint256 byUtil = (vault.totalAssets() * util) / BPS / LOT;
-        uint256 maxTotal = byUtil < cap ? byUtil : cap;
-        uint256 written = vault.contractsWritten();
-        if (maxTotal <= written) {
-            _skip();
-            return;
-        }
-        uint112 n = uint112(bound(sizeSeed, 1, maxTotal - written));
-
-        uint256 key = vault.claimKey();
-        uint256 total = vault.totalAssets();
-        try vault.writeMore(n) {
-            assertEq(vault.claimKey(), key, "a top-up opened a second claim");
-            assertEq(vault.contractsWritten(), written + n, "contractsWritten did not accumulate");
-            assertEq(vault.totalAssets(), total, "a top-up moved the share price");
-            succeeded++;
-            cWriteMore++;
-        } catch (bytes memory err) {
-            _reverted("writeMore", err);
         }
     }
 
@@ -808,30 +774,92 @@ contract VaultHandler is Test {
         }
     }
 
-    /// @dev A stranger kills a listing the policy would no longer authorise at a fresh spot.
-    function invalidateStaleListing(uint256 spotSeed) external {
+    /// @dev THE F-01 ADVERSARY. A third party writes into the vault's option id. Before any exercise
+    ///      every write lands in the vault's bucket (upstream `_addOrUpdateBucket`), so later
+    ///      exercises are assigned pro rata across the vault and this writer. Under write on fill the
+    ///      vault's share of that assignment can never exceed what it sold.
+    function thirdPartyWrite(uint256 sizeSeed) external {
         attempted++;
-        if (vault.listingHash() == bytes32(0)) {
+        uint8 p = uint8(vault.phase());
+        uint256 optionId = vault.optionId();
+        if ((p != 1 && p != 2) || optionId == 0 || block.timestamp >= vault.cycleExpiryTs()) {
             _skip();
             return;
         }
-        uint256 spot = _refreshSpot(spotSeed);
-        (uint16 minOtmBps,, uint16 minPremiumBps,,,) = vault.policy();
-        bool stale = vault.cycleStrikeUsdg() < (spot * (BPS + minOtmBps)) / BPS
-            || vault.listingGrossUsdg() < (spot * vault.listingAmount() * minPremiumBps) / BPS;
-        if (!stale) {
-            _skip();
-            return;
-        }
+        uint112 n = uint112(bound(sizeSeed, 1, 40));
+        _fundAsset(mallory, uint256(n) * LOT);
 
-        vm.prank(address(uint160(uint256(keccak256(abi.encode(spotSeed, "sniper-guard"))))));
-        try vault.invalidateStaleListing() {
-            live.active = false;
+        uint256 locked = vault.lockedAssets();
+        uint256 nav = vault.totalAssets();
+        vm.prank(mallory);
+        try clear.write(optionId, n) {
+            assertEq(vault.lockedAssets(), locked, "a stranger's write moved the vault's collateral");
+            assertEq(vault.totalAssets(), nav, "a stranger's write moved NAV");
+            assertEq(clear.balanceOf(address(vault), optionId), 0, "a stranger's write put inventory in the vault");
             succeeded++;
-            cStaleKill++;
+            cThirdPartyWrite++;
         } catch (bytes memory err) {
-            _reverted("invalidateStaleListing", err);
+            _reverted("thirdPartyWrite", err);
         }
+    }
+
+    /// @dev The adversary exercises what it wrote (or bought). Warps into the window like {exercise}.
+    ///      Whatever the bucket maths does, the vault's claim gives up at most what it sold.
+    function thirdPartyExercise(uint256 amountSeed, uint256 whenSeed) external {
+        attempted++;
+        uint8 p = uint8(vault.phase());
+        uint256 optionId = vault.optionId();
+        if ((p != 1 && p != 2) || optionId == 0) {
+            _skip();
+            return;
+        }
+        // The exerciser pays the strike into Clear: a paused USDG or a frozen Clear refuses it.
+        if (usdg.paused() || usdg.isFrozen(address(clear))) {
+            _skip();
+            return;
+        }
+        uint40 exerciseTs = vault.cycleExerciseTs();
+        uint40 expiryTs = vault.cycleExpiryTs();
+        if (block.timestamp >= expiryTs) {
+            _skip();
+            return;
+        }
+        uint256 held = clear.balanceOf(mallory, optionId);
+        if (held == 0) {
+            _skip();
+            return;
+        }
+        if (block.timestamp < exerciseTs) vm.warp(bound(whenSeed, exerciseTs, expiryTs - 1));
+
+        uint112 n = uint112(bound(amountSeed, 1, held));
+        usdg.mint(mallory, uint256(n) * vault.cycleStrikeUsdg());
+
+        uint256 lockedBefore = vault.lockedAssets();
+        vm.prank(mallory);
+        try clear.exercise(optionId, n) {
+            uint256 lockedAfter = vault.lockedAssets();
+            totalAssignedOut += lockedBefore - lockedAfter;
+            _assertVaultAssignedOnlyWhatItSold();
+            succeeded++;
+            cThirdPartyExercise++;
+        } catch (bytes memory err) {
+            _reverted("thirdPartyExercise", err);
+        }
+    }
+
+    /// @dev The F-01 bound, checked after every exercise: the vault's claim is assigned on at most
+    ///      `contractsWritten`, which under write on fill is exactly what it sold.
+    function _assertVaultAssignedOnlyWhatItSold() internal view {
+        uint256 key = vault.claimKey();
+        if (key == 0) return;
+        IValoremClear.Claim memory c = clear.claim(key);
+        uint256 written = uint256(vault.contractsWritten()) * 1e18;
+        assertEq(c.amountWritten, written, "Valorem's amount written disagrees with contractsWritten");
+        assertLe(c.amountExercised, written, "the vault was assigned on more than it wrote (and sold)");
+        // Valorem floors the underlying and the exercised WAD per claim index separately, so the two
+        // can disagree by a wei of dust (which stays in Clear for ever, Zellic 2022 §4.1). One index
+        // under "no writes after the first exercise", so one wei.
+        assertApproxEqAbs(vault.lockedAssets(), written - c.amountExercised, 1, "locked != written - exercised");
     }
 
     /// @dev A keeper repricing mid-week is real, but cancelling every listing on sight would
@@ -857,16 +885,25 @@ contract VaultHandler is Test {
         }
     }
 
-    /// @dev Partial fills are the norm on Overcall, so the fill size is fuzzed against what is
-    ///      left of the order rather than always taking the lot.
+    /// @dev Partial fills are the norm, so the fill size is fuzzed against what is left of the order,
+    ///      capped at the capacity the fill gate would still admit. THIS IS WHERE THE VAULT WRITES:
+    ///      Seaport calls `authorizeOrder` before moving anything, the hook writes exactly the fill
+    ///      into Valorem, and `validateOrder` afterwards asserts nothing stayed behind.
     function fill(uint256 fillSeed) external {
         attempted++;
         if (!live.active || vault.listingHash() == bytes32(0)) {
             _skip();
             return;
         }
-        // The buyer's USDG cannot reach a frozen vault, and nothing moves while USDG is paused.
-        if (_usdgOutBlocked()) {
+        // The hook's own gates, mirrored: Listed, not halted, before the exercise window.
+        if (uint8(vault.phase()) != 1 || vault.writesHalted() || block.timestamp >= vault.cycleExerciseTs()) {
+            _skip();
+            return;
+        }
+        // The issuers' gates: the buyer's USDG cannot reach a paused token or a frozen vault, and the
+        // write inside the hook cannot move the vault's Stock Token into Valorem while the vault is
+        // blocklisted. Either makes Seaport (honestly) revert the whole fill.
+        if (_usdgOutBlocked() || _vaultBlockedOnNvda()) {
             _skip();
             return;
         }
@@ -874,33 +911,44 @@ contract VaultHandler is Test {
         OrderComponents memory c = _rebuildLive();
         bytes32 h = seaport.getOrderHash(c);
         uint256 remaining = live.amount - seaport.filled(h);
-        if (remaining == 0) {
+        uint256 capacity = _capacityLeft();
+        if (remaining == 0 || capacity == 0) {
             _skip();
             return;
         }
-        if (clear.balanceOf(address(vault), live.optionId) < remaining) {
-            _skip();
-            return;
-        }
-
-        uint256 fillAmount = bound(fillSeed, 1, remaining);
+        uint256 maxFill = remaining < capacity ? remaining : capacity;
+        uint256 fillAmount = bound(fillSeed, 1, maxFill);
         usdg.mint(buyer, live.unitPrice * fillAmount + 1e6);
 
+        // A live feed keeps ticking: re-stamp `updatedAt` at the SAME answer, so the fill gate's
+        // staleness check sees a fresh price and the band/premium floors the listing was priced
+        // against are unchanged.
+        (, int256 answer,,,) = feed.latestRoundData();
+        feed.setAnswer(answer);
+
         uint256 vaultUsdgBefore = usdg.balanceOf(address(vault));
+        uint256 writtenBefore = vault.contractsWritten();
+        uint256 keyBefore = vault.claimKey();
+        uint256 navBefore = vault.totalAssets();
         vm.prank(buyer);
         try seaport.fulfil(c, fillAmount) {
-            // The ghost is the MEASURED inflow, so a partial fill counts exactly what Seaport
-            // actually moved. It is cross-checked against the order's own vault leg (Overcall's
-            // 5% floored per contract, so the fraction is always exact) to prove the
-            // measurement is the premium and nothing else.
+            // The ghost is the MEASURED inflow, cross-checked against the order's unit price.
             uint256 premiumIn = usdg.balanceOf(address(vault)) - vaultUsdgBefore;
-            uint256 feePerContract = (live.unitPrice * 500) / BPS;
-            assertEq(
-                premiumIn,
-                (live.unitPrice - feePerContract) * fillAmount,
-                "a fill paid the vault something other than its consideration leg"
-            );
+            assertEq(premiumIn, live.unitPrice * fillAmount, "a fill paid the vault something other than its premium");
             ghostPremiumToVault += premiumIn;
+
+            // WRITTEN == SOLD, BY CONSTRUCTION.
+            assertEq(vault.contractsWritten(), writtenBefore + fillAmount, "the fill did not write exactly its size");
+            assertEq(clear.balanceOf(address(vault), live.optionId), 0, "option tokens stayed in the vault");
+            assertEq(clear.balanceOf(address(vault), vault.claimKey()), 1, "the vault does not hold its claim");
+            if (keyBefore == 0) {
+                cFirstFills++;
+            } else {
+                assertEq(vault.claimKey(), keyBefore, "a top-up opened a second claim");
+                cTopUpFills++;
+            }
+            assertEq(vault.totalAssets(), navBefore, "a fill moved the share price");
+            _assertVaultAssignedOnlyWhatItSold();
             succeeded++;
             cFill++;
         } catch (bytes memory err) {
@@ -949,9 +997,13 @@ contract VaultHandler is Test {
         uint112 n = uint112(bound(amountSeed, 1, held));
         usdg.mint(buyer, uint256(n) * vault.cycleStrikeUsdg());
 
+        uint256 lockedBefore = vault.lockedAssets();
         vm.prank(buyer);
         try clear.exercise(optionId, n) {
-            totalAssignedOut += uint256(n) * LOT;
+            // With a third-party writer in the bucket the vault gives up its pro-rata share, not
+            // `n` lots: measure what actually left the claim.
+            totalAssignedOut += lockedBefore - vault.lockedAssets();
+            _assertVaultAssignedOnlyWhatItSold();
             succeeded++;
             cExercise++;
         } catch (bytes memory err) {
@@ -1257,7 +1309,8 @@ contract VaultHandler is Test {
     ///      unfilled week (`exercise` warps only when the buyer holds inventory, and `rollClose`
     ///      deliberately never warps), so a 600-call run sees about `600 / actions` warps and
     ///      exactly as many cycles as their sum covers. The four issuer actions added for F-02
-    ///      took the handler from 21 to 25 actions, a sixth fewer warps a run, and the first
+    ///      took the handler to 25 actions (26 after the write-on-fill merge added the third-party
+    ///      writer, its exerciser and a second fill slot), a sixth fewer warps a run, and the first
     ///      full-depth run with a late first open and only eight warps left never reached
     ///      `cycleExerciseTs` and tripped the "no cycle was ever closed" floor in
     ///      {VaultInvariantTest.afterInvariant}. Three days rather than two puts the budget back
@@ -1389,7 +1442,19 @@ contract VaultHandler is Test {
 
     function _canDeposit() internal view returns (bool) {
         uint8 p = uint8(vault.phase());
-        return p == 0 || p == 1;
+        if (p != 0 && p != 1) return false;
+        // A DEAD VAULT IS NOT DEPOSITED INTO. Full assignment of everything sold (which the third-party
+        // exerciser reaches routinely) plus an issuer burn can leave NAV at zero, or a few wei, with the
+        // whole supply still outstanding and `balance == reservedAssets` keeping the gate open. A deposit
+        // then mints `assets x (supply + 1)` shares at one wei each; two of those in a row put the supply
+        // near 1e58 and `shares x accUsdgPerShare` (1e27-scaled) past uint256 in the queue's per-entry
+        // maths, so `previewCompleteRedeem` panics for that owner. That is a numeric edge of a book that
+        // has lost everything, not a fill or settlement defect, and no front end would quote a deposit
+        // into it: the handler stops where a UI would, at a share price under 1e-6 token per share, and
+        // the edge is recorded in the stage report rather than papered over in the vault.
+        uint256 supply = vault.totalSupply();
+        if (supply != 0 && vault.totalAssets() * 1e6 < supply) return false;
+        return true;
     }
 
     /// @dev Queued shares have already moved into escrow at the vault, so a holder's own
@@ -1422,7 +1487,6 @@ contract VaultHandler is Test {
                 clear.newOptionType(address(nvda), uint96(LOT), address(usdg), strikes[i], cycleExercise, cycleExpiry)
             );
         }
-        registry.setCycleWithStrikes(cycleOptionIds, strikes, cycleExercise, cycleExpiry);
     }
 
     /// @dev Pick a rung inside the policy's OTM band for this spot, or 0 if none qualifies.
@@ -1442,10 +1506,14 @@ contract VaultHandler is Test {
         return eligible[seed % count];
     }
 
-    function _maxContracts() internal view returns (uint256) {
+    /// @dev Contracts the fill gate would still admit this cycle: `Policy.maxContracts(totalAssets())`
+    ///      less what is already written. Sized on `totalAssets()` exactly as the gate is.
+    function _capacityLeft() internal view returns (uint256) {
         (,,, uint16 maxUtilizationBps,, uint64 cap) = vault.policy();
-        uint256 byUtilization = (vault.idleAssets() * maxUtilizationBps) / BPS / LOT;
-        return byUtilization < cap ? byUtilization : cap;
+        uint256 byUtilization = (vault.totalAssets() * maxUtilizationBps) / BPS / LOT;
+        uint256 maxTotal = byUtilization < cap ? byUtilization : cap;
+        uint256 written = vault.contractsWritten();
+        return maxTotal > written ? maxTotal - written : 0;
     }
 
     function _rebuildLive() internal view returns (OrderComponents memory) {
@@ -1460,8 +1528,8 @@ contract VaultHandler is Test {
         return _buildOrderWithCounter(optionId, amount, unitPrice, endTime, seaport.getCounter(address(vault)), salt);
     }
 
-    /// @dev The exact Overcall shape: 5% fee floored PER CONTRACT, so every consideration item
-    ///      divides evenly by the order size and a partial fill is expressible.
+    /// @dev The vault's order shape: offerer AND zone the vault, PARTIAL_RESTRICTED, one USDG
+    ///      consideration item of `unitPrice x amount` to the vault, so every fraction is exact.
     function _buildOrderWithCounter(
         uint256 optionId,
         uint256 amount,
@@ -1470,10 +1538,6 @@ contract VaultHandler is Test {
         uint256 counter,
         uint256 salt
     ) internal view returns (OrderComponents memory c) {
-        uint256 feePerContract = (unitPrice * 500) / BPS;
-        uint256 toOvercall = feePerContract * amount;
-        uint256 toVault = (unitPrice - feePerContract) * amount;
-
         OfferItem[] memory offer = new OfferItem[](1);
         offer[0] = OfferItem({
             itemType: ItemType.ERC1155,
@@ -1483,30 +1547,22 @@ contract VaultHandler is Test {
             endAmount: amount
         });
 
-        ConsiderationItem[] memory consid = new ConsiderationItem[](2);
+        ConsiderationItem[] memory consid = new ConsiderationItem[](1);
         consid[0] = ConsiderationItem({
             itemType: ItemType.ERC20,
             token: address(usdg),
             identifierOrCriteria: 0,
-            startAmount: toVault,
-            endAmount: toVault,
+            startAmount: unitPrice * amount,
+            endAmount: unitPrice * amount,
             recipient: payable(address(vault))
-        });
-        consid[1] = ConsiderationItem({
-            itemType: ItemType.ERC20,
-            token: address(usdg),
-            identifierOrCriteria: 0,
-            startAmount: toOvercall,
-            endAmount: toOvercall,
-            recipient: payable(overcallFee)
         });
 
         c = OrderComponents({
             offerer: address(vault),
-            zone: address(0),
+            zone: address(vault),
             offer: offer,
             consideration: consid,
-            orderType: OrderType.PARTIAL_OPEN,
+            orderType: OrderType.PARTIAL_RESTRICTED,
             startTime: 0,
             endTime: endTime,
             zoneHash: bytes32(0),
@@ -1547,11 +1603,10 @@ contract VaultInvariantTest is BaseTest {
             nvda,
             usdg,
             mockClear,
-            registry,
-            seaport,
+            mockSeaport,
             feed,
             buyer,
-            overcallFee,
+            makeAddr("mallory"),
             admin,
             guardian,
             [alice, bob, carol]
@@ -1564,7 +1619,7 @@ contract VaultInvariantTest is BaseTest {
 
         holders = [alice, bob, carol, buyer, address(vault)];
 
-        bytes4[] memory selectors = new bytes4[](25);
+        bytes4[] memory selectors = new bytes4[](26);
         selectors[0] = VaultHandler.deposit.selector;
         selectors[1] = VaultHandler.mintShares.selector;
         selectors[2] = VaultHandler.instantRedeem.selector;
@@ -1582,14 +1637,17 @@ contract VaultInvariantTest is BaseTest {
         selectors[14] = VaultHandler.lockBook.selector;
         selectors[15] = VaultHandler.warpAhead.selector;
         selectors[16] = VaultHandler.toggleHalt.selector;
-        selectors[17] = VaultHandler.writeMore.selector;
-        selectors[18] = VaultHandler.settleQueue.selector;
-        selectors[19] = VaultHandler.invalidateStaleListing.selector;
-        selectors[20] = VaultHandler.adminBurn.selector;
-        selectors[21] = VaultHandler.retryStrandedClaim.selector;
-        selectors[22] = VaultHandler.toggleUsdgPause.selector;
-        selectors[23] = VaultHandler.toggleUsdgFreeze.selector;
-        selectors[24] = VaultHandler.toggleNvdaBlock.selector;
+        selectors[17] = VaultHandler.settleQueue.selector;
+        selectors[18] = VaultHandler.adminBurn.selector;
+        selectors[19] = VaultHandler.thirdPartyWrite.selector;
+        selectors[20] = VaultHandler.thirdPartyExercise.selector;
+        // A second chance for the fill path every round: fills are where the vault writes, and the
+        // listing window is short next to the settlement half of a cycle.
+        selectors[21] = VaultHandler.fill.selector;
+        selectors[22] = VaultHandler.retryStrandedClaim.selector;
+        selectors[23] = VaultHandler.toggleUsdgPause.selector;
+        selectors[24] = VaultHandler.toggleUsdgFreeze.selector;
+        selectors[25] = VaultHandler.toggleNvdaBlock.selector;
 
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
@@ -1862,14 +1920,42 @@ contract VaultInvariantTest is BaseTest {
             "asset reserve != unsettled epochs + staged balances + uncollected stranded-claim shares"
         );
 
-        // `lockedAssets()` is read straight out of Valorem's position; `contractsWritten` and
-        // `contractsAssigned()` come from the vault's own counters and the claim. If those two
-        // ever disagree, the vault's idea of its collateral has drifted from the clearinghouse's
-        // and `totalAssets` — and therefore the share price — is wrong.
+        // `lockedAssets()` is read straight out of Valorem's position; `contractsWritten` comes from
+        // the vault's own counter and the exercised amount from the claim. If those ever disagree,
+        // the vault's idea of its collateral has drifted from the clearinghouse's and `totalAssets`
+        // — and therefore the share price — is wrong. Assignment is a WAD figure here: with a third
+        // party in the bucket the vault's share is fractional, so the identity is stated against
+        // Valorem's `amountExercised`, and `contractsAssigned()` (its floor) is bounded by written.
         uint256 written = vault.contractsWritten();
-        uint256 assigned = vault.contractsAssigned();
-        assertLe(assigned, written, "more contracts assigned than were ever written");
-        assertEq(vault.lockedAssets(), (written - assigned) * 1e18, "locked collateral disagrees with the open short");
+        uint256 key = vault.claimKey();
+        if (key != 0) {
+            IValoremClear.Claim memory c = mockClear.claim(key);
+            assertEq(c.amountWritten, written * 1e18, "Valorem's amount written != contractsWritten");
+            assertLe(c.amountExercised, c.amountWritten, "more assigned than was ever written (and sold)");
+            // Floored per claim index on both sides in Valorem: a wei of dust, one index (see the handler).
+            assertApproxEqAbs(
+                vault.lockedAssets(), c.amountWritten - c.amountExercised, 1, "locked != written - exercised"
+            );
+        } else {
+            assertEq(vault.lockedAssets(), 0, "locked collateral with no claim");
+        }
+        assertLe(vault.contractsAssigned(), written, "more contracts assigned than were ever written");
+    }
+
+    /// @notice THE F-01 CLOSURE (decision D1). The vault never holds an unsold option token: outside
+    ///         a fill its balance of the armed id is zero, so there is nothing for a third-party
+    ///         writer to be assigned against beyond what the vault sold, and `written == sold`.
+    /// @dev The handler's third-party writer shares the vault's bucket and exercises at will; this
+    ///      is checked after every single call, in every phase.
+    function invariant_vaultHoldsNoOptionTokens() public view {
+        uint256 id = vault.optionId();
+        if (id != 0) {
+            assertEq(mockClear.balanceOf(address(vault), id), 0, "the vault holds unsold option tokens");
+        }
+        uint256 key = vault.claimKey();
+        if (key != 0) {
+            assertEq(mockClear.balanceOf(address(vault), key), 1, "the vault does not hold its own claim");
+        }
     }
 
     /// @notice Idle means flat. If it does not, instant redemption would pay out collateral
@@ -2018,9 +2104,11 @@ contract VaultInvariantTest is BaseTest {
         emit log_named_uint("exercises", handler.cExercise());
         emit log_named_uint("books locked", handler.cLock());
         emit log_named_uint("rollCloses", handler.cClose());
-        emit log_named_uint("tranche top-ups", handler.cWriteMore());
+        emit log_named_uint("fills opening a claim", handler.cFirstFills());
+        emit log_named_uint("fills topping a claim up", handler.cTopUpFills());
         emit log_named_uint("flat queue settlements", handler.cSettleQueue());
-        emit log_named_uint("stale listings killed", handler.cStaleKill());
+        emit log_named_uint("third-party writes into the bucket", handler.cThirdPartyWrite());
+        emit log_named_uint("third-party exercises", handler.cThirdPartyExercise());
         emit log_named_uint("issuer burns", handler.cBurn());
         emit log_named_uint("burns that unbacked the reserve", handler.cBurnShortfalls());
         emit log_named_uint("haircut redemptions", handler.cHaircuts());
@@ -2119,20 +2207,26 @@ contract VaultInvariantTest is BaseTest {
     function test_handlerReachesEveryState() public {
         handler.deposit(0, type(uint256).max); // alice, the biggest ticket the handler writes
         handler.deposit(1, type(uint256).max); // bob, the same
-        handler.rollOpen(0, 0, type(uint256).max);
+        handler.rollOpen(0, 0);
         assertEq(uint8(vault.phase()), 1, "should be Listed");
-        assertGt(vault.contractsWritten(), 0, "should have written contracts");
+        assertEq(vault.contractsWritten(), 0, "arming writes nothing");
 
         handler.approveListing(type(uint256).max, 0, 0);
         assertTrue(vault.listingHash() != bytes32(0), "should have a live listing");
 
-        handler.fill(1); // partial fill
+        handler.fill(1); // partial fill: opens the claim
+        assertGt(vault.contractsWritten(), 0, "the fill wrote");
+        handler.thirdPartyWrite(3); // an adversary joins the bucket
+        handler.fill(2); // another fill: tops the claim up
+        assertGt(handler.cTopUpFills(), 0, "a top-up fill");
         handler.deposit(2, 0); // carol deposits mid-cycle: new money, same open short
         handler.queueRedeem(0, type(uint256).max);
         assertGt(vault.queuedShares(), 0, "should have shares in escrow");
 
         handler.exercise(0, 0); // partial assignment inside the window
+        handler.thirdPartyExercise(type(uint256).max, 0); // the adversary exercises everything it wrote
         assertGt(handler.totalAssignedOut(), 0, "should have been assigned");
+        assertGt(handler.cThirdPartyExercise(), 0, "third-party exercise");
 
         handler.lockBook(0);
         assertEq(uint8(vault.phase()), 2, "should be Exercisable");
@@ -2164,6 +2258,7 @@ contract VaultInvariantTest is BaseTest {
         assertGt(handler.cClaim(), 0, "claimUsdg");
         assertGt(handler.cRedeem(), 0, "instant redeem");
         assertGt(handler.cAssignedCycles(), 0, "a cycle closed with an assignment");
+        assertGt(handler.cThirdPartyWrite(), 0, "thirdPartyWrite");
 
         // And the invariants still hold at the end of it.
         _assertAllInvariants();
@@ -2195,6 +2290,7 @@ contract VaultInvariantTest is BaseTest {
         invariant_feeNeverTouchesStrikeProceeds();
         invariant_depositGateTracksTheReserve();
         invariant_strandSharesAreConserved();
+        invariant_vaultHoldsNoOptionTokens();
     }
 
     /// @notice Proves the handler reaches a stranded close (F-02), the queue paying its idle slice
@@ -2204,7 +2300,7 @@ contract VaultInvariantTest is BaseTest {
     function test_handlerReachesAStrandAndRecovers() public {
         handler.deposit(0, type(uint256).max); // alice, 6e18
         handler.deposit(1, type(uint256).max); // bob, 6e18
-        handler.rollOpen(0, 0, type(uint256).max);
+        handler.rollOpen(0, 0);
         handler.approveListing(type(uint256).max, 0, 0);
         handler.fill(type(uint256).max); // the whole listing
         handler.queueRedeem(1, type(uint256).max); // bob queues everything, into the escrow that earns the week
@@ -2226,7 +2322,7 @@ contract VaultInvariantTest is BaseTest {
         assertEq(vault.maxDeposit(alice), 0, "deposits shut");
         handler.deposit(2, type(uint256).max); // carol: skipped, not reverted
         assertEq(handler.cDeposit(), 2, "no deposit landed while stranded");
-        handler.rollOpen(0, 0, 0); // skipped: StillStranded
+        handler.rollOpen(0, 0); // skipped: StillStranded
         assertEq(handler.cOpen(), 1, "no cycle opened over the stranded claim");
         _assertAllInvariants();
 
@@ -2264,7 +2360,7 @@ contract VaultInvariantTest is BaseTest {
         // Deposits reopen and a fresh cycle can start.
         handler.deposit(2, type(uint256).max);
         assertEq(handler.cDeposit(), 3, "carol's deposit lands now");
-        handler.rollOpen(0, 0, 0);
+        handler.rollOpen(0, 0);
         assertEq(handler.cOpen(), 2, "a new cycle opened");
 
         assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
@@ -2277,7 +2373,12 @@ contract VaultInvariantTest is BaseTest {
     function test_handlerReachesANvdaBlocklistStrand() public {
         handler.deposit(0, type(uint256).max);
         handler.deposit(1, type(uint256).max);
-        handler.rollOpen(0, 0, type(uint256).max);
+        // Arming locks nothing under write on fill: the collateral the redeem has to push back is
+        // whatever a fill wrote, so sell (and write) part of the listing first.
+        handler.rollOpen(0, 0);
+        handler.approveListing(type(uint256).max, 0, 0);
+        handler.fill(1);
+        assertGt(vault.lockedAssets(), 0, "a fill locked collateral");
         handler.queueRedeem(1, type(uint256).max);
         handler.warpAhead(type(uint256).max);
         handler.warpAhead(type(uint256).max);
@@ -2298,7 +2399,8 @@ contract VaultInvariantTest is BaseTest {
         _setNvdaBlock(false);
         handler.retryStrandedClaim(0);
         assertEq(handler.cRetries(), 1, "redeemed once unblocked");
-        assertEq(vault.usdgReservedForQueue(), 0, "no USDG leg on an unassigned week");
+        (, uint256 usdgIn,,,) = vault.strands(1);
+        assertEq(usdgIn, 0, "no USDG leg on an unassigned week");
         handler.completeRedeem(1);
         assertEq(handler.cComplete(), 1, "bob paid idle slice plus claim share");
         assertEq(handler.strandAssetsLeft(), 0, "the generation drained");
@@ -2313,7 +2415,9 @@ contract VaultInvariantTest is BaseTest {
         handler.deposit(1, type(uint256).max); // bob, 6e18
 
         // The handler refuses to burn before the run has closed a cycle, so run one OTM week first.
-        handler.rollOpen(0, 0, 0); // one contract
+        handler.rollOpen(0, 0);
+        handler.approveListing(0, 0, 0);
+        handler.fill(0); // one contract
         handler.adminBurn(0, 1e18);
         assertEq(handler.cBurn(), 0, "no burn before the first close");
         handler.warpAhead(type(uint256).max);
@@ -2342,13 +2446,19 @@ contract VaultInvariantTest is BaseTest {
         invariant_reservesAreReal();
         invariant_depositGateTracksTheReserve();
 
-        // alice collects: paid the haircut, reserve released in full, deposits reopen.
+        // alice collects: paid the haircut, reserve released in full, the vault's gate reopens.
         handler.completeRedeem(0);
         assertEq(handler.cHaircuts(), 1, "haircut redemption");
         assertEq(vault.reservedAssets(), 0, "reserve fully released");
         assertGt(vault.maxDeposit(alice), 0, "deposits reopen once the reserve is collected");
+        // The burn took the whole book: alice's haircut payout drained the balance to zero while bob's
+        // shares are still outstanding, so the vault is a dead book at a share price of zero. The VAULT
+        // would accept carol's deposit (at one wei a share); the HANDLER refuses it, as a front end
+        // would, see `_canDeposit`. Pinned both ways so neither side drifts silently.
+        assertEq(nvda.balanceOf(address(vault)), 0, "the book is empty");
+        assertGt(vault.totalSupply(), 0, "with shares outstanding");
         handler.deposit(2, type(uint256).max);
-        assertEq(handler.cDeposit(), 3, "carol's deposit lands now");
+        assertEq(handler.cDeposit(), 2, "the handler does not deposit into a dead book");
 
         assertEq(handler.revertedCalls(), 0, "no handler call should have reverted");
         invariant_assetConservation();
@@ -2360,18 +2470,25 @@ contract VaultInvariantTest is BaseTest {
         invariant_depositGateTracksTheReserve();
     }
 
-    /// @notice Proves the handler reaches the three audit-fix actions: a tranche top-up, a stale
-    ///         listing killed by a stranger, and a queue settled while flat.
-    function test_handlerReachesTranchesStaleKillsAndFlatSettlement() public {
+    /// @notice Proves the handler reaches the F-01 adversary (a third-party write and exercise into
+    ///         the vault's bucket) with the vault assigned on no more than it sold, and a queue settled
+    ///         while flat.
+    function test_handlerReachesTheThirdPartyBucketAndFlatSettlement() public {
         handler.deposit(0, type(uint256).max);
         handler.deposit(1, type(uint256).max);
-        handler.rollOpen(0, 0, 0); // one contract, leaving room for a tranche
-        handler.writeMore(0, 0);
-        assertGt(handler.cWriteMore(), 0, "writeMore");
-
+        handler.rollOpen(0, 0);
         handler.approveListing(0, 0, 0); // priced on the floor at $215 spot
-        handler.invalidateStaleListing(type(uint256).max); // $232 spot: the floor has risen past it
-        assertGt(handler.cStaleKill(), 0, "invalidateStaleListing");
+        handler.fill(1); // the vault sells (and writes) a fraction
+        uint256 sold = vault.contractsWritten();
+        assertGt(sold, 0, "fill");
+
+        handler.thirdPartyWrite(type(uint256).max); // 40 contracts into the same bucket
+        assertGt(handler.cThirdPartyWrite(), 0, "thirdPartyWrite");
+        handler.thirdPartyExercise(type(uint256).max, 0); // and exercises them all
+        assertGt(handler.cThirdPartyExercise(), 0, "thirdPartyExercise");
+        assertLe(vault.contractsAssigned(), sold, "assigned on at most what was sold");
+        assertGt(handler.totalAssignedOut(), 0, "the vault was assigned pro rata in its bucket");
+        assertEq(mockClear.balanceOf(address(vault), vault.optionId()), 0, "no inventory");
 
         handler.warpAhead(type(uint256).max);
         handler.warpAhead(type(uint256).max);
@@ -2391,6 +2508,7 @@ contract VaultInvariantTest is BaseTest {
         invariant_usdgBooksBalance();
         invariant_reservesAreReal();
         invariant_phaseSanity();
+        invariant_vaultHoldsNoOptionTokens();
     }
 
     /// @notice The redeem queue takes a whole position, which is what the handler assumes
@@ -2436,16 +2554,15 @@ contract VaultInvariantTest is BaseTest {
 
         uint256 optionId = optionIds[RUNG_MID];
         vm.prank(keeper);
-        vault.rollOpen(optionId, 1);
+        vault.rollOpen(optionId);
 
-        // $4.422336 for one contract. HAND CHECK: fee/contract = 4_422_336 * 500 / 10_000
-        // = 221_116 (floor), so Overcall takes 221_116 and the vault's consideration item is
-        // 4_422_336 - 221_116 = 4_201_220. The premium does not divide evenly into the supply,
-        // which is exactly what makes the index rounding observable.
-        OrderComponents memory c = _approveListing(optionId, 1, 4_422_336);
+        // $4.201220 for one contract, ONE consideration item: the exact figure the vault netted under
+        // the old two-item order at $4.422336, so the hand-checked drift below is unchanged. The
+        // premium does not divide evenly into the supply, which is what makes the index rounding
+        // observable.
+        OrderComponents memory c = _approveListing(optionId, 1, 4_201_220);
         _fill(c, 1);
         assertEq(usdg.balanceOf(address(vault)), 4_201_220, "premium landed");
-        assertEq(usdg.balanceOf(overcallFee), 221_116, "Overcall took its 5% of the one contract");
 
         // Distribution 1: the deposit checkpoints the premium while carol is the only holder, so
         // bob gets none of it. This deposit has to land BEFORE the exercise window opens —
@@ -2496,14 +2613,8 @@ contract VaultInvariantTest is BaseTest {
         // redeemer unable to collect their principal.
         _deposit(alice, 1e18);
 
-        exerciseTs = uint40(block.timestamp + 6 days);
-        expiryTs = uint40(block.timestamp + 7 days);
-        _installCycle();
-        feed.setAnswer(SPOT_FEED);
-        uint256 nextOption = optionIds[RUNG_PICK];
-
-        vm.prank(keeper);
-        vault.rollOpen(nextOption, 1);
+        _nextWeek();
+        _rollOpen(); // armed, listed to nobody: an unsold week distributes nothing
         _warpToExpiry();
         _rollClose();
         assertEq(_phase(), 0, "the cycle still closes: the underflow brick has been fixed");
@@ -2550,15 +2661,11 @@ contract VaultInvariantTest is BaseTest {
     /// @dev Written out in full so a reader can check the fixture instead of trusting it.
     ///
     ///      alice deposits 10e18 -> 10e18 shares (first deposit, 1:1).
-    ///      rollOpen 3 contracts on the 231 rung:
+    ///      arm the 231 rung, list 3 at $1.90 and sell all 3, which writes 3:
     ///        utilization cap = 10e18 * 9_500 / 10_000 / 1e18 = 9 contracts, so 3 is legal;
     ///        collateral locked = 3 * 1e18 = 3e18, leaving 7e18 idle.
-    ///      Listing 3 contracts at $2.00 each:
-    ///        fee per contract = 2_000_000 * 500 / 10_000      = 100_000
-    ///        consideration[1] to Overcall = 100_000 * 3       =   300_000
-    ///        consideration[0] to the vault = 1_900_000 * 3    = 5_700_000
-    ///        gross = 6_000_000, and the policy floor is
-    ///          220_000_000 * 3 * 40 / 10_000                  = 2_640_000  -> clears it.
+    ///        consideration to the vault = 1_900_000 * 3 = 5_700_000, and the policy floor is
+    ///          220_000_000 * 3 * 40 / 10_000 = 2_640_000  -> clears it.
     ///      Nobody exercises, so at rollClose the claim returns all 3e18 and no strike proceeds.
     ///      Harvest: balance 5_700_000, nothing committed, so gross = 5_700_000, all premium
     ///      (no assignment, so nothing fee-free).
@@ -2572,14 +2679,10 @@ contract VaultInvariantTest is BaseTest {
         _deposit(alice, 10e18);
         assertEq(vault.balanceOf(alice), 10e18, "first deposit mints one for one");
 
-        uint256 optionId = _rollOpen(3);
-        assertEq(vault.lockedAssets(), 3e18, "three lots locked in Valorem");
+        _openAndSell(3);
+        assertEq(vault.lockedAssets(), 3e18, "three lots locked in Valorem by the fill");
         assertEq(vault.idleAssets(), 7e18, "seven lots left idle");
-
-        OrderComponents memory c = _approveListing(optionId, 3, _okUnitPrice());
-        _fill(c, 3);
-        assertEq(usdg.balanceOf(address(vault)), 5_700_000, "vault leg of the premium");
-        assertEq(usdg.balanceOf(overcallFee), 300_000, "Overcall's 5%, floored per contract");
+        assertEq(usdg.balanceOf(address(vault)), 5_700_000, "the premium, all of it the vault's");
 
         _warpToExercise();
         vault.lockBook();
@@ -2616,7 +2719,7 @@ contract VaultInvariantTest is BaseTest {
     ///                + 1_111_111_111_111_111_113 = 12_222_222_222_222_222_221  (all 1:1)
     ///        queued  = 5_000_000_000_000_000_001 + 1_000_000_000_000_000_007 + 3
     ///                =  6_000_000_000_000_000_011
-    ///        3 contracts written on the 231 rung, 3 sold, 1 exercised, so at rollClose the
+    ///        3 contracts sold (and so written) on the 231 rung, 1 exercised, so at rollClose the
     ///        claim returns 2e18 of asset and 231_000_000 of strike proceeds:
     ///          asset balance = 12_222_222_222_222_222_221 - 3e18 + 2e18
     ///                        = 11_222_222_222_222_222_221
@@ -2657,9 +2760,7 @@ contract VaultInvariantTest is BaseTest {
         assertEq(vault.totalSupply(), supply, "deposits mint one for one while assets == shares");
         assertEq(supply, 12_222_222_222_222_222_221, "hand-checked supply");
 
-        uint256 optionId = _rollOpen(3);
-        OrderComponents memory c = _approveListing(optionId, 3, _okUnitPrice());
-        _fill(c, 3);
+        (uint256 optionId,) = _openAndSell(3);
 
         uint256 aQ = 5_000_000_000_000_000_001;
         uint256 bQ = 1_000_000_000_000_000_007;
@@ -2741,7 +2842,7 @@ contract VaultInvariantTest is BaseTest {
     function _replayShrunkShortfallSequence() internal {
         handler.mintShares(392018837125427104589832581607, 4);
         handler.deposit(2123574579, 1000);
-        handler.rollOpen(3, 16562, 12766);
+        handler.rollOpen(3, 16562);
         handler.queueRedeem(3, 10741306253717019503541772419713936945217196400975256642973503555);
         handler.approveListing(
             348, 279844674491765041288496783162929638129721525479985, 650711817032216429628102352962173952670641

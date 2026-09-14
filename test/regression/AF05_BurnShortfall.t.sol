@@ -120,7 +120,7 @@ contract AF05_BurnShortfall is BaseTest {
         vault.settleQueue();
         assertEq(vault.reservedAssets(), 50e18);
 
-        _rollOpen(47);
+        _openAndSell(47);
         assertEq(vault.lockedAssets(), 47e18);
         assertEq(nvda.balanceOf(address(vault)), 53e18);
 
@@ -163,7 +163,7 @@ contract AF05_BurnShortfall is BaseTest {
         _deposit(bob, 50e18);
         _queue(alice, 50e18);
         vault.settleQueue();
-        _rollOpen(47);
+        _openAndSell(47);
 
         nvda.adminBurn(address(vault), 20e18); // balance 33 < reserved 50
         _assertDepositsClosed(dave, "before the collateral returns");
