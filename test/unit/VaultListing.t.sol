@@ -9,26 +9,24 @@ import {SeaportOrderLib} from "../../src/lib/SeaportOrderLib.sol";
 import {OrderComponents, OfferItem, ConsiderationItem, ItemType, OrderType} from "../../src/interfaces/ISeaport.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
-/// @notice Seaport order authorisation: what the vault will sign for, and everything it won't.
-/// @dev This is the surface that stops a compromised keeper. The keeper never holds the option
-///      ERC-1155 and never holds a signing key for the vault; the only way inventory leaves is
-///      an order the vault itself authorised. So every field of that order is checked on chain,
-///      and the bulk of this file is the rejection matrix for those checks.
+/// @notice Seaport order authorisation: what the vault will list, and everything it won't.
+/// @dev This is the surface that stops a compromised keeper. The keeper never holds an option
+///      token and never holds a signing key for the vault; the only way a contract is ever written
+///      and sold is a fill of an order the vault itself authorised, through the vault's own zone
+///      hooks. So every field of that order is checked on chain, and the bulk of this file is the
+///      rejection matrix for those checks. What happens INSIDE a fill is test/unit/VaultWriteOnFill.t.sol.
 ///
 ///      TESTING NOTE, and it bit this repo once already: `vm.expectRevert` arms the NEXT
-///      external call. Every helper here that touches the vault, the registry or Seaport is
+///      external call. Every helper here that touches the vault, the clearinghouse or Seaport is
 ///      hoisted into a local BEFORE the cheatcode, including the expected-error bytes.
 contract VaultListingTest is BaseTest {
     /*//////////////////////////////////////////////////////////////
                               LOCAL FIXTURE
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Contracts written in the standard setup. 10 lots against a 30e18 deposit sits well
+    /// @dev Contracts listed in the standard setup. 10 lots against a 30e18 deposit sits well
     ///      inside the 95% utilization limit (28) and the 50-lot cap.
     uint112 internal constant N = 10;
-
-    bytes4 internal constant EIP1271_MAGIC = 0x1626ba7e;
-    bytes4 internal constant EIP1271_INVALID = 0xffffffff;
 
     event ListingApproved(
         bytes32 indexed orderHash, uint256 indexed optionId, uint256 amount, uint256 grossUsdg, uint8 seq
@@ -36,11 +34,11 @@ contract VaultListingTest is BaseTest {
     event ListingCancelled(bytes32 indexed orderHash);
     event AllListingsInvalidated(uint256 newCounter);
 
-    /// @dev Deposit, write N contracts, and hand back a well-formed order for them.
+    /// @dev Deposit, ARM the in-band rung, and hand back a well-formed order for N contracts.
     ///      Nothing is approved yet: each rejection test mutates exactly one field first.
     function _openAndBuild() internal returns (uint256 optionId, OrderComponents memory c) {
         _deposit(alice, 30e18);
-        optionId = _rollOpen(N);
+        optionId = _rollOpen();
         c = _buildOrder(optionId, N, _okUnitPrice());
     }
 
@@ -53,12 +51,8 @@ contract VaultListingTest is BaseTest {
         vault.approveListing(c);
     }
 
-    function _sig(bytes32 h) internal view returns (bytes32) {
-        return bytes32(vault.isValidSignature(h, ""));
-    }
-
     /*//////////////////////////////////////////////////////////////
-                        THE HAPPY PATH (T-07, F-03)
+                             THE HAPPY PATH
     //////////////////////////////////////////////////////////////*/
 
     function test_approveListing_recordsTheAuthorisedOrder() public {
@@ -66,16 +60,18 @@ contract VaultListingTest is BaseTest {
         bytes32 expectedHash = seaport.getOrderHash(c);
 
         vm.expectEmit(true, true, true, true, address(vault));
-        emit ListingApproved(expectedHash, optionId, N, 20_000_000, 1);
+        emit ListingApproved(expectedHash, optionId, N, 19_000_000, 1);
 
         vm.prank(keeper);
         vault.approveListing(c);
 
         assertEq(vault.listingHash(), expectedHash, "listingHash is the authorised order");
-        assertEq(vault.listingGrossUsdg(), 20_000_000, "$2.00 x 10 contracts, gross of Overcall's cut");
+        assertEq(vault.listingGrossUsdg(), 19_000_000, "$1.90 x 10 contracts, every unit of it the vault's");
         assertEq(vault.listingAmount(), N, "10 contracts offered");
         assertEq(vault.listingsThisCycle(), 1, "first of the three listings this cycle");
-        assertTrue(seaport.validated(expectedHash), "order marked valid on Seaport so it fills unsigned");
+        assertTrue(mockSeaport.validated(expectedHash), "order marked valid on Seaport so it fills unsigned");
+        assertEq(vault.contractsWritten(), 0, "listing writes nothing: the fill does");
+        assertEq(clear.balanceOf(address(vault), optionId), 0, "and the vault holds no option tokens");
 
         (bool isValidated, bool isCancelled, uint256 totalFilled, uint256 totalSize) =
             seaport.getOrderStatus(expectedHash);
@@ -85,110 +81,15 @@ contract VaultListingTest is BaseTest {
         assertEq(totalSize, N, "order size is the offer amount");
     }
 
-    /// @dev FULL_OPEN is the other order type Overcall may publish. It must be accepted too,
-    ///      or a legitimate non-partial listing would be unlistable.
-    function test_approveListing_acceptsFullOpenAsWellAsPartialOpen() public {
-        (, OrderComponents memory c) = _openAndBuild();
-        c.orderType = OrderType.FULL_OPEN;
-
-        vm.prank(keeper);
-        vault.approveListing(c);
-
-        assertEq(vault.listingHash(), seaport.getOrderHash(c), "FULL_OPEN is a legal shape");
-    }
-
-    /// @dev F-03: the fill is where the 95/5 split becomes real money.
-    function test_fill_paysVault95AndOvercall5AndMovesTheOptionsOut() public {
-        (uint256 optionId, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-
-        // THE ARITHMETIC, BY HAND, so a reader can check the fixture instead of trusting it.
-        //   unit price        = 2_000_000            ($2.00, USDG is 6 dp)
-        //   feePerContract    = 2_000_000 * 500 / 10_000 = 100_000        ($0.10)
-        //   writerPerContract = 2_000_000 - 100_000      = 1_900_000      ($1.90)
-        //   consideration[1]  =   100_000 * 10 =   1_000_000   ($1.00 to Overcall)
-        //   consideration[0]  = 1_900_000 * 10 =  19_000_000   ($19.00 to the vault)
-        //   gross             = 2_000_000 * 10 =  20_000_000   ($20.00 out of the buyer)
-        // 1_000_000 / 20_000_000 = 5.00% exactly, and 19_000_000 + 1_000_000 = 20_000_000.
-        (uint256 toVault, uint256 toOvercall, uint256 gross) = _splitPremium(_okUnitPrice(), N);
-        assertEq(gross, 20_000_000, "gross premium");
-        assertEq(toVault, 19_000_000, "95%");
-        assertEq(toOvercall, 1_000_000, "5%");
-
-        uint256 buyerBefore = usdg.balanceOf(buyer);
-        _fill(c, N);
-
-        assertEq(usdg.balanceOf(address(vault)), toVault, "vault received exactly 95% of gross");
-        assertEq(usdg.balanceOf(overcallFee), toOvercall, "Overcall received exactly 5% of gross");
-        assertEq(usdg.balanceOf(buyer), buyerBefore - gross, "buyer paid gross, no more");
-        assertEq(clear.balanceOf(address(vault), optionId), 0, "every option token left the vault");
-        assertEq(clear.balanceOf(buyer, optionId), N, "buyer holds the calls");
-    }
-
-    /// @dev A partial fill must pay exactly its fraction of BOTH consideration items. This is
-    ///      the reason the fee is rounded per contract rather than on the total: Seaport
-    ///      rejects any fraction it cannot express exactly.
-    function test_partialFill_paysExactlyTheFilledFraction() public {
-        (uint256 optionId, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-
-        uint256 buyerBefore = usdg.balanceOf(buyer);
-        _fill(c, 4);
-
-        // THE ARITHMETIC, BY HAND. Seaport pays each consideration item startAmount*k/total:
-        //   vault    = 19_000_000 * 4 / 10 = 7_600_000   ($7.60), remainder 0
-        //   Overcall =  1_000_000 * 4 / 10 =   400_000   ($0.40), remainder 0
-        //   buyer out = 7_600_000 + 400_000 = 8_000_000  ($8.00 = $2.00 x 4)
-        // Both divisions are exact, which is the whole point of rounding the fee per contract:
-        // round on the TOTAL and one of these leaves a remainder and Seaport reverts.
-        assertEq(usdg.balanceOf(address(vault)), 7_600_000, "40% of 19.00 USDG");
-        assertEq(usdg.balanceOf(overcallFee), 400_000, "40% of 1.00 USDG");
-        assertEq(buyerBefore - usdg.balanceOf(buyer), 8_000_000, "buyer paid $2.00 x 4, exactly");
-        assertEq(clear.balanceOf(address(vault), optionId), 6, "six contracts still in inventory");
-        assertEq(clear.balanceOf(buyer, optionId), 4, "buyer holds four");
-
-        // The recorded listing is the ORDER's size and gross, not the outstanding remainder.
-        // A UI reading listingAmount as "contracts still for sale" would be wrong here; the
-        // vault's own inventory check reads the ERC-1155 balance instead, which is why the
-        // relist test below refuses the original size against the shrunken inventory.
-        assertEq(vault.listingAmount(), N, "listingAmount is the order size, not the remainder");
-        assertEq(vault.listingGrossUsdg(), 20_000_000, "listingGrossUsdg likewise");
-
-        // The remaining 6 completes the order and lands on the full-fill numbers exactly.
-        _fill(c, 6);
-        assertEq(usdg.balanceOf(address(vault)), 19_000_000, "95% of gross once fully filled");
-        assertEq(usdg.balanceOf(overcallFee), 1_000_000, "5% of gross once fully filled");
-        assertEq(buyerBefore - usdg.balanceOf(buyer), 20_000_000, "buyer paid gross in total, no more");
-        assertEq(clear.balanceOf(address(vault), optionId), 0, "inventory emptied");
-    }
-
-    /// @dev Per-contract rounding has to survive every legal (price, size, fill) triple, not
-    ///      just the round ones. If the split were rounded on the total, some of these fills
-    ///      would revert InexactFraction on Seaport and the week would go unfilled.
-    function testFuzz_perContractRoundingKeepsEveryPartialFillExact(uint256 unitPrice, uint8 sizeRaw, uint8 fillRaw)
-        public
-    {
-        uint112 n = uint112(bound(uint256(sizeRaw), 1, 20));
-        uint256 k = bound(uint256(fillRaw), 1, n);
-        // Lower bound is the policy floor EXACTLY (0.40% of $220 = $0.88/contract), not a
-        // comfortable margin above it, so the boundary price is inside the fuzzer's domain.
-        // Upper bound is $50, well under the $231 strike and inside the buyer's $5,000 purse
-        // at the largest size this bounds to (20 x $50 = $1,000). The wide range matters: it
-        // is what generates the odd prices where 5% does NOT divide evenly.
-        unitPrice = bound(unitPrice, 880_000, 50_000_000);
-
+    /// @dev CAPACITY, NOT INVENTORY. The keeper may list everything the size gate would still
+    ///      admit: `Policy.maxContracts(NAV) - contractsWritten`. 30 NVDA at 95% is 28 lots.
+    function test_approveListing_acceptsTheWholeCapacity() public {
         _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(n);
-        OrderComponents memory c = _approveListing(optionId, n, unitPrice);
-
-        _fill(c, k);
-
-        uint256 feePerContract = (unitPrice * 500) / 10_000;
-        assertEq(usdg.balanceOf(overcallFee), feePerContract * k, "Overcall gets the per-contract fee x fill");
-        assertEq(usdg.balanceOf(address(vault)), (unitPrice - feePerContract) * k, "vault gets the remainder x fill");
-        assertEq(clear.balanceOf(buyer, optionId), k, "buyer received exactly the filled contracts");
+        uint256 optionId = _rollOpen();
+        OrderComponents memory c = _buildOrder(optionId, 28, _okUnitPrice());
+        vm.prank(keeper);
+        vault.approveListing(c);
+        assertEq(vault.listingAmount(), 28, "the full capacity is listable at once");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -201,10 +102,15 @@ contract VaultListingTest is BaseTest {
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOfferer.selector, alice));
     }
 
-    function test_reject_nonZeroZone() public {
+    /// @dev THE ZONE IS THE VAULT. Any other zone (including none) would promise option tokens the
+    ///      vault never mints, because the write happens inside the vault's own `authorizeOrder`.
+    function test_reject_zoneOtherThanTheVault() public {
         (, OrderComponents memory c) = _openAndBuild();
         c.zone = bob;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadZone.selector, address(0), bob));
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadZone.selector, address(vault), bob));
+
+        c.zone = address(0);
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadZone.selector, address(vault), address(0)));
     }
 
     function test_reject_nonZeroZoneHash() public {
@@ -220,16 +126,20 @@ contract VaultListingTest is BaseTest {
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConduitKey.selector, bytes32(0), rogueKey));
     }
 
-    /// @dev A restricted order hands a zone a veto over every fill; a CONTRACT order is a
-    ///      different mechanism entirely. Neither belongs on the vault's inventory.
-    function test_reject_restrictedAndContractOrderTypes() public {
+    /// @dev PARTIAL_RESTRICTED and nothing else. An OPEN order would let Seaport try to move tokens
+    ///      the vault does not hold without ever calling the hook that writes them; FULL_RESTRICTED
+    ///      could only fill in one shot; CONTRACT orders are a different mechanism.
+    function test_reject_everyOrderTypeButPartialRestricted() public {
         (, OrderComponents memory c) = _openAndBuild();
+
+        c.orderType = OrderType.FULL_OPEN;
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOrderType.selector, OrderType.FULL_OPEN));
+
+        c.orderType = OrderType.PARTIAL_OPEN;
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOrderType.selector, OrderType.PARTIAL_OPEN));
 
         c.orderType = OrderType.FULL_RESTRICTED;
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOrderType.selector, OrderType.FULL_RESTRICTED));
-
-        c.orderType = OrderType.PARTIAL_RESTRICTED;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOrderType.selector, OrderType.PARTIAL_RESTRICTED));
 
         c.orderType = OrderType.CONTRACT;
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOrderType.selector, OrderType.CONTRACT));
@@ -279,14 +189,9 @@ contract VaultListingTest is BaseTest {
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.DutchAuctionNotAllowed.selector));
     }
 
-    function test_reject_dutchAuctionInEitherConsiderationItem() public {
+    function test_reject_dutchAuctionInTheConsideration() public {
         (, OrderComponents memory c) = _openAndBuild();
-
         c.consideration[0].endAmount = c.consideration[0].startAmount - 1;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.DutchAuctionNotAllowed.selector));
-
-        c.consideration[0].endAmount = c.consideration[0].startAmount;
-        c.consideration[1].endAmount = c.consideration[1].startAmount + 1;
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.DutchAuctionNotAllowed.selector));
     }
 
@@ -297,83 +202,74 @@ contract VaultListingTest is BaseTest {
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.OfferAmountZero.selector));
     }
 
-    /// @dev Offering more than the vault holds would be a naked call the moment it filled.
-    function test_reject_offerExceedsInventory() public {
+    /// @dev Offering more than the size gate would admit is a listing no full fill could ever clear:
+    ///      the hook would refuse it at the margin, so it is dead weight refused up front.
+    function test_reject_offerExceedsCapacity() public {
         _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
-        OrderComponents memory c = _buildOrder(optionId, uint256(N) + 1, _okUnitPrice());
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.OfferExceedsInventory.selector, uint256(N) + 1, N));
+        uint256 optionId = _rollOpen();
+        OrderComponents memory c = _buildOrder(optionId, 29, _okUnitPrice());
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.OfferExceedsCapacity.selector, 29, 28));
     }
 
-    /// @dev Inventory shrinks as the order fills, and the next listing must respect that.
-    ///      Re-listing the original size after a partial fill is the naked-call hazard again.
-    function test_reject_relistingMoreThanTheUnsoldInventory() public {
+    /// @dev Capacity shrinks as fills write, and the next listing must respect that: after 4 of 10
+    ///      have sold (and been written), the relist may offer at most 28 - 4 = 24.
+    function test_reject_relistingMoreThanTheRemainingCapacity() public {
         (uint256 optionId, OrderComponents memory c) = _openAndBuild();
         vm.prank(keeper);
         vault.approveListing(c);
         _fill(c, 4);
+        assertEq(vault.contractsWritten(), 4, "four written by the fill");
 
         vm.prank(keeper);
         vault.cancelListing(c);
 
-        OrderComponents memory tooBig = _buildOrder(optionId, N, _okUnitPrice() + 100_000);
-        _rejects(tooBig, abi.encodeWithSelector(SeaportOrderLib.OfferExceedsInventory.selector, N, 6));
+        OrderComponents memory tooBig = _buildOrder(optionId, 25, _okUnitPrice() + 100_000);
+        _rejects(tooBig, abi.encodeWithSelector(SeaportOrderLib.OfferExceedsCapacity.selector, 25, 24));
 
-        // Exactly the remaining six is fine.
-        OrderComponents memory ok = _buildOrder(optionId, 6, _okUnitPrice() + 100_000);
+        // Exactly the remaining capacity is fine.
+        OrderComponents memory ok = _buildOrder(optionId, 24, _okUnitPrice() + 100_000);
         vm.prank(keeper);
         vault.approveListing(ok);
-        assertEq(vault.listingAmount(), 6, "relisted the unsold remainder");
+        assertEq(vault.listingAmount(), 24, "relisted the remaining capacity");
     }
 
     /*//////////////////////////////////////////////////////////////
                      REJECTIONS: WHO GETS PAID, AND HOW MUCH
     //////////////////////////////////////////////////////////////*/
 
-    function test_reject_oneConsiderationItem() public {
+    /// @dev ONE consideration item. There is no venue fee item any more: paying a third party for
+    ///      flow it did not provide would be a pure depositor cost, and a second recipient is one
+    ///      more place a compromised keeper could route premium.
+    function test_reject_anyConsiderationLengthButOne() public {
         (, OrderComponents memory c) = _openAndBuild();
-        ConsiderationItem[] memory one = new ConsiderationItem[](1);
-        one[0] = c.consideration[0];
-        c.consideration = one;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationLength.selector, 1));
+
+        ConsiderationItem[] memory two = new ConsiderationItem[](2);
+        two[0] = c.consideration[0];
+        two[1] = c.consideration[0];
+        c.consideration = two;
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationLength.selector, 2));
+
+        c.consideration = new ConsiderationItem[](0);
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationLength.selector, 0));
     }
 
-    function test_reject_threeConsiderationItems() public {
-        (, OrderComponents memory c) = _openAndBuild();
-        ConsiderationItem[] memory three = new ConsiderationItem[](3);
-        three[0] = c.consideration[0];
-        three[1] = c.consideration[1];
-        three[2] = c.consideration[1];
-        c.consideration = three;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationLength.selector, 3));
-    }
-
-    /// @dev Both legs are checked, so both are tested. An ERC-1155 consideration would be the
-    ///      vault "selling" its calls for more calls; a NATIVE one would be payment in a token
-    ///      the vault has no distribution path for at all.
+    /// @dev An ERC-1155 consideration would be the vault "selling" its calls for more calls; a
+    ///      NATIVE one would be payment in a token the vault has no distribution path for at all.
     function test_reject_nonErc20ConsiderationItem() public {
         (, OrderComponents memory c) = _openAndBuild();
 
         c.consideration[0].itemType = ItemType.ERC1155;
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationItemType.selector, ItemType.ERC1155));
 
-        c.consideration[0].itemType = ItemType.ERC20;
-        c.consideration[1].itemType = ItemType.NATIVE;
+        c.consideration[0].itemType = ItemType.NATIVE;
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationItemType.selector, ItemType.NATIVE));
     }
 
     /// @dev Getting paid in something other than USDG is getting paid in something the vault
-    ///      cannot distribute. Both items are checked.
+    ///      cannot distribute.
     function test_reject_nonUsdgConsideration() public {
         (, OrderComponents memory c) = _openAndBuild();
-
         c.consideration[0].token = address(nvda);
-        _rejects(
-            c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationToken.selector, address(usdg), address(nvda))
-        );
-
-        c.consideration[0].token = address(usdg);
-        c.consideration[1].token = address(nvda);
         _rejects(
             c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationToken.selector, address(usdg), address(nvda))
         );
@@ -381,15 +277,8 @@ contract VaultListingTest is BaseTest {
 
     function test_reject_nonZeroConsiderationIdentifier() public {
         (, OrderComponents memory c) = _openAndBuild();
-
         c.consideration[0].identifierOrCriteria = 7;
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationIdentifier.selector, 7));
-
-        // The Overcall leg is checked with the same rule; testing only item 0 would leave the
-        // second branch of the identifier check unexecuted.
-        c.consideration[0].identifierOrCriteria = 0;
-        c.consideration[1].identifierOrCriteria = 9;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadConsiderationIdentifier.selector, 9));
     }
 
     /// @dev THE attack. A compromised keeper proposes a perfectly-priced order that pays the
@@ -401,107 +290,26 @@ contract VaultListingTest is BaseTest {
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadVaultRecipient.selector, address(vault), rogue));
     }
 
-    /// @dev The second item is Overcall's 5%. Point it anywhere else and Overcall will not
-    ///      surface the listing, so the order is dead weight on chain.
-    function testFuzz_reject_overcallFeePaidToTheWrongAddress(address rogue) public {
-        vm.assume(rogue != overcallFee);
-        (, OrderComponents memory c) = _openAndBuild();
-        c.consideration[1].recipient = payable(rogue);
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadOvercallRecipient.selector, overcallFee, rogue));
-    }
-
-    /// @dev Rounding the 5% on the TOTAL instead of per contract still produces a signable
-    ///      order whose gross divides by the order size, so nothing else catches it. It is
-    ///      caught here because Seaport would then reject partial fills with InexactFraction
-    ///      and the listing would quietly become all-or-nothing.
-    ///      At $0.900001 x 20 the two roundings differ by exactly one base unit.
-    function test_reject_feeSplitRoundedOnTheTotal() public {
-        _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(20);
-
-        uint256 unitPrice = 900_001;
-        OrderComponents memory c = _buildOrder(optionId, 20, unitPrice);
-        // Sanity: the fixture builds the correct, per-contract split.
-        assertEq(c.consideration[0].startAmount, 17_100_020, "per-contract split, vault leg");
-        assertEq(c.consideration[1].startAmount, 900_000, "per-contract split, Overcall leg");
-
-        // Now round on the total instead: 18_000_020 * 5% = 900_001.
-        c.consideration[0].startAmount = 17_100_019;
-        c.consideration[0].endAmount = 17_100_019;
-        c.consideration[1].startAmount = 900_001;
-        c.consideration[1].endAmount = 900_001;
-
-        _rejects(
-            c, abi.encodeWithSelector(SeaportOrderLib.BadFeeSplit.selector, 17_100_020, 17_100_019, 900_000, 900_001)
-        );
-    }
-
-    /// @dev The other shape of the same attack: keep the gross correct so the divisibility and
-    ///      floor checks all pass, but move Overcall's 5% into the vault's own leg. The order
-    ///      would still validate on Seaport and still pay the vault MORE than a correct one,
-    ///      which is precisely why nothing downstream would complain - the split is pinned to
-    ///      Overcall's published schema, not to the vault's advantage.
-    ///        gross unchanged at 20_000_000, so unit price is still 2_000_000
-    ///        expected (19_000_000, 1_000_000)  vs  proposed (20_000_000, 0)
-    function test_reject_feeSplitThatSkimsOvercallsLeg() public {
-        (, OrderComponents memory c) = _openAndBuild();
-        c.consideration[0].startAmount = 20_000_000;
-        c.consideration[0].endAmount = 20_000_000;
-        c.consideration[1].startAmount = 0;
-        c.consideration[1].endAmount = 0;
-
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadFeeSplit.selector, 19_000_000, 20_000_000, 1_000_000, 0));
-    }
-
     /// @dev A gross that is not a whole multiple of the contract count cannot be filled in
-    ///      fractions at all.
+    ///      fractions at all, and the hook needs an exact unit price to re-check the floor per fill.
     function test_reject_grossNotDivisibleByOrderSize() public {
         (, OrderComponents memory c) = _openAndBuild();
         c.consideration[0].startAmount += 1;
         c.consideration[0].endAmount += 1;
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.PremiumNotDivisibleByOrderSize.selector, 20_000_001, N));
-    }
-
-    /// @dev Below 20 base units the 5% fee floors to zero, and Overcall's schema rejects a
-    ///      zero-amount consideration item, so the listing would never reach a buyer.
-    function test_reject_unitPriceWhoseFeeRoundsToZero() public {
-        _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
-        OrderComponents memory c = _buildOrder(optionId, N, 19);
-        assertEq(c.consideration[1].startAmount, 0, "5% of 19 base units floors to nothing");
-        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.OvercallFeeRoundsToZero.selector, 19, 20));
-
-        // One base unit higher the fee survives (20 * 500 / 10_000 = 1), so the SHAPE gate is
-        // satisfied and a different gate has to be the one that stops it. It is the economic
-        // floor: 20 x 10 = 200 base units of gross against a $8.80 floor. Proving this keeps
-        // the two gates from being confused for one another - the shape gate is not, and must
-        // not be mistaken for, a price floor.
-        OrderComponents memory atTwenty = _buildOrder(optionId, N, 20);
-        assertEq(atTwenty.consideration[1].startAmount, 10, "5% of 20 base units is 1, x 10 contracts");
-        assertEq(atTwenty.consideration[0].startAmount, 190, "the vault leg keeps the other 19");
-        _rejects(atTwenty, abi.encodeWithSelector(Policy.PremiumBelowMinimum.selector, 200, 8_800_000));
+        _rejects(c, abi.encodeWithSelector(SeaportOrderLib.PremiumNotDivisibleByOrderSize.selector, 19_000_001, N));
     }
 
     /// @dev A premium above the strike is never a real quote, it is a fat finger or a broken
-    ///      feed. 20 base units is the floor, the strike is the ceiling.
+    ///      feed. The strike itself is still listable: the check is strictly-greater.
     function test_reject_unitPriceAboveTheStrike() public {
         _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
-        uint256 strike = registry.strikePerContract(optionId);
+        uint256 optionId = _rollOpen();
+        uint256 strike = vault.cycleStrikeUsdg();
         assertEq(strike, 231_000_000, "the in-band rung");
         OrderComponents memory c = _buildOrder(optionId, N, strike + 1);
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.UnitPriceExceedsStrike.selector, strike + 1, strike));
 
-        // The check is strictly-greater, so the strike itself is still listable. Asserting the
-        // rejection alone would pass just as well against an off-by-one `>=`, which would ban a
-        // legitimate (if absurdly rich) quote.
-        //   unit = 231_000_000, fee = 231_000_000 * 500 / 10_000 = 11_550_000
-        //   vault leg    = (231_000_000 - 11_550_000) * 10 = 2_194_500_000
-        //   Overcall leg =                11_550_000  * 10 =   115_500_000
-        //   gross        =                231_000_000 * 10 = 2_310_000_000
         OrderComponents memory atStrike = _buildOrder(optionId, N, strike);
-        assertEq(atStrike.consideration[0].startAmount, 2_194_500_000, "vault leg at the strike");
-        assertEq(atStrike.consideration[1].startAmount, 115_500_000, "Overcall leg at the strike");
         vm.prank(keeper);
         vault.approveListing(atStrike);
         assertEq(vault.listingGrossUsdg(), 2_310_000_000, "a unit price equal to the strike is accepted");
@@ -529,9 +337,9 @@ contract VaultListingTest is BaseTest {
             )
         );
 
-        // ...and one second earlier, i.e. an order that ends exactly when the book closes, is
-        // legal. The check is `endTime > exerciseTimestamp`; without this half an off-by-one
-        // would shave a second off every listing and nothing here would notice.
+        // ...and an order that ends exactly when the window opens is legal. Seaport's `endTime` is
+        // exclusive, so it fills up to the second before and never on the tick; the fill hook
+        // enforces the same edge itself (VaultWriteOnFill.t.sol).
         c.endTime = exerciseTs;
         vm.prank(keeper);
         vault.approveListing(c);
@@ -565,15 +373,16 @@ contract VaultListingTest is BaseTest {
     }
 
     /*//////////////////////////////////////////////////////////////
-                         REJECTIONS: THE POLICY FLOOR
+                         REJECTIONS: THE POLICY FLOORS
     //////////////////////////////////////////////////////////////*/
 
     /// @dev The economic floor is 0.40% of spot notional per week. At $220 spot that is
     ///      $0.88 a contract, so $0.80 must fail and $0.90 must pass. The order shape is
-    ///      impeccable in both cases: this gate is purely about price.
+    ///      impeccable in both cases: this gate is purely about price. It is an EARLY refusal
+    ///      for the keeper; the hook re-derives the floor at the spot of each fill.
     function test_reject_premiumBelowThePolicyFloor() public {
         _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
+        uint256 optionId = _rollOpen();
 
         OrderComponents memory tooCheap = _buildOrder(optionId, N, 800_000);
         _rejects(tooCheap, abi.encodeWithSelector(Policy.PremiumBelowMinimum.selector, 8_000_000, 8_800_000));
@@ -588,17 +397,12 @@ contract VaultListingTest is BaseTest {
     }
 
     /// @dev The floor is `premium < floor` reverts, so the floor itself must be listable.
-    ///      $0.80 vs $0.90 leaves a $0.10 gap either side of the real edge and would pass just
-    ///      as happily against an off-by-one. THE ARITHMETIC, BY HAND:
-    ///        floor(gross) = spot x contracts x minPremiumBps / 10_000
-    ///                     = 220_000_000 x 10 x 40 / 10_000 = 8_800_000   ($8.80 for ten lots)
+    ///        floor(gross) = 220_000_000 x 10 x 40 / 10_000 = 8_800_000
     ///        880_000 x 10 = 8_800_000  -> exactly the floor, must be ACCEPTED
     ///        879_999 x 10 = 8_799_990  -> ten base units under, must be REJECTED
-    ///      (879_999 is the largest unit price whose gross still lands under the floor while
-    ///      staying an exact multiple of the order size, so this is as tight as the edge gets.)
     function test_policyFloorIsInclusiveAtTheExactBoundary() public {
         _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
+        uint256 optionId = _rollOpen();
 
         OrderComponents memory under = _buildOrder(optionId, N, 879_999);
         _rejects(under, abi.encodeWithSelector(Policy.PremiumBelowMinimum.selector, 8_799_990, 8_800_000));
@@ -610,12 +414,35 @@ contract VaultListingTest is BaseTest {
         assertEq(vault.listingsThisCycle(), 1, "and the rejected one burned no slot");
     }
 
+    /// @dev Regression (review round 1): after a rally to $225 the band floor is 231.75, above the
+    ///      231 strike armed at $220. A listing then would only ever be refused at the hook, fill
+    ///      after fill, so the keeper cannot publish it at all. FLOOR ONLY (decision D9): after a
+    ///      sell-off the strike sits above the band ceiling, which makes the call safer to sell.
+    function test_approveListing_refusesAStrikeBelowTheLiveBandFloorButNotAboveTheCeiling() public {
+        _deposit(alice, 30e18);
+        uint256 optionId = _rollOpen();
+        feed.setAnswer(225_00000000);
+        _rejects(
+            _buildOrder(optionId, N, _okUnitPrice()),
+            abi.encodeWithSelector(Policy.StrikeBelowBand.selector, uint256(231_000_000), uint256(231_750_000))
+        );
+        assertEq(vault.listingHash(), bytes32(0), "nothing listed");
+        assertEq(vault.listingsThisCycle(), 0);
+
+        // A sell-off to $200 puts the 231 strike 15.5% out, above the 12% ceiling: still listable.
+        feed.setAnswer(200_00000000);
+        OrderComponents memory c = _buildOrder(optionId, N, _okUnitPrice());
+        vm.prank(keeper);
+        vault.approveListing(c);
+        assertEq(vault.listingHash(), seaport.getOrderHash(c), "the ceiling is not re-checked after the arm");
+    }
+
     /*//////////////////////////////////////////////////////////////
                       ONE LIVE LISTING, THREE PER CYCLE
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev F-11. Two live orders for the same inventory could both fill, so a second listing
-    ///      is refused until the first is explicitly cancelled.
+    /// @dev Two live orders would both fill and both write, so a second listing is refused until
+    ///      the first is explicitly cancelled.
     function test_onlyOneListingLiveAtATime() public {
         (uint256 optionId, OrderComponents memory first) = _openAndBuild();
         vm.prank(keeper);
@@ -630,24 +457,23 @@ contract VaultListingTest is BaseTest {
         assertEq(vault.listingHash(), bytes32(0), "cancel clears the live hash");
         assertEq(vault.listingGrossUsdg(), 0, "and the recorded gross");
         assertEq(vault.listingAmount(), 0, "and the recorded size");
-        assertTrue(seaport.cancelled(live), "cancelled on Seaport too");
+        assertTrue(mockSeaport.cancelled(live), "cancelled on Seaport too");
 
         vm.prank(keeper);
         vault.approveListing(second);
         assertEq(vault.listingHash(), seaport.getOrderHash(second), "the replacement is live");
-        // The replacement is priced ABOVE the first, so it is a reprice up and spends no slot.
-        assertEq(vault.listingsThisCycle(), 1, "only the first listing spent a price level");
+        assertEq(vault.listingsThisCycle(), 2, "every authorisation spends a slot");
     }
 
-    /// @dev T-07. The cap exists so a compromised or panicking keeper cannot ratchet the price
-    ///      down all week: three descending price levels per cycle, cancelled or not. CHANGED
-    ///      BEHAVIOUR: slots used to count every authorisation; they now count price cuts (the
-    ///      first listing, then each strictly lower unit price), so this walks the price DOWN.
-    function test_threePriceCutsPerCycleThenNoMore() public {
+    /// @dev Under write on fill a listing is a standing offer sized to capacity and Seaport tracks
+    ///      the fraction filled, so nothing is ever relisted for size: a relist is a REPRICE, and
+    ///      three a week is the ceiling on how far a keeper can walk the quote before the guardian
+    ///      must step in. Every authorisation spends a slot, cancelled or not, up or down.
+    function test_threeListingsPerCycleThenNoMore() public {
         (uint256 optionId,) = _openAndBuild();
         uint256 p = _okUnitPrice();
         OrderComponents memory a = _buildOrder(optionId, N, p + 300_000);
-        OrderComponents memory b = _buildOrder(optionId, N, p + 200_000);
+        OrderComponents memory b = _buildOrder(optionId, N, p + 500_000); // a reprice UP spends one too
         OrderComponents memory c3 = _buildOrder(optionId, N, p + 100_000);
         OrderComponents memory d = _buildOrder(optionId, N, p);
 
@@ -661,69 +487,16 @@ contract VaultListingTest is BaseTest {
         vm.stopPrank();
 
         assertEq(vault.listingsThisCycle(), 3, "budget spent");
-        assertEq(vault.lowestListedUnitUsdg(), p + 100_000, "the third cut is the lowest price authorised");
         assertEq(vault.listingHash(), bytes32(0), "nothing live, so this is the cap and not the live-listing guard");
 
         _rejects(d, abi.encodeWithSelector(AdapterSeaport.TooManyListings.selector, uint8(3), uint8(3)));
     }
 
-    /// @dev F5(a). With the budget spent, a relist AT the lowest price or above it is still free,
-    ///      any number of times, including a bigger tranche after `writeMore`. Only a fourth cut
-    ///      is refused.
-    function test_relistAtOrAboveTheLowestPriceIsFreeEvenWithTheBudgetSpent() public {
-        (uint256 optionId,) = _openAndBuild();
-        uint256 p = _okUnitPrice();
-        for (uint256 i; i < 3; i++) {
-            OrderComponents memory cut = _approveListing(optionId, N, p - i * 100_000);
-            vm.prank(keeper);
-            vault.cancelListing(cut);
-        }
-        assertEq(vault.listingsThisCycle(), 3, "three cuts spent the budget");
-
-        // Same price as the lowest: free.
-        OrderComponents memory same = _approveListing(optionId, N, p - 200_000);
-        vm.prank(keeper);
-        vault.cancelListing(same);
-        // Up: free, and again, and a different size.
-        OrderComponents memory up = _approveListing(optionId, N, p + 500_000);
-        vm.prank(keeper);
-        vault.cancelListing(up);
-        _writeMore(5);
-        _approveListing(optionId, N + 5, p + 500_000);
-        assertEq(vault.listingsThisCycle(), 3, "no relist at or above the lowest spent a slot");
-        assertEq(vault.lowestListedUnitUsdg(), p - 200_000, "and none of them moved the lowest");
-
-        vm.prank(keeper);
-        vault.invalidateAllListings();
-
-        OrderComponents memory fourthCut = _buildOrder(optionId, N, p - 300_000);
-        _rejects(fourthCut, abi.encodeWithSelector(AdapterSeaport.TooManyListings.selector, uint8(3), uint8(3)));
-    }
-
-    /// @dev Review round 2 PoC, pinned for the off-chain keeper. Three authorisations at ONE price,
-    ///      each cancelled, spend one slot; a fourth at that price succeeds and the counter still
-    ///      reads 1. The keeper used to take `seq` from `listingsThisCycle + 1` and to expect
-    ///      TooManyListings(3,3) here (callhouse keeper/src/dryrun-extended.ts); it now keeps its
-    ///      own sequence and mirrors the price-cut rule (keeper/src/policy.ts listingSlotRefused).
-    function test_relistsAtOnePriceSpendOneSlot() public {
-        (uint256 optionId,) = _openAndBuild();
-        uint256 p = _okUnitPrice();
-        for (uint256 i; i < 3; i++) {
-            OrderComponents memory c = _approveListing(optionId, N, p);
-            vm.prank(guardian);
-            vault.cancelListing(c);
-        }
-        assertEq(vault.listingsThisCycle(), 1, "three authorisations at one price spend ONE slot");
-        _approveListing(optionId, N, p);
-        assertEq(vault.listingsThisCycle(), 1, "and a fourth at that price is free");
-        assertEq(vault.lowestListedUnitUsdg(), p, "the lowest price is the one price listed");
-    }
-
-    /// @dev The budget is per cycle. A new write reopens it, or the vault would be unlistable
-    ///      forever after three relists in one busy week.
+    /// @dev The budget is per cycle. A new arm reopens it, or the vault would be unlistable
+    ///      forever after three reprices in one busy week.
     function test_listingBudgetResetsOnTheNextRollOpen() public {
         _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
+        uint256 optionId = _rollOpen();
         OrderComponents memory a = _approveListing(optionId, N, _okUnitPrice());
         vm.prank(keeper);
         vault.cancelListing(a);
@@ -735,121 +508,10 @@ contract VaultListingTest is BaseTest {
         vault.lockBook();
         _warpToExpiry();
         _rollClose();
+        _nextWeek();
 
-        exerciseTs = uint40(block.timestamp + 6 days);
-        expiryTs = uint40(block.timestamp + 7 days);
-        _installCycle();
-        feed.setAnswer(SPOT_FEED); // refresh updatedAt; a week has passed
-
-        _rollOpen(N);
+        _rollOpen();
         assertEq(vault.listingsThisCycle(), 0, "fresh budget for the new cycle");
-        assertEq(vault.lowestListedUnitUsdg(), 0, "and no lowest price carried over from last week");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    F5(b): PERMISSIONLESS STALE-LISTING KILL
-    //////////////////////////////////////////////////////////////*/
-
-    /// @dev List the N contracts at `unitPrice` and hand back the stranger who will try to kill it.
-    function _listForStaleTest(uint256 unitPrice) internal returns (address stranger) {
-        _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
-        _approveListing(optionId, N, unitPrice);
-        stranger = makeAddr("stranger");
-    }
-
-    function _assertKilledBy(address who) internal {
-        uint256 counterBefore = seaport.getCounter(address(vault));
-        vm.prank(who);
-        vault.invalidateStaleListing();
-        assertEq(vault.listingHash(), bytes32(0), "the stale listing is dead");
-        assertEq(seaport.getCounter(address(vault)), counterBefore + 1, "by a Seaport counter bump");
-    }
-
-    /// @dev A rally to $225 lifts the band floor to 231.75, above the 231 strike written at $220.
-    function test_invalidateStaleListing_afterARallyPastTheBandFloor() public {
-        address stranger = _listForStaleTest(_okUnitPrice());
-        feed.setAnswer(225_00000000);
-        _assertKilledBy(stranger);
-    }
-
-    /// @dev Listed exactly on the $220 floor (8_800_000 for ten). At $221 the floor is 8_840_000
-    ///      and the band floor 227.63 still admits the 231 strike, so only the premium is stale.
-    function test_invalidateStaleListing_whenTheFloorRisesAboveTheListingGross() public {
-        address stranger = _listForStaleTest(880_000);
-        feed.setAnswer(221_00000000);
-        _assertKilledBy(stranger);
-    }
-
-    /// @dev A paused Stock Token oracle means a fresh approval would revert, so the listing counts
-    ///      as stale even though its price is still fine.
-    function test_invalidateStaleListing_whileTheOracleIsPaused() public {
-        address stranger = _listForStaleTest(_okUnitPrice());
-        nvda.setOraclePaused(true);
-        _assertKilledBy(stranger);
-    }
-
-    /// @dev Nobody may kill a listing the policy would still authorise, which is what keeps this
-    ///      from being a griefing lever. $224 moves the floor to 8_960_000 and the band floor to
-    ///      230.72: a $2.00 listing of a 231 strike is still valid. A dead feed proves nothing.
-    function test_invalidateStaleListing_revertsWhileStillValidOrWithoutAPrice() public {
-        address stranger = _listForStaleTest(_okUnitPrice());
-        feed.setAnswer(224_00000000);
-
-        vm.prank(stranger);
-        vm.expectRevert(Vault.ListingStillValid.selector);
-        vault.invalidateStaleListing();
-
-        vm.warp(block.timestamp + MAX_PRICE_AGE + 1);
-        vm.prank(stranger);
-        vm.expectRevert();
-        vault.invalidateStaleListing();
-        assertTrue(vault.listingHash() != bytes32(0), "the listing survives both");
-    }
-
-    /// @dev Regression (review round 1): approveListing used to check only the premium floor, so
-    ///      after a rally to $225 (band floor 231.75 > the 231 strike) it still accepted a $2.00
-    ///      listing that any stranger could kill in the same block, round after round, keeping the
-    ///      written inventory unsold but assignable. The keeper now cannot list it at all.
-    function test_approveListing_refusesAStrikeBelowTheLiveBandFloor() public {
-        _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
-        feed.setAnswer(225_00000000);
-        _rejects(
-            _buildOrder(optionId, N, _okUnitPrice()),
-            abi.encodeWithSelector(Policy.StrikeBelowBand.selector, uint256(231_000_000), uint256(231_750_000))
-        );
-        assertEq(vault.listingHash(), bytes32(0), "nothing listed for a griefer to kill");
-        assertEq(vault.listingsThisCycle(), 0);
-    }
-
-    /// @dev The two paths read one set of floors, so at any spot where approveListing accepts a
-    ///      listing, invalidateStaleListing refuses to kill it. $224.27 is the last cent at which
-    ///      the band floor (230.9981) still admits the 231 strike.
-    function test_invalidateStaleListing_cannotKillWhatApproveListingJustAccepted() public {
-        _deposit(alice, 30e18);
-        uint256 optionId = _rollOpen(N);
-        address stranger = makeAddr("stranger");
-        int256[3] memory spots = [int256(220_00000000), 223_00000000, 224_27000000];
-        for (uint256 i; i < spots.length; i++) {
-            feed.setAnswer(spots[i]);
-            OrderComponents memory c = _approveListing(optionId, N, _okUnitPrice());
-            vm.prank(stranger);
-            vm.expectRevert(Vault.ListingStillValid.selector);
-            vault.invalidateStaleListing();
-            assertTrue(vault.listingHash() != bytes32(0), "the accepted listing survives");
-            vm.prank(keeper);
-            vault.cancelListing(c); // the keeper's own reprice, to relist at the next spot
-        }
-        assertEq(vault.listingsThisCycle(), 1, "same-price relists stay free");
-    }
-
-    function test_invalidateStaleListing_revertsWithNoLiveListing() public {
-        _deposit(alice, 30e18);
-        _rollOpen(N);
-        feed.setAnswer(225_00000000);
-        vm.expectRevert(AdapterSeaport.NoLiveListing.selector);
-        vault.invalidateStaleListing();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -932,12 +594,11 @@ contract VaultListingTest is BaseTest {
 
     /// @dev The guardian's tool of last resort: it needs no order data, so it still works when
     ///      the keeper is gone and nobody can reconstruct the components. Bumping the counter
-    ///      re-keys every order this vault ever signed, so the old one can never come back.
+    ///      re-keys every order this vault ever validated, so the old one can never come back.
     function test_invalidateAllListings_bumpsTheCounterAndStrandsTheOldOrder() public {
         (, OrderComponents memory c) = _openAndBuild();
         vm.prank(keeper);
         vault.approveListing(c);
-        bytes32 live = vault.listingHash();
         assertEq(seaport.getCounter(address(vault)), 0, "counter starts at zero");
 
         vm.expectEmit(true, true, true, true, address(vault));
@@ -949,7 +610,6 @@ contract VaultListingTest is BaseTest {
         assertEq(vault.listingHash(), bytes32(0), "live hash cleared");
         assertEq(vault.listingGrossUsdg(), 0, "gross cleared");
         assertEq(vault.listingAmount(), 0, "amount cleared");
-        assertEq(_sig(live), bytes32(EIP1271_INVALID), "the vault no longer vouches for the old hash");
 
         // The old order is now permanently unapprovable: its counter can never be current again.
         _rejects(c, abi.encodeWithSelector(SeaportOrderLib.BadCounter.selector, 1, 0));
@@ -985,83 +645,16 @@ contract VaultListingTest is BaseTest {
     }
 
     /*//////////////////////////////////////////////////////////////
-                                EIP-1271
+                             NO SIGNATURES
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Seaport may ask the offerer to sign either the raw order hash or its EIP-712
-    ///      digest, depending on the fill path. Answering only one of the two would make the
-    ///      listing unfillable through Overcall's UI, which is an unfilled week.
-    function test_eip1271_answersForTheLiveHashAndItsEip712Digest() public {
-        (, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-        bytes32 live = vault.listingHash();
-
-        (, bytes32 domainSeparator,) = seaport.information();
-        bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSeparator, live));
-
-        assertEq(_sig(live), bytes32(EIP1271_MAGIC), "raw order hash is signed");
-        assertEq(_sig(digest), bytes32(EIP1271_MAGIC), "EIP-712 digest form is signed");
-        assertEq(_sig(keccak256("some other order")), bytes32(EIP1271_INVALID), "unrelated hash is refused");
-    }
-
-    function testFuzz_eip1271_refusesEveryUnrelatedHash(bytes32 h) public {
-        (, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-        bytes32 live = vault.listingHash();
-        (, bytes32 domainSeparator,) = seaport.information();
-        bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSeparator, live));
-
-        vm.assume(h != live && h != digest);
-        assertEq(_sig(h), bytes32(EIP1271_INVALID), "authorisation is one hash, not a key");
-    }
-
-    /// @dev With nothing live the vault must be a dead signer. Answering for anything here is
-    ///      how a stale or forged order gets filled against the inventory.
-    ///
-    ///      THIS DELIBERATELY DOES NOT STOP AT THE VIRGIN VAULT. On a vault that never listed,
-    ///      `listingHash` is zero and the early return makes the assertion trivially true for
-    ///      every input; the fuzzer proves nothing. The state that matters is AFTER a real
-    ///      listing has been cancelled, because then the stale hash and its EIP-712 digest are
-    ///      live values sitting inside the fuzzer's domain, and they are exactly the two hashes
-    ///      a stale-order replay would present.
-    function testFuzz_eip1271_refusesEverythingWithNoLiveListing(bytes32 h) public {
-        assertEq(_sig(h), bytes32(EIP1271_INVALID), "a vault that never listed signs nothing");
-
-        (, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-        bytes32 live = vault.listingHash();
-        (, bytes32 domainSeparator,) = seaport.information();
-        bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSeparator, live));
-        // Guard against the assertion below holding for an uninteresting reason.
-        assertEq(_sig(live), bytes32(EIP1271_MAGIC), "signed while genuinely live");
-        assertEq(_sig(digest), bytes32(EIP1271_MAGIC), "digest form signed while genuinely live");
-
-        vm.prank(keeper);
-        vault.cancelListing(c);
-
-        assertEq(_sig(h), bytes32(EIP1271_INVALID), "no live listing means no signature, ever");
-        assertEq(_sig(live), bytes32(EIP1271_INVALID), "not even for the hash it signed a moment ago");
-        assertEq(_sig(digest), bytes32(EIP1271_INVALID), "nor its EIP-712 digest");
-    }
-
-    function test_eip1271_goesDeadAfterCancel() public {
-        (, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-        bytes32 live = vault.listingHash();
-        (, bytes32 domainSeparator,) = seaport.information();
-        bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSeparator, live));
-        assertEq(_sig(live), bytes32(EIP1271_MAGIC), "live while listed");
-
-        vm.prank(keeper);
-        vault.cancelListing(c);
-
-        assertEq(_sig(live), bytes32(EIP1271_INVALID), "refused after cancel");
-        assertEq(_sig(digest), bytes32(EIP1271_INVALID), "digest form refused after cancel");
-        assertEq(_sig(bytes32(0)), bytes32(EIP1271_INVALID), "the empty hash is never signed");
+    /// @dev The vault signs nothing. Pre-validation on Seaport is what lets an empty signature fill,
+    ///      and it is the only authorisation path; an EIP-1271 hook would be a second one answering
+    ///      for digests the vault never checked. It is neither advertised nor present.
+    function test_noEip1271_theVaultIsNotASigner() public {
+        assertFalse(vault.supportsInterface(0x1626ba7e), "EIP-1271 interface id is not advertised");
+        (bool ok,) = address(vault).call(abi.encodeWithSelector(0x1626ba7e, bytes32(0), ""));
+        assertFalse(ok, "isValidSignature does not exist on the vault");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1098,7 +691,7 @@ contract VaultListingTest is BaseTest {
 
     function test_approveListing_requiresTheListedPhase() public {
         _deposit(alice, 30e18);
-        // Idle: nothing has been written yet, so there is nothing to list.
+        // Idle: nothing has been armed yet, so there is nothing to list.
         OrderComponents memory c = _buildOrder(optionIds[RUNG_PICK], N, _okUnitPrice());
         bytes memory err = abi.encodeWithSelector(Vault.WrongPhase.selector, Vault.Phase.Listed, Vault.Phase.Idle);
         vm.prank(keeper);
@@ -1158,15 +751,14 @@ contract VaultListingTest is BaseTest {
     ///      NOTE ON WHAT IS ASSERTED: the kill is the Seaport counter bump. Real Seaport
     ///      derives an order's hash from the offerer's CURRENT counter at fulfilment, so a
     ///      bumped counter re-keys every outstanding order and the old one reads as
-    ///      unvalidated and unsigned. MockSeaport stores `validated` under the hash the caller
-    ///      supplies and so does not model that re-keying, which is why this asserts the
-    ///      on-chain facts the vault actually controls: the counter moved, the recorded hash
-    ///      is gone, and EIP-1271 refuses the old hash.
+    ///      unvalidated. MockSeaport stores `validated` under the hash the caller supplies and
+    ///      so does not model that re-keying, which is why this asserts the on-chain facts the
+    ///      vault actually controls: the counter moved and the recorded hash is gone. The fill
+    ///      hook independently refuses a fill outside Listed (VaultWriteOnFill.t.sol).
     function test_lockBook_killsAStillLiveListing() public {
         (, OrderComponents memory c) = _openAndBuild();
         vm.prank(keeper);
         vault.approveListing(c);
-        bytes32 live = vault.listingHash();
 
         _warpToExercise();
         vault.lockBook(); // permissionless
@@ -1174,7 +766,6 @@ contract VaultListingTest is BaseTest {
         assertEq(_phase(), 2, "Exercisable");
         assertEq(vault.listingHash(), bytes32(0), "no listing survives the book close");
         assertEq(seaport.getCounter(address(vault)), 1, "counter bumped, every outstanding order re-keyed");
-        assertEq(_sig(live), bytes32(EIP1271_INVALID), "the vault will not sign the old order again");
 
         // And no replacement can be authorised once the book is closed.
         bytes memory err =
@@ -1206,14 +797,11 @@ contract VaultListingTest is BaseTest {
     }
 
     /// @dev Nobody called `lockBook` all week, so the vault reaches expiry still in Listed with
-    ///      a live order on the book. `rollClose` has to kill it on the way past: the option
-    ///      tokens are about to be redeemed back into collateral, and an order still fillable
-    ///      against inventory the vault no longer has is the naked-call hazard at its worst.
+    ///      a live order on the book. `rollClose` has to kill it on the way past.
     function test_rollClose_killsAListingLeftLiveThroughExpiry() public {
         (, OrderComponents memory c) = _openAndBuild();
         vm.prank(keeper);
         vault.approveListing(c);
-        bytes32 live = vault.listingHash();
 
         _warpToExpiry();
         assertEq(_phase(), 1, "still Listed: lockBook was never called");
@@ -1222,19 +810,14 @@ contract VaultListingTest is BaseTest {
         assertEq(_phase(), 0, "Idle");
         assertEq(vault.listingHash(), bytes32(0), "no listing survives the close");
         assertEq(seaport.getCounter(address(vault)), 1, "counter bumped, every outstanding order re-keyed");
-        assertEq(_sig(live), bytes32(EIP1271_INVALID), "the vault will not sign the old order again");
     }
 
     /*//////////////////////////////////////////////////////////////
                         THE ORACLE GATE ON A LISTING
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev `approveListing` is the second place in the contract that reads spot, because the
-    ///      economic floor it enforces is a percentage OF spot. A broken feed therefore has to
-    ///      stop a listing and not merely a write: with a stale or absent price the floor is
-    ///      computed against a number nobody stands behind, and the keeper could authorise a
-    ///      sale of the whole inventory at a premium derived from last week's market.
-    ///      The shape of the order is impeccable in both of these; only the price source is bad.
+    /// @dev `approveListing` reads spot because the economic floor it enforces is a percentage OF
+    ///      spot. A broken feed therefore has to stop a listing and not merely an arm.
     function test_approveListing_refusesAStaleSpotPrice() public {
         (, OrderComponents memory c) = _openAndBuild();
 
@@ -1258,9 +841,8 @@ contract VaultListingTest is BaseTest {
     }
 
     /// @dev The issuer can halt the Stock Token's own oracle. While it is halted the vault must
-    ///      not sell anything either, and - just as important - the guardian must still be able
-    ///      to PULL what is already on the book. An oracle halt that also froze the unwind path
-    ///      would leave a live order sitting on Seaport with nobody able to retract it.
+    ///      not list anything either, and the guardian must still be able to PULL what is
+    ///      already on the book.
     function test_pausedStockOracleBlocksListingButNotTheUnwind() public {
         (, OrderComponents memory c) = _openAndBuild();
         vm.prank(keeper);
@@ -1289,33 +871,30 @@ contract VaultListingTest is BaseTest {
         vault.cancelListing(c);
         assertEq(vault.listingHash(), bytes32(0), "cancel does not consult the oracle");
 
-        nvda.setOraclePaused(true);
         vm.prank(guardian);
         vault.invalidateAllListings();
         assertEq(seaport.getCounter(address(vault)), 1, "nor does invalidateAllListings");
     }
 
     /*//////////////////////////////////////////////////////////////
-                          INVENTORY EXHAUSTED
+                          CAPACITY EXHAUSTED
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Once the whole order has filled the vault holds no option tokens at all, so there
-    ///      is nothing left to list. The guard has to hold at zero as well as at a shortfall:
-    ///      a listing authorised here would be naked from the moment it was filled.
-    function test_reject_anyListingOnceInventoryIsFullySold() public {
-        (uint256 optionId, OrderComponents memory c) = _openAndBuild();
-        vm.prank(keeper);
-        vault.approveListing(c);
-        _fill(c, N);
-        assertEq(clear.balanceOf(address(vault), optionId), 0, "the vault sold every contract");
+    /// @dev Once the fills have written the whole capacity there is nothing left to list. The
+    ///      guard has to hold at zero as well as at a shortfall.
+    function test_reject_anyListingOnceCapacityIsWritten() public {
+        _deposit(alice, 30e18);
+        uint256 optionId = _rollOpen();
+        OrderComponents memory c = _approveListing(optionId, 28, _okUnitPrice());
+        _fund(buyer, 0, 100_000_000);
+        _fill(c, 28);
+        assertEq(vault.contractsWritten(), 28, "the vault wrote and sold its whole capacity");
 
-        // The order is spent but still recorded, so it has to be cancelled before anything
-        // else can be proposed at all.
         vm.prank(keeper);
         vault.cancelListing(c);
 
         OrderComponents memory oneMore = _buildOrder(optionId, 1, _okUnitPrice() + 100_000);
-        _rejects(oneMore, abi.encodeWithSelector(SeaportOrderLib.OfferExceedsInventory.selector, 1, 0));
+        _rejects(oneMore, abi.encodeWithSelector(SeaportOrderLib.OfferExceedsCapacity.selector, 1, 0));
         assertEq(vault.listingsThisCycle(), 1, "the refused proposal burned no slot");
     }
 }

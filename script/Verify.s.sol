@@ -6,7 +6,10 @@ import {Vault} from "../src/Vault.sol";
 import {Policy, PolicyParams} from "../src/Policy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IERC1155Minimal} from "../src/interfaces/IERC1155Minimal.sol";
+import {IValoremClear} from "../src/interfaces/IValoremClear.sol";
+import {ISeaport, IZone} from "../src/interfaces/ISeaport.sol";
 
 interface ISafeView {
     function getOwners() external view returns (address[] memory);
@@ -31,8 +34,13 @@ interface ISafeView {
 ///           checked separately through its getter), and a library's own deploy-address word
 ///           (checked to equal that library's address). A match proves the logic and every
 ///           compiled-in hard cap are this commit's — nothing a getter can show covers that.
-///        3. Every immutable through its getter, including the Seaport fee recipient, conduit key,
-///           zone and the ERC-1155 transfer-approval target, plus the approval itself on Valorem.
+///        3. Every immutable through its getter, the conduit key, the zone (which must be the vault
+///           itself: write on fill), the ERC-1155 transfer-approval target, the approval itself on
+///           Valorem, and the interfaces advertised (the 1.6 zone interface, no EIP-1271). Then the
+///           dependencies the zone hooks rest on: `seaport.information()` reports version 1.6 and the
+///           canonical ConduitController, the Seaport runtime extcodehash equals the vendored 4663
+///           runtime, Clear's `feeBps` is 15 with the switch off (or accepted), and both tokens have
+///           the decimals {Policy} assumes.
 ///        4. Policy, field by field, against `Policy.launchDefaults()`; deposit cap; price age;
 ///           fee recipient; share token name, symbol and decimals.
 ///        5. Roles, for the admin phase in ADMIN_PHASE:
@@ -53,8 +61,8 @@ interface ISafeView {
 ///        EXPECT_KEEPER_CONFIGURED  default true.  EXPECT_FRESH  default true.
 ///        EXPECT_SAFE_THRESHOLD     default 2.     EXPECT_SAFE_OWNERS default 3.
 ///        EXPECT_SAFE_OWNER_SET     optional comma-separated owner addresses, order free.
-///        Address overrides as in Deploy.s.sol: ASSET, USDG, CLEARINGHOUSE, SEAPORT, REGISTRY,
-///        PRICE_FEED, OVERCALL_FEE_RECIPIENT, DEPOSIT_CAP, VAULT_NAME, VAULT_SYMBOL, EXPECT_CHAIN_ID.
+///        Address overrides as in Deploy.s.sol: ASSET, USDG, CLEARINGHOUSE, SEAPORT, PRICE_FEED,
+///        DEPOSIT_CAP, VAULT_NAME, VAULT_SYMBOL, EXPECT_CHAIN_ID, EXPECT_SEAPORT_CODEHASH.
 contract VerifyVault is Script {
     /// @dev Safe storage: slot 0 is the singleton; guard and fallback handler live at these hashed slots.
     bytes32 internal constant SAFE_GUARD_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
@@ -66,6 +74,13 @@ contract VerifyVault is Script {
     address internal constant SAFE_141 = 0x41675C099F32341bf84BFc5382aF534df5C7461a;
     address internal constant SAFE_L2_130 = 0x3E5c63644E683549055b9Be8653de26E0B4CD36E;
     address internal constant FALLBACK_141 = 0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99;
+
+    /// @dev keccak256 of the Seaport 1.6 runtime on chain 4663 (23,981 B; differs from Ethereum's only in
+    ///      the immutable chainId and domain separator). Same constant as test/helpers/RealSeaportBase.sol,
+    ///      which asserts it against the vendored fixture. Override with EXPECT_SEAPORT_CODEHASH on a chain
+    ///      whose Seaport was compiled for another chain id.
+    bytes32 internal constant SEAPORT_16_RUNTIME_HASH =
+        0x95809b70c9659c30188db5fdd87103e24b1a55379af8c851fca393aba0224a00;
 
     struct Ref {
         uint256 length;
@@ -272,25 +287,42 @@ contract VerifyVault is Script {
         _check(address(vault.clear()) == clear, "clearinghouse");
         _check(address(vault.seaport()) == seaport, "seaport");
         _check(
-            address(vault.registry()) == vm.envOr("REGISTRY", 0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA),
-            "registry is the NVDA market, not JUGGERNAUT"
-        );
-        _check(
             address(vault.priceFeed()) == vm.envOr("PRICE_FEED", 0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15),
             "price feed"
         );
-        _check(
-            vault.overcallFeeRecipient()
-                == vm.envOr("OVERCALL_FEE_RECIPIENT", 0xdAe7e82A2E7D566C67E87C164B05a1C560190782),
-            "Overcall fee recipient"
-        );
-        _check(vault.conduitKey() == bytes32(0), "conduit key is zero (Overcall lists with no conduit)");
-        _check(vault.seaportZone() == address(0), "Seaport zone is zero");
+        _check(vault.conduitKey() == bytes32(0), "conduit key is zero (Seaport pulls the ERC-1155 directly)");
+        // Write on fill: the vault is its own Seaport zone, so `authorizeOrder` writes on every fill.
+        _check(vault.seaportZone() == address(vault), "Seaport zone is the vault itself");
         _check(vault.transferApprovalTarget() == seaport, "ERC-1155 transfer approval target is Seaport");
         _check(
             IERC1155Minimal(clear).isApprovedForAll(address(vault), seaport),
             "Valorem ERC-1155 approval for Seaport is set"
         );
+        _check(vault.supportsInterface(type(IZone).interfaceId), "advertises the Seaport 1.6 zone interface");
+        _check(!vault.supportsInterface(0x1626ba7e), "does not advertise EIP-1271 (the vault signs nothing)");
+
+        // The dependencies the zone hooks are built against. `authorizeOrder` running before any
+        // transfer and before the status update on every fulfilment path is a Seaport 1.6 fact
+        // (integrations/seaport.md §4.4), so the runtime is pinned, not just the address.
+        console2.log("dependencies");
+        (string memory version,, address controller) = ISeaport(seaport).information();
+        _check(keccak256(bytes(version)) == keccak256("1.6"), "seaport.information().version == 1.6");
+        _check(
+            controller == 0x00000000F9490004C11Cef243f5400493c00Ad63,
+            "seaport conduit controller is the canonical 0x00000000F9490004C11Cef243f5400493c00Ad63"
+        );
+        bytes32 seaportHash = seaport.codehash;
+        console2.log("  info  seaport extcodehash", vm.toString(seaportHash));
+        _check(
+            seaportHash == vm.envOr("EXPECT_SEAPORT_CODEHASH", SEAPORT_16_RUNTIME_HASH),
+            "seaport runtime extcodehash matches the 4663 Seaport 1.6 runtime (test/fixtures/seaport)"
+        );
+        IValoremClear c = IValoremClear(clear);
+        _check(c.feeBps() == 15, "clear feeBps == 15");
+        _check(!c.feesEnabled() || vault.valoremFeeAccepted(), "clear fee switch off, or accepted by governance");
+        _check(c.supportsInterface(0xd9b67a26), "clear is ERC-1155");
+        _check(IERC20Metadata(address(vault.asset())).decimals() == 18, "asset has 18 decimals");
+        _check(IERC20Metadata(address(vault.usdg())).decimals() == 6, "usdg has 6 decimals");
     }
 
     function _parameters(Vault vault) internal {

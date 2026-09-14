@@ -5,7 +5,7 @@ import {BaseTest} from "../Base.t.sol";
 import {Vault} from "../../src/Vault.sol";
 import {Policy, PolicyParams} from "../../src/Policy.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
-import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
+import {IZone, OrderComponents} from "../../src/interfaces/ISeaport.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 /// @notice Roles, the halt, the policy hard caps, and the two Stock Token hazards the vault
@@ -41,15 +41,12 @@ contract VaultAdminTest is BaseTest {
         return abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, who, role);
     }
 
-    /// @dev Roll the fixture forward to a fresh Overcall cycle starting from now.
+    /// @dev Roll the fixture forward to a fresh week starting from now.
     /// @dev The feed is re-published as part of the roll. A week has passed since the fixture
-    ///      deployed it, and the vault's staleness gate (6 hours here) would refuse the write
+    ///      deployed it, and the vault's staleness gate (6 hours here) would refuse the arm
     ///      against a frozen `updatedAt` — a real feed keeps ticking, so the mock has to too.
     function _nextCycle() internal {
-        feed.setAnswer(SPOT_FEED);
-        exerciseTs = uint40(block.timestamp + 6 days);
-        expiryTs = uint40(block.timestamp + 7 days);
-        _installCycle();
+        _nextWeek();
     }
 
     function _assertPolicyIs(PolicyParams memory want, string memory what) internal view {
@@ -94,16 +91,16 @@ contract VaultAdminTest is BaseTest {
 
         vm.prank(stranger);
         vm.expectRevert(_unauthorized(stranger, keeperRole));
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
 
         vm.prank(guardian);
         vm.expectRevert(_unauthorized(guardian, keeperRole));
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
 
         // Governance holding the keeper key would defeat the split entirely.
         vm.prank(admin);
         vm.expectRevert(_unauthorized(admin, keeperRole));
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
     }
 
     function test_approveListing_rejectsEveryoneButKeeper() public {
@@ -208,7 +205,7 @@ contract VaultAdminTest is BaseTest {
         uint256 optionId = optionIds[RUNG_PICK];
         vm.prank(keeper);
         vm.expectRevert(Vault.WritesAreHalted.selector);
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
 
         bytes32 adminRole = vault.DEFAULT_ADMIN_ROLE();
         vm.prank(guardian);
@@ -221,8 +218,8 @@ contract VaultAdminTest is BaseTest {
         assertFalse(vault.writesHalted());
 
         vm.prank(keeper);
-        vault.rollOpen(optionId, 5);
-        assertEq(_phase(), 1, "writing resumed after the admin lifted the halt");
+        vault.rollOpen(optionId);
+        assertEq(_phase(), 1, "arming resumed after the admin lifted the halt");
     }
 
     /// @dev THE ONE THAT MATTERS. A halt is an emergency brake on new risk, not a freeze on
@@ -232,9 +229,9 @@ contract VaultAdminTest is BaseTest {
         _deposit(alice, 20e18);
         _deposit(bob, 10e18);
 
-        uint256 optionId = _rollOpen(10);
+        uint256 optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 6); // 6 of 10 contracts sell: vault takes 6 * $1.90 = 11.40 USDG
+        _fill(c, 6); // 6 of 10 contracts sell: vault writes 6 and takes 6 * $1.90 = 11.40 USDG
         assertEq(usdg.balanceOf(address(vault)), 11_400_000, "premium in");
 
         vm.prank(guardian);
@@ -261,6 +258,21 @@ contract VaultAdminTest is BaseTest {
         vm.expectRevert(Vault.WritesAreHalted.selector);
         vault.approveListing(relist);
 
+        // --- and neither does a fill of a listing that was live when the brake was pulled ----
+        vm.prank(admin);
+        vault.unhaltWrites();
+        OrderComponents memory again = _approveListing(optionId, 4, _okUnitPrice());
+        vm.prank(guardian);
+        vault.haltWrites();
+        vm.startPrank(buyer);
+        usdg.approve(address(seaport), type(uint256).max);
+        vm.expectRevert(Vault.WritesAreHalted.selector);
+        mockSeaport.fulfil(again, 1);
+        vm.stopPrank();
+        assertEq(vault.contractsWritten(), 6, "the halt stopped the fill before anything was written");
+        vm.prank(guardian);
+        vault.cancelListing(again);
+
         // --- the permissionless book close keeps working --------------------------------
         _warpToExercise();
         vm.prank(stranger);
@@ -279,9 +291,7 @@ contract VaultAdminTest is BaseTest {
         // `deposit` folds the accrual into `accUsdgPerShare` before minting, so Carol's shares
         // start from the fixed index and earn nothing from a week they did not back.
         //
-        //   gross premium       = $2.00 x 6 filled contracts             = 12_000_000
-        //   Overcall's 5%       = floor(2_000_000 * 500 / 10_000) * 6    =    600_000
-        //   into the vault      = 12_000_000 - 600_000                   = 11_400_000
+        //   into the vault      = $1.90 x 6 filled contracts             = 11_400_000
         //   protocol fee 5%     = 11_400_000 * 500 / 10_000              =    570_000
         //     (all premium, no assignment; accrued into `pendingFeeUsdg` by the checkpoint,
         //      swept at rollClose)
@@ -343,11 +353,11 @@ contract VaultAdminTest is BaseTest {
         assertEq(carolBurned, 10e18, "withdraw under halt");
         assertEq(nvda.balanceOf(carol), 30e18, "carol whole again");
 
-        // --- the only thing still blocked is a new write ----------------------------------
+        // --- the only thing still blocked is a new arm --------------------------------------
         uint256 nextOption = optionIds[RUNG_PICK];
         vm.prank(keeper);
         vm.expectRevert(Vault.WritesAreHalted.selector);
-        vault.rollOpen(nextOption, 1);
+        vault.rollOpen(nextOption);
 
         assertEq(vault.totalSupply(), 0, "every depositor got out of a halted vault");
     }
@@ -440,11 +450,11 @@ contract VaultAdminTest is BaseTest {
         uint256 pick = optionIds[RUNG_PICK]; // 231.00, inside the launch band at $220 spot
         uint256 mid = optionIds[RUNG_MID]; // 236.00
 
-        // Baseline: under the launch policy this rung writes.
+        // Baseline: under the launch policy this rung arms.
         uint256 snap = vm.snapshotState();
         vm.prank(keeper);
-        vault.rollOpen(pick, 5);
-        assertEq(vault.cycleStrikeUsdg(), 231_000_000, "231 is writable under the launch band");
+        vault.rollOpen(pick);
+        assertEq(vault.cycleStrikeUsdg(), 231_000_000, "231 is armable under the launch band");
         vm.revertToState(snap);
         assertEq(_phase(), 0, "back to a clean Idle vault");
 
@@ -457,11 +467,11 @@ contract VaultAdminTest is BaseTest {
         vm.expectRevert(
             abi.encodeWithSelector(Policy.StrikeBelowBand.selector, uint256(231_000_000), uint256(233_200_000))
         );
-        vault.rollOpen(pick, 5);
+        vault.rollOpen(pick);
 
-        // And the next rung up, which clears the new floor, still writes.
+        // And the next rung up, which clears the new floor, still arms.
         vm.prank(keeper);
-        vault.rollOpen(mid, 5);
+        vault.rollOpen(mid);
         assertEq(vault.cycleStrikeUsdg(), 236_000_000, "236 clears the tightened floor");
         assertEq(_phase(), 1);
     }
@@ -512,15 +522,18 @@ contract VaultAdminTest is BaseTest {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(Vault.StalePrice.selector, publishedAt, uint256(MAX_PRICE_AGE)));
-        vault.rollOpen(id, 5);
+        vault.rollOpen(id);
 
-        // Widen the window to a weekend's worth and the very same price is now acceptable.
+        // Widen the window to a weekend's worth and the very same price is now acceptable, at the
+        // arm and at the fill alike.
         vm.prank(admin);
         vault.setMaxPriceAge(3 days);
         vm.prank(keeper);
-        vault.rollOpen(id, 5);
-        assertEq(_phase(), 1, "the widened window let the identical write through");
-        assertEq(vault.contractsWritten(), 5, "and it really wrote, it did not just change phase");
+        vault.rollOpen(id);
+        assertEq(_phase(), 1, "the widened window let the identical arm through");
+        OrderComponents memory c = _approveListing(id, 5, _okUnitPrice());
+        _fill(c, 5);
+        assertEq(vault.contractsWritten(), 5, "and the fill wrote against the same 8-hour-old price");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -538,9 +551,7 @@ contract VaultAdminTest is BaseTest {
     ///      rotated-out Safe is. Prove the change routes the NEXT harvest and nothing else.
     ///
     ///      THE ARITHMETIC, PER WEEK, CHECKABLE BY HAND AGAINST THE FIXTURE:
-    ///        gross premium     = $2.00 x 10 contracts                = 20_000_000
-    ///        Overcall's 5%     = floor(2_000_000 * 500 / 10_000) * 10 =  1_000_000  (per contract)
-    ///        into the vault    = 20_000_000 - 1_000_000              = 19_000_000
+    ///        into the vault    = $1.90 x 10 contracts                = 19_000_000
     ///        protocol fee 5%   = 19_000_000 * 500 / 10_000           =    950_000  (premium only)
     ///        net to depositors = 19_000_000 - 950_000                = 18_050_000
     ///      Alice is the only holder, so she takes the whole net both weeks: 2 x 18_050_000
@@ -561,7 +572,6 @@ contract VaultAdminTest is BaseTest {
 
         assertEq(usdg.balanceOf(feeSafe), 950_000, "the old safe received nothing more");
         assertEq(usdg.balanceOf(newFeeSafe), 950_000, "the new safe took the second week");
-        assertEq(usdg.balanceOf(overcallFee), 2_000_000, "Overcall took 5% both weeks regardless");
 
         // The rotation moved WHO is paid, never HOW MUCH. Depositors are untouched by it, and
         // the fee is not double-charged to cover the new Safe.
@@ -580,8 +590,8 @@ contract VaultAdminTest is BaseTest {
     ///      refuses to write while it is switched on. Acceptance is governance's call, and it
     ///      has to be a real one: the switch must move the vault from "refuses" to "writes".
     ///
-    ///      REGRESSION GUARD. The gate lives in `ValoremLib.write` (shared by `rollOpen` and
-    ///      `writeMore`), which is handed `feeAccepted` and reverts only on
+    ///      REGRESSION GUARD. The gate lives in `ValoremLib.open` (the arm) and again in
+    ///      `ValoremLib.writeOnFill` (every fill), both handed `feeAccepted` and reverting only on
     ///      `feesEnabled() && !feeAccepted`. An earlier draft had the adapter revert on
     ///      `clear.feesEnabled()` alone, which made the acceptance decorative: it changed only
     ///      which error came back. Both halves of the switch are asserted below.
@@ -594,18 +604,21 @@ contract VaultAdminTest is BaseTest {
         // Unaccepted: the vault-level gate refuses, and it names the fee it refused over.
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(Vault.ValoremFeeNotAccepted.selector, uint8(15)));
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
 
         vm.prank(admin);
         vault.acceptValoremFee(true);
         assertTrue(vault.valoremFeeAccepted(), "governance accepted the engine fee");
 
-        // Accepted: the write goes through with the engine fee still switched on. Neither the
-        // vault gate nor the adapter's own guard may fire once governance has said yes.
+        // Accepted: the arm and the fill both go through with the engine fee still switched on.
+        // Neither the vault gate nor the adapter's own guard may fire once governance has said yes.
         vm.prank(keeper);
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
+        assertEq(_phase(), 1, "the vault moved to Listed");
+        OrderComponents memory c = _approveListing(optionId, 5, _okUnitPrice());
+        _fill(c, 5);
         assertEq(vault.contractsWritten(), 5, "the acceptance switch actually lets the write land");
-        assertEq(_phase(), 1, "and the vault moved to Listed");
+        assertEq(nvda.balanceOf(address(vault)), 20e18 - 5e18 - (5e18 * 15) / 10_000, "collateral plus 15 bps left");
 
         // Turn the engine fee back off and the next cycle writes with acceptance irrelevant.
         _warpToExercise();
@@ -617,8 +630,8 @@ contract VaultAdminTest is BaseTest {
         vm.prank(admin);
         vault.acceptValoremFee(false);
         vm.prank(keeper);
-        vault.rollOpen(optionIds[RUNG_PICK], 5);
-        assertEq(_phase(), 1, "writes fine once Valorem's fee is off");
+        vault.rollOpen(optionIds[RUNG_PICK]);
+        assertEq(_phase(), 1, "arms fine once Valorem's fee is off");
     }
 
     /// @dev The other direction: revoking acceptance re-arms the gate.
@@ -637,7 +650,7 @@ contract VaultAdminTest is BaseTest {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(Vault.ValoremFeeNotAccepted.selector, uint8(20)));
-        vault.rollOpen(optionId, 5);
+        vault.rollOpen(optionId);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -656,9 +669,7 @@ contract VaultAdminTest is BaseTest {
         // Open a second cycle and fill it, so the change lands with collateral locked, USDG
         // claimable, and the vault mid-flight.
         _nextCycle();
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
         assertEq(_phase(), 1, "mid-cycle");
 
         uint256 sharesFor1 = vault.convertToShares(1e18);
@@ -740,8 +751,7 @@ contract VaultAdminTest is BaseTest {
         _deposit(bob, 5e18);
         _fullCycleOtm(10, _okUnitPrice());
         _nextCycle();
-        uint256 optionId = _rollOpen(10);
-        _fill(_approveListing(optionId, 10, _okUnitPrice()), 10);
+        _openAndSell(10);
 
         uint256 sharesFor1 = vault.convertToShares(1e18);
         uint256 assetsFor1 = vault.convertToAssets(1e18);
@@ -844,32 +854,46 @@ contract VaultAdminTest is BaseTest {
 
     function test_supportsInterface() public view {
         assertTrue(vault.supportsInterface(0x4e2312e0), "ERC1155Receiver");
-        assertTrue(vault.supportsInterface(0x1626ba7e), "EIP-1271");
+        assertTrue(vault.supportsInterface(type(IZone).interfaceId), "Seaport 1.6 zone");
         assertTrue(vault.supportsInterface(type(IAccessControl).interfaceId), "IAccessControl");
         assertTrue(vault.supportsInterface(0x01ffc9a7), "ERC-165 itself");
+
+        // EIP-1271 is gone on purpose: the vault signs nothing, and a signer that answered for any
+        // digest would expose its USDG to the stablecoin's own EIP-3009 / permit paths.
+        assertFalse(vault.supportsInterface(0x1626ba7e), "EIP-1271 is not advertised");
+        (bool ok,) = address(vault).staticcall(abi.encodeWithSelector(0x1626ba7e, bytes32(0), ""));
+        assertFalse(ok, "and isValidSignature does not exist");
 
         assertFalse(vault.supportsInterface(0xffffffff), "the ERC-165 invalid id");
         assertFalse(vault.supportsInterface(0x36372b07), "ERC-20 is not advertised");
     }
 
-    /// @dev Valorem pushes the option tokens and the claim NFT straight to the writer, so the
-    ///      hooks must accept from the clearinghouse. Accepting from anyone would turn the
-    ///      vault into a dumping ground for unrelated ERC-1155s.
-    function test_erc1155Hooks_acceptOnlyFromTheClearinghouse() public {
+    /// @dev Valorem mints the option tokens and the claim NFT straight to the writer, so the hooks
+    ///      must accept MINTS from the clearinghouse (`from == address(0)`), and nothing else: not a
+    ///      transfer of a Clear token from another holder (the clearinghouse is `msg.sender` for
+    ///      those too), and not any other ERC-1155. Under write-on-fill the vault must never hold an
+    ///      option token it did not just mint for a sale.
+    function test_erc1155Hooks_acceptOnlyMintsFromTheClearinghouse() public {
         uint256[] memory ids = new uint256[](1);
         uint256[] memory amounts = new uint256[](1);
         ids[0] = optionIds[RUNG_PICK];
         amounts[0] = 1;
 
         vm.prank(address(clear));
-        assertEq(vault.onERC1155Received(keeper, address(0), ids[0], 1, ""), ERC1155_RECEIVED, "accepts the engine");
+        assertEq(vault.onERC1155Received(keeper, address(0), ids[0], 1, ""), ERC1155_RECEIVED, "accepts a mint");
 
         vm.prank(address(clear));
         assertEq(
             vault.onERC1155BatchReceived(keeper, address(0), ids, amounts, ""),
             ERC1155_BATCH_RECEIVED,
-            "accepts a batch from the engine"
+            "accepts a batch mint"
         );
+
+        // The clearinghouse forwarding somebody's transfer is refused: `from` is a holder, not zero.
+        vm.prank(address(clear));
+        assertEq(vault.onERC1155Received(stranger, stranger, ids[0], 1, ""), REJECT, "rejects a donation");
+        vm.prank(address(clear));
+        assertEq(vault.onERC1155BatchReceived(stranger, stranger, ids, amounts, ""), REJECT, "rejects a batch donation");
 
         // `address(nvda)` is in here on purpose: the underlying is the one address a lazy
         // "is this one of our contracts?" check would wave through.

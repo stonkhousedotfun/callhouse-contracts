@@ -6,38 +6,46 @@ import {Vault} from "../../src/Vault.sol";
 import {Policy, PolicyParams} from "../../src/Policy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IValoremClear} from "../../src/interfaces/IValoremClear.sol";
-import {IOvercallRegistry} from "../../src/interfaces/IOvercallRegistry.sol";
 import {IChainlinkFeed} from "../../src/interfaces/IChainlinkFeed.sol";
 import {IStockToken} from "../../src/interfaces/IStockToken.sol";
 import {
     ISeaport,
+    IZone,
     OrderComponents,
+    OrderParameters,
     OfferItem,
     ConsiderationItem,
     ItemType,
     OrderType
 } from "../../src/interfaces/ISeaport.sol";
+import {AdvancedOrder, CriteriaResolver, ISeaportFulfil} from "../helpers/RealSeaportBase.sol";
 
 /// @notice Fork tests against the real Robinhood Chain 4663 deployment.
-/// @dev Run with:  forge test --match-path 'test/fork/*' --fork-url $RH_RPC -vv
+/// @dev Run with:  FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC -vv
 ///      These are the tests that catch a wrong assumption about somebody else's contract, which
-///      is the class of bug mocks cannot find.
+///      is the class of bug mocks cannot find. Under write on fill the assumptions that matter
+///      are Seaport 1.6's hook order (authorizeOrder before any transfer, on the LIVE runtime),
+///      transient storage on chain 4663 (the fill baseline is TSTORE'd), and Valorem's `write`
+///      minting to `msg.sender` inside that hook.
+///
+///      NO REGISTRY. The vault validates option types from the clearinghouse alone, and
+///      `newOptionType` is permissionless, so these tests create their own weekly type on the live
+///      Clear rather than depending on Overcall having published one.
 contract ForkLiveTest is Test {
     address constant CLEAR = 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0;
     address constant SEAPORT = 0x0000000000000068F116a894984e2DB1123eB395;
+    address constant CONDUIT_CONTROLLER = 0x00000000F9490004C11Cef243f5400493c00Ad63;
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address constant NVDA = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
-    address constant REGISTRY = 0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA;
-    address constant OVERCALL_FEE = 0xdAe7e82A2E7D566C67E87C164B05a1C560190782;
     address constant FEED = 0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15;
     address constant MULTICALL3 = 0xcA11bde05977b3631167028862bE2a173976CA11;
 
-    /// @dev The JUGGERNAUT market registry. Present only so a test can prove we did NOT wire it.
-    address constant REGISTRY_JUGGERNAUT = 0x65dD407955912Be814f723724cE60f91ebd72616;
+    /// @dev Pinned in test/helpers/RealSeaportBase.sol and script/Verify.s.sol; asserted live here.
+    bytes32 constant SEAPORT_16_RUNTIME_HASH = 0x95809b70c9659c30188db5fdd87103e24b1a55379af8c851fca393aba0224a00;
 
-    IOvercallRegistry reg = IOvercallRegistry(REGISTRY);
     IValoremClear clear = IValoremClear(CLEAR);
     ISeaport seaport = ISeaport(SEAPORT);
+    ISeaportFulfil seaportFulfil = ISeaportFulfil(SEAPORT);
 
     address admin = makeAddr("admin");
     address keeper = makeAddr("keeper");
@@ -68,12 +76,9 @@ contract ForkLiveTest is Test {
                 usdg: IERC20(USDG),
                 clear: IValoremClear(CLEAR),
                 seaport: ISeaport(SEAPORT),
-                registry: IOvercallRegistry(REGISTRY),
                 priceFeed: IChainlinkFeed(FEED),
                 maxPriceAge: 4 days,
-                overcallFeeRecipient: OVERCALL_FEE,
                 conduitKey: bytes32(0),
-                seaportZone: address(0),
                 admin: admin,
                 feeRecipient: feeSafe,
                 depositCap: 50e18,
@@ -94,18 +99,22 @@ contract ForkLiveTest is Test {
     function test_fork_everythingHasCode() public onlyFork {
         assertGt(CLEAR.code.length, 0, "Valorem Clear");
         assertGt(SEAPORT.code.length, 0, "Seaport 1.6");
+        assertGt(CONDUIT_CONTROLLER.code.length, 0, "ConduitController");
         assertGt(USDG.code.length, 0, "USDG");
         assertGt(NVDA.code.length, 0, "NVDA Stock Token");
-        assertGt(REGISTRY.code.length, 0, "OvercallRegistry NVDA");
         assertGt(MULTICALL3.code.length, 0, "Multicall3");
         assertGt(FEED.code.length, 0, "Chainlink NVDA/USD");
-        assertEq(OVERCALL_FEE.code.length, 0, "Overcall fee key is an EOA, not a contract");
     }
 
-    function test_fork_seaportIsVersion16() public onlyFork {
+    /// @dev The zone hooks are a Seaport 1.6 feature, and their ordering (authorize before any
+    ///      transfer, validate after all of them, on every fulfilment path) was verified against
+    ///      THIS runtime (integrations/seaport.md). Pin the bytes, not only the version string.
+    function test_fork_seaportIsTheVerified16Runtime() public onlyFork {
         (string memory version,, address conduitController) = seaport.information();
         assertEq(version, "1.6", "must be Seaport 1.6, not 1.5");
-        console2.log("conduitController", conduitController);
+        assertEq(conduitController, CONDUIT_CONTROLLER, "canonical ConduitController");
+        assertEq(SEAPORT.codehash, SEAPORT_16_RUNTIME_HASH, "the live runtime is the one the fixtures and Verify pin");
+        assertEq(SEAPORT.code.length, 23_981, "23,981 B on 4663");
     }
 
     function test_fork_tokenDecimals() public onlyFork {
@@ -114,123 +123,34 @@ contract ForkLiveTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                        THE REGISTRY IS THE RIGHT ONE
-    //////////////////////////////////////////////////////////////*/
-
-    function test_fork_registryDescribesOurPair() public onlyFork {
-        assertEq(reg.collateralToken(), NVDA, "collateral must be NVDA");
-        assertEq(reg.exerciseToken(), USDG, "exercise must be USDG");
-        assertEq(reg.clearinghouse(), CLEAR, "clearinghouse must be Valorem Clear");
-        assertEq(reg.lotSize(), 1e18, "lot size is exactly one token");
-    }
-
-    /// @dev Overcall's frontend config has a top-level `registry` key that is the JUGGERNAUT
-    ///      market, not NVDA. Binding it here would collateralise NVDA calls against a different
-    ///      token. This test exists so that mistake can never be made silently.
-    function test_fork_juggernautRegistryIsNotOurs() public onlyFork {
-        assertTrue(REGISTRY_JUGGERNAUT != REGISTRY, "distinct registries");
-        assertTrue(
-            IOvercallRegistry(REGISTRY_JUGGERNAUT).collateralToken() != NVDA,
-            "the JUGGERNAUT registry does not collateralise NVDA"
-        );
-    }
-
-    /// @dev The vault constructor refuses a registry that does not describe its pair.
-    function test_fork_constructorRejectsWrongRegistry() public onlyFork {
-        vm.expectRevert();
-        new Vault(
-            Vault.Config({
-                asset: IERC20(NVDA),
-                usdg: IERC20(USDG),
-                clear: IValoremClear(CLEAR),
-                seaport: ISeaport(SEAPORT),
-                registry: IOvercallRegistry(REGISTRY_JUGGERNAUT),
-                priceFeed: IChainlinkFeed(FEED),
-                maxPriceAge: 4 days,
-                overcallFeeRecipient: OVERCALL_FEE,
-                conduitKey: bytes32(0),
-                seaportZone: address(0),
-                admin: admin,
-                feeRecipient: feeSafe,
-                depositCap: 50e18,
-                name: "wrong",
-                symbol: "wrong"
-            })
-        );
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                             THE LIVE CYCLE
-    //////////////////////////////////////////////////////////////*/
-
-    function test_fork_cycleShape() public onlyFork {
-        IOvercallRegistry.Cycle memory c = reg.cycle();
-        console2.log("cycle number      ", c.number);
-        console2.log("exerciseTimestamp ", c.exerciseTimestamp);
-        console2.log("expiryTimestamp   ", c.expiryTimestamp);
-        console2.log("lotSize           ", c.lotSize);
-        console2.log("rungs             ", c.optionIds.length);
-
-        if (c.number == 0) {
-            console2.log("no cycle set yet on this fork block");
-            return;
-        }
-
-        assertLe(c.optionIds.length, reg.MAX_STRIKES(), "never more rungs than MAX_STRIKES");
-        assertGt(c.expiryTimestamp, c.exerciseTimestamp, "expiry is after exercise");
-        assertGe(
-            uint256(c.expiryTimestamp - c.exerciseTimestamp),
-            reg.MIN_EXERCISE_WINDOW(),
-            "exercise window respects the registry minimum"
-        );
-        assertEq(reg.writeDeadline(), c.exerciseTimestamp, "writeDeadline IS exerciseTimestamp");
-
-        // Strikes ascend, and the registry and the clearinghouse agree about every one of them.
-        uint96 prev;
-        for (uint256 i; i < c.optionIds.length; i++) {
-            uint256 id = c.optionIds[i];
-            uint96 strike = reg.strikePerContract(id);
-            assertGt(strike, prev, "strikes strictly ascending");
-            prev = strike;
-
-            assertTrue(reg.isApproved(id), "every cycle id is approved");
-            assertEq(reg.cycleOf(id), c.number, "every id belongs to this cycle");
-
-            IValoremClear.Option memory o = clear.option(id);
-            assertEq(o.underlyingAsset, NVDA, "underlying is NVDA");
-            assertEq(o.exerciseAsset, USDG, "exercise is USDG");
-            assertEq(o.underlyingAmount, c.lotSize, "one lot per contract");
-            assertEq(o.exerciseAmount, strike, "registry strike == Valorem exerciseAmount");
-            assertEq(o.exerciseTimestamp, c.exerciseTimestamp, "shared exercise time");
-            assertEq(o.expiryTimestamp, c.expiryTimestamp, "shared expiry");
-
-            console2.log("  rung strike (USDG 6dp)", strike);
-        }
-    }
-
-    /// @dev An id that is not in the cycle must not read as approved. A default-true would let
-    ///      the keeper write anything.
-    function test_fork_unknownOptionNotApproved() public onlyFork {
-        assertFalse(reg.isApproved(0), "zero id is not approved");
-        assertEq(reg.cycleOf(0), 0, "zero id belongs to no cycle");
-    }
-
-    /*//////////////////////////////////////////////////////////////
                           VALOREM ASSUMPTIONS
     //////////////////////////////////////////////////////////////*/
 
     /// @dev The engine fee being off is what makes weekly OTM premium worth collecting. If this
-    ///      ever fails on mainnet, the vault refuses to write until governance accepts it.
+    ///      ever fails on mainnet, the vault refuses to arm until governance accepts it.
     function test_fork_valoremFeeSwitch() public onlyFork {
         bool on = clear.feesEnabled();
         console2.log("feesEnabled", on);
         console2.log("feeBps     ", clear.feeBps());
         console2.log("feeTo      ", clear.feeTo());
-        assertFalse(on, "Valorem engine fee is expected OFF at Overcall launch");
+        assertEq(clear.feeBps(), 15, "feeBps is a compile-time 15");
+        assertFalse(on, "Valorem engine fee is expected OFF");
     }
 
     function test_fork_clearIsErc1155() public onlyFork {
         assertTrue(clear.supportsInterface(0xd9b67a26), "ERC-1155");
+    }
+
+    /// @dev `newOptionType` is permissionless and the settlement seed is the option key: the two
+    ///      facts the vault's arm gate and the write-on-fill design rest on, checked live.
+    function test_fork_anyoneCanCreateAnOptionTypeAndTheSeedIsTheKey() public onlyFork {
+        (uint256 id,,,) = _ourOptionType(7);
+        assertEq(uint8(clear.tokenType(id)), uint8(IValoremClear.TokenType.Option), "an Option id");
+        IValoremClear.Option memory o = clear.option(id);
+        assertEq(o.underlyingAsset, NVDA);
+        assertEq(o.exerciseAsset, USDG);
+        assertEq(o.underlyingAmount, 1e18);
+        assertEq(o.settlementSeed, uint160(id >> 96), "settlementSeed == optionKey, fixed for ever");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -270,9 +190,12 @@ contract ForkLiveTest is Test {
 
     function test_fork_vaultDeploysAndReadsSpot() public onlyFork {
         assertEq(address(vault.asset()), NVDA);
-        assertEq(address(vault.registry()), REGISTRY);
+        assertEq(address(vault.clear()), CLEAR);
+        assertEq(vault.seaportZone(), address(vault), "the vault is its own zone");
         assertEq(vault.maxPriceAge(), 4 days);
         assertEq(uint8(vault.phase()), 0, "starts Idle");
+        assertTrue(clear.isApprovedForAll(address(vault), SEAPORT), "Seaport may pull the option tokens");
+        assertTrue(vault.supportsInterface(type(IZone).interfaceId), "advertises the zone interface");
 
         uint256 spot = vault.spotUsdg();
         assertGt(spot, 0, "vault can read spot through the real feed");
@@ -281,10 +204,8 @@ contract ForkLiveTest is Test {
 
     /// @dev Seaport must accept the vault as an offerer and hash our exact order shape.
     function test_fork_seaportHashesOurOrderShape() public onlyFork {
-        IOvercallRegistry.Cycle memory c = reg.cycle();
-        if (c.number == 0 || c.optionIds.length == 0) return;
-
-        OrderComponents memory o = _order(c.optionIds[0], 1, 2_000_000, c.exerciseTimestamp);
+        (uint256 id,, uint40 exTs,) = _ourOptionType(11);
+        OrderComponents memory o = _order(id, 1, 2_000_000, exTs);
         bytes32 h = seaport.getOrderHash(o);
         assertTrue(h != bytes32(0), "real Seaport produced a hash for our shape");
 
@@ -295,12 +216,6 @@ contract ForkLiveTest is Test {
         assertEq(sz, 0);
 
         assertEq(seaport.getCounter(address(vault)), 0, "a fresh vault starts at counter 0");
-    }
-
-    /// @dev EIP-1271 must answer for the real Seaport EIP-712 digest, built from the live domain
-    ///      separator. Getting this wrong means no buyer can ever fill.
-    function test_fork_eip1271RejectsWhenNothingListed() public onlyFork {
-        assertEq(vault.isValidSignature(bytes32(uint256(1)), ""), bytes4(0xffffffff));
     }
 
     /// @dev Bumping the counter is the guardian's no-data kill switch. Prove it works against the
@@ -329,7 +244,7 @@ contract ForkLiveTest is Test {
     ///      slot cannot be found, this reports that rather than failing opaquely; the write path
     ///      is then covered by the mock suite instead.
     function test_fork_depositRealStockToken() public onlyFork {
-        try this.dealNvda(alice, 5e18) {
+        try this.dealToken(NVDA, alice, 5e18) {
             assertEq(IERC20(NVDA).balanceOf(alice), 5e18, "dealt NVDA");
         } catch {
             console2.log("deal() could not locate the NVDA balance slot; skipping deposit path");
@@ -352,8 +267,8 @@ contract ForkLiveTest is Test {
         assertEq(IERC20(NVDA).balanceOf(alice), 5e18, "got it all back");
     }
 
-    function dealNvda(address to, uint256 amount) external {
-        deal(NVDA, to, amount, true);
+    function dealToken(address token, address to, uint256 amount) external {
+        deal(token, to, amount, true);
     }
 
     /// @dev The ERC-8056 multiplier must be readable and must never enter share maths.
@@ -373,250 +288,192 @@ contract ForkLiveTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                    THE REAL THING: WRITE AND LIST ON CHAIN
+               THE REAL THING: ARM, LIST AND WRITE ON FILL
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev The integration test that matters. Deposit real NVDA, write real Valorem calls
-    ///      against the live cycle, and authorise a real Seaport listing. Everything a mock can
-    ///      get wrong about someone else's contract shows up here.
-    function test_fork_writeAndListForReal() public onlyFork {
-        IOvercallRegistry.Cycle memory c = reg.cycle();
-        if (c.number == 0 || c.optionIds.length == 0) {
-            console2.log("no live cycle at this block; nothing to write against");
-            return;
-        }
-        if (!reg.isWritingOpen()) {
-            console2.log("write window closed at this block");
-            return;
-        }
-
-        // Pick the nearest rung inside the vault's own OTM band, the way the keeper does.
-        uint256 spot = vault.spotUsdg();
-        (uint256 lo, uint256 hi) = Policy.strikeBand(spot, _policy());
-        uint256 chosen = type(uint256).max;
-        for (uint256 i; i < c.optionIds.length; i++) {
-            uint256 k = reg.strikePerContract(c.optionIds[i]);
-            if (k >= lo && k <= hi) {
-                chosen = c.optionIds[i];
-                console2.log("picked rung strike", k);
-                break;
-            }
-        }
-        if (chosen == type(uint256).max) {
-            console2.log("no rung inside the OTM band at this spot; the vault correctly writes nothing");
-            return;
-        }
-
-        try this.dealNvda(alice, 4e18) {}
-        catch {
-            console2.log("deal() could not locate the NVDA balance slot; skipping");
-            return;
-        }
+    /// @dev The integration test that matters (FIX-PLAN C-06A acceptance, D11.4). Deposit real
+    ///      NVDA, arm a type on the live Clear, authorise a real PARTIAL_RESTRICTED listing on the
+    ///      live Seaport with the vault as zone, and let a buyer fill it TWICE through the live
+    ///      `fulfillAdvancedOrder`: the first fill opens the claim inside `authorizeOrder`, the second
+    ///      tops the same claim up, and the TSTORE'd fill baseline is exercised on chain 4663's EVM.
+    ///      Everything a mock can get wrong about someone else's contract shows up here.
+    function test_fork_writeOnFillAgainstLiveSeaportAndClear() public onlyFork {
+        (uint256 optionId, uint256 strike, uint40 exTs,) = _ourOptionType(13);
+        if (!_dealBoth()) return;
 
         vm.startPrank(alice);
         IERC20(NVDA).approve(address(vault), 4e18);
         vault.deposit(4e18, alice);
         vm.stopPrank();
 
-        uint112 n = 3; // 4 NVDA idle at 95% utilisation floors to 3 whole lots
-
         vm.prank(keeper);
-        vault.rollOpen(chosen, n);
-
-        // Real Valorem minted us real option tokens and a real claim.
+        vault.rollOpen(optionId);
         assertEq(uint8(vault.phase()), 1, "phase Listed");
-        assertEq(clear.balanceOf(address(vault), chosen), n, "vault holds n option tokens");
-        assertGt(vault.claimKey(), 0, "vault holds a claim");
-        assertEq(vault.contractsWritten(), n);
-        assertEq(vault.lockedAssets(), uint256(n) * 1e18, "collateral locked in Valorem");
-        assertEq(vault.totalAssets(), 4e18, "writing moves collateral, it does not lose it");
+        assertEq(vault.contractsWritten(), 0, "nothing written at arm");
+        assertEq(vault.claimKey(), 0, "no claim at arm");
+        assertEq(clear.balanceOf(address(vault), optionId), 0, "no inventory at arm");
+        assertEq(vault.cycleStrikeUsdg(), strike);
+        assertEq(vault.cycleExerciseTs(), exTs);
 
-        IValoremClear.Claim memory cl = clear.claim(vault.claimKey());
-        assertEq(cl.amountWritten, uint256(n) * 1e18, "Valorem reports a 1e18-scaled scalar");
-        assertEq(cl.amountExercised, 0);
-        assertEq(cl.optionId, chosen);
-
-        // Now authorise a listing on the real Seaport.
+        // 4 NVDA at 95% utilisation floors to 3 whole lots: list the whole capacity.
         uint256 unitPrice = 2_000_000; // $2.00/contract, over the 0.40%-of-spot floor
-        OrderComponents memory o = _order(chosen, n, unitPrice, c.exerciseTimestamp);
-
+        OrderComponents memory o = _order(optionId, 3, unitPrice, exTs);
         vm.prank(keeper);
         vault.approveListing(o);
 
         bytes32 h = seaport.getOrderHash(o);
         assertEq(vault.listingHash(), h, "vault recorded the real Seaport order hash");
-        assertEq(vault.listingAmount(), n);
-        assertEq(vault.listingGrossUsdg(), unitPrice * n);
-
-        (bool validated, bool isCancelled, uint256 totalFilled, uint256 totalSize) = seaport.getOrderStatus(h);
+        (bool validated,,,) = seaport.getOrderStatus(h);
         assertTrue(validated, "real Seaport marked our order validated");
-        assertFalse(isCancelled);
-        // NOTE FOR THE KEEPER: `totalFilled`/`totalSize` are the numerator and denominator of the
-        // FILL FRACTION, not the order quantity. Both stay 0 until someone actually fills, even
-        // on a validated order. Do not read them to discover how big an order is, and do not read
-        // totalSize == 0 as "nothing listed" — check `validated` for that.
-        assertEq(totalFilled, 0, "nothing filled yet");
-        assertEq(totalSize, 0, "fill fraction is unset until the first fill");
 
-        // EIP-1271 must answer for the real EIP-712 digest, or no buyer can ever fill.
-        (, bytes32 domainSeparator,) = seaport.information();
-        bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSeparator, h));
-        assertEq(vault.isValidSignature(digest, new bytes(65)), bytes4(0x1626ba7e), "1271 accepts the digest");
-        assertEq(vault.isValidSignature(h, ""), bytes4(0x1626ba7e), "1271 accepts the raw hash too");
-        assertEq(vault.isValidSignature(keccak256("nope"), ""), bytes4(0xffffffff), "and rejects anything else");
-
-        // Seaport pulls the 1155 directly because the conduit key is zero.
-        assertTrue(clear.isApprovedForAll(address(vault), SEAPORT), "Seaport is approved to move the options");
-
-        console2.log("listed", uint256(n), "contracts for USDG", unitPrice * n);
-    }
-
-    /// @dev F2 tranche writes against the REAL clearinghouse: passing our claim id back to
-    ///      `clear.write` must add to that claim and return the same id, and Valorem's summed
-    ///      `claim`/`position` must be what the vault's views read. A mock cannot prove that.
-    function test_fork_writeMoreTopsUpTheLiveClaim() public onlyFork {
-        IOvercallRegistry.Cycle memory c = reg.cycle();
-        if (c.number == 0 || c.optionIds.length == 0 || !reg.isWritingOpen()) {
-            console2.log("no writable cycle at this block");
-            return;
-        }
-        (uint256 lo, uint256 hi) = Policy.strikeBand(vault.spotUsdg(), _policy());
-        uint256 chosen = type(uint256).max;
-        for (uint256 i; i < c.optionIds.length; i++) {
-            uint256 k = reg.strikePerContract(c.optionIds[i]);
-            if (k >= lo && k <= hi) {
-                chosen = c.optionIds[i];
-                break;
-            }
-        }
-        if (chosen == type(uint256).max) {
-            console2.log("no rung inside the OTM band at this spot");
-            return;
-        }
-        try this.dealNvda(alice, 4e18) {}
-        catch {
-            console2.log("deal() could not locate the NVDA balance slot; skipping");
-            return;
-        }
-        vm.startPrank(alice);
-        IERC20(NVDA).approve(address(vault), 4e18);
-        vault.deposit(4e18, alice);
-        vm.stopPrank();
-
-        vm.prank(keeper);
-        vault.rollOpen(chosen, 2);
+        // First fill: 1 of 3. `authorizeOrder` writes 1 into a fresh claim, Seaport moves it out.
+        vm.prank(buyer);
+        IERC20(USDG).approve(SEAPORT, type(uint256).max);
+        uint256 g0 = gasleft();
+        assertTrue(_fill(o, 1, 3), "first fill");
+        console2.log("gas: first fill (opens the claim)", g0 - gasleft());
         uint256 key = vault.claimKey();
+        assertGt(key, 0, "the fill opened the claim");
+        assertEq(vault.contractsWritten(), 1);
+        assertEq(clear.balanceOf(buyer, optionId), 1, "buyer holds the call");
+        assertEq(clear.balanceOf(address(vault), optionId), 0, "the vault holds NO option tokens");
+        assertEq(clear.balanceOf(address(vault), key), 1, "and the claim NFT");
+        assertEq(IERC20(USDG).balanceOf(address(vault)), unitPrice, "premium landed");
+        assertEq(vault.lockedAssets(), 1e18, "one lot behind the claim");
+        assertEq(vault.totalAssets(), 4e18, "writing moves collateral, it does not lose it");
 
-        vm.prank(keeper);
-        vault.writeMore(1);
-
+        // Second fill: 1 more. Same claim, topped up.
+        g0 = gasleft();
+        assertTrue(_fill(o, 1, 3), "second fill");
+        console2.log("gas: second fill (tops the claim up)", g0 - gasleft());
         assertEq(vault.claimKey(), key, "live Clear topped up the same claim");
-        assertEq(vault.contractsWritten(), 3);
-        assertEq(clear.balanceOf(address(vault), chosen), 3, "three option tokens");
-        assertEq(clear.balanceOf(address(vault), key), 1, "one claim NFT");
-        assertEq(clear.claim(key).amountWritten, 3e18, "Valorem sums the claim's indices");
-        assertEq(vault.lockedAssets(), 3e18, "position() sums them too");
-        assertEq(vault.totalAssets(), 4e18, "no value moved");
+        assertEq(vault.contractsWritten(), 2);
+        assertEq(clear.balanceOf(buyer, optionId), 2);
+        assertEq(clear.balanceOf(address(vault), optionId), 0, "still no inventory");
+        assertEq(clear.claim(key).amountWritten, 2e18, "Valorem sums the claim's indices");
+        assertEq(vault.lockedAssets(), 2e18, "position() sums them too");
 
-        vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(Policy.ContractsAboveUtilization.selector, 4, 3));
-        vault.writeMore(1);
+        (, bool isCancelled, uint256 totalFilled, uint256 totalSize) = seaport.getOrderStatus(h);
+        assertFalse(isCancelled);
+        assertEq(totalFilled, 2, "fill fraction numerator");
+        assertEq(totalSize, 3, "fill fraction denominator");
+
+        console2.log("wrote and sold 2 of 3 on the live Seaport + Clear; claim", key);
     }
 
-    /// @dev A rung outside the OTM band must be refused even against the live ladder.
-    function test_fork_outOfBandRungIsRefused() public onlyFork {
-        IOvercallRegistry.Cycle memory c = reg.cycle();
-        if (c.number == 0 || c.optionIds.length == 0 || !reg.isWritingOpen()) return;
-
+    /// @dev A type whose strike sits outside the band must be refused at arm against the live ladder
+    ///      maths, and a claim id must never pass for an option id.
+    function test_fork_armGateRefusesOutOfBandAndClaimIds() public onlyFork {
         uint256 spot = vault.spotUsdg();
-        (uint256 lo, uint256 hi) = Policy.strikeBand(spot, _policy());
-
-        uint256 outOfBand = type(uint256).max;
-        for (uint256 i; i < c.optionIds.length; i++) {
-            uint256 k = reg.strikePerContract(c.optionIds[i]);
-            if (k < lo || k > hi) {
-                outOfBand = c.optionIds[i];
-                break;
-            }
-        }
-        if (outOfBand == type(uint256).max) {
-            console2.log("every live rung happens to be in band right now");
-            return;
-        }
-
-        try this.dealNvda(alice, 4e18) {}
-        catch {
-            return;
-        }
-        vm.startPrank(alice);
-        IERC20(NVDA).approve(address(vault), 4e18);
-        vault.deposit(4e18, alice);
-        vm.stopPrank();
-
+        (uint40 exTs, uint40 expTs) = _window(17);
+        // 30% out of the money is above the 12% ceiling at every launch policy.
+        uint96 farStrike = uint96((spot * 13_000) / 10_000);
+        uint256 far = clear.newOptionType(NVDA, 1e18, USDG, farStrike, exTs, expTs);
         vm.prank(keeper);
         vm.expectRevert();
-        vault.rollOpen(outOfBand, 3);
-    }
+        vault.rollOpen(far);
+        assertEq(uint8(vault.phase()), 0, "still Idle");
 
-    function _policy() internal view returns (PolicyParams memory p) {
-        (
-            uint16 minOtmBps,
-            uint16 maxOtmBps,
-            uint16 minPremiumBps,
-            uint16 maxUtilizationBps,
-            uint16 protocolFeeBps,
-            uint64 maxContractsCap
-        ) = vault.policy();
-        p = PolicyParams({
-            minOtmBps: minOtmBps,
-            maxOtmBps: maxOtmBps,
-            minPremiumBps: minPremiumBps,
-            maxUtilizationBps: maxUtilizationBps,
-            protocolFeeBps: protocolFeeBps,
-            maxContractsCap: maxContractsCap
-        });
+        // A claim id (a write against a live type) is not an option type.
+        if (!_dealBoth()) return;
+        (uint256 optionId,,,) = _ourOptionType(19);
+        vm.startPrank(alice);
+        IERC20(NVDA).approve(CLEAR, 1e18);
+        uint256 claimId = clear.write(optionId, 1);
+        vm.stopPrank();
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(Vault.NotAnOptionType.selector, claimId));
+        vault.rollOpen(claimId);
     }
 
     /*//////////////////////////////////////////////////////////////
                                HELPERS
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev A weekly-shaped window `salt` seconds off the round hour, so two tests in one fork run
+    ///      never collide on an option key that already exists on the live Clear.
+    function _window(uint256 salt) internal view returns (uint40 exTs, uint40 expTs) {
+        exTs = uint40(block.timestamp + 3 days + salt);
+        expTs = uint40(exTs + 1 days);
+    }
+
+    /// @dev Create our own option type on the live clearinghouse: 7% out of the money at live spot
+    ///      (inside the 3%..12% launch band), lot 1e18, a 24-hour exercise window.
+    function _ourOptionType(uint256 salt) internal returns (uint256 id, uint256 strike, uint40 exTs, uint40 expTs) {
+        (exTs, expTs) = _window(salt);
+        uint256 spot = vault.spotUsdg();
+        strike = (spot * 10_700) / 10_000;
+        id = clear.newOptionType(NVDA, 1e18, USDG, uint96(strike), exTs, expTs);
+    }
+
+    /// @dev Fund alice with NVDA and the buyer with USDG through `deal`; false if either slot cannot
+    ///      be located on the live token (then the test reports and skips).
+    function _dealBoth() internal returns (bool) {
+        try this.dealToken(NVDA, alice, 4e18) {}
+        catch {
+            console2.log("deal() could not locate the NVDA balance slot; skipping");
+            return false;
+        }
+        try this.dealToken(USDG, buyer, 10_000_000_000) {}
+        catch {
+            console2.log("deal() could not locate the USDG balance slot; skipping");
+            return false;
+        }
+        return true;
+    }
+
+    function _fill(OrderComponents memory c, uint120 num, uint120 den) internal returns (bool ok) {
+        AdvancedOrder memory ao = AdvancedOrder({
+            parameters: _toParameters(c), numerator: num, denominator: den, signature: "", extraData: ""
+        });
+        vm.prank(buyer);
+        ok = seaportFulfil.fulfillAdvancedOrder(ao, new CriteriaResolver[](0), bytes32(0), buyer);
+    }
+
+    function _toParameters(OrderComponents memory c) internal pure returns (OrderParameters memory p) {
+        p = OrderParameters({
+            offerer: c.offerer,
+            zone: c.zone,
+            offer: c.offer,
+            consideration: c.consideration,
+            orderType: c.orderType,
+            startTime: c.startTime,
+            endTime: c.endTime,
+            zoneHash: c.zoneHash,
+            salt: c.salt,
+            conduitKey: c.conduitKey,
+            totalOriginalConsiderationItems: c.consideration.length
+        });
+    }
+
+    /// @dev The vault's order shape: offerer AND zone the vault, PARTIAL_RESTRICTED, one USDG
+    ///      consideration item to the vault.
     function _order(uint256 optionId, uint256 n, uint256 unitPrice, uint40 endTime)
         internal
         view
         returns (OrderComponents memory c)
     {
-        (uint256 toVault, uint256 toOvercall,) = Policy.splitPremium(unitPrice, n);
-
         OfferItem[] memory offer = new OfferItem[](1);
         offer[0] = OfferItem({
             itemType: ItemType.ERC1155, token: CLEAR, identifierOrCriteria: optionId, startAmount: n, endAmount: n
         });
 
-        ConsiderationItem[] memory consid = new ConsiderationItem[](2);
+        ConsiderationItem[] memory consid = new ConsiderationItem[](1);
         consid[0] = ConsiderationItem({
             itemType: ItemType.ERC20,
             token: USDG,
             identifierOrCriteria: 0,
-            startAmount: toVault,
-            endAmount: toVault,
+            startAmount: unitPrice * n,
+            endAmount: unitPrice * n,
             recipient: payable(address(vault))
-        });
-        consid[1] = ConsiderationItem({
-            itemType: ItemType.ERC20,
-            token: USDG,
-            identifierOrCriteria: 0,
-            startAmount: toOvercall,
-            endAmount: toOvercall,
-            recipient: payable(OVERCALL_FEE)
         });
 
         c = OrderComponents({
             offerer: address(vault),
-            zone: address(0),
+            zone: address(vault),
             offer: offer,
             consideration: consid,
-            orderType: OrderType.PARTIAL_OPEN,
+            orderType: OrderType.PARTIAL_RESTRICTED,
             startTime: 0,
             endTime: endTime,
             zoneHash: bytes32(0),

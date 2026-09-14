@@ -3,52 +3,51 @@ pragma solidity 0.8.28;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {Vault} from "../src/Vault.sol";
-import {Policy, PolicyParams} from "../src/Policy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IValoremClear} from "../src/interfaces/IValoremClear.sol";
-import {IOvercallRegistry} from "../src/interfaces/IOvercallRegistry.sol";
 import {IChainlinkFeed} from "../src/interfaces/IChainlinkFeed.sol";
 import {ISeaport} from "../src/interfaces/ISeaport.sol";
 
 /// @notice Deploys one Callhouse vault.
-/// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/ (leekzor/callhouse).
-///      Run with:
+/// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/ (leekzor/callhouse)
+///      and the integration dossiers in projects/callhouse/integrations/. Run with:
 ///        forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast \
 ///          --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
 ///
-///      SeaportOrderLib and ValoremLib are `public` libraries and must both be deployed and linked
-///      (Vault links them at five sites). Foundry does this automatically during `forge script`;
-///      if you link manually, pass both
+///      SeaportOrderLib and ValoremLib are `public` libraries and must both be deployed and linked.
+///      Foundry does this automatically during `forge script`; if you link manually, pass both
 ///        --libraries src/lib/SeaportOrderLib.sol:SeaportOrderLib:<address>
 ///        --libraries src/lib/ValoremLib.sol:ValoremLib:<address>
+///
+///      NO REGISTRY (decision D16). The vault validates every option type it arms from the
+///      clearinghouse itself, so there is no third-party registry to wire and nothing to get wrong
+///      about which market's registry is which. THE CLEARINGHOUSE IS A DEPLOY-TIME CHOICE: the
+///      default is Overcall's unmodified Valorem Clear instance (whose `feeTo` key holds only the
+///      15 bps fee switch, which the vault treats as opt-in); `CLEARINGHOUSE=<addr>` points the vault
+///      at an instance of our own from script/DeployClear.s.sol instead.
+///
+///      THE ZONE IS THE VAULT (decision D1, A(ii)). Every listing is a PARTIAL_RESTRICTED Seaport
+///      order whose zone is the vault; the constructor derives that, so there is no zone parameter.
 contract DeployVault is Script {
     /*//////////////////////////////////////////////////////////////
              CHAIN 4663 — all explorer/eth_call confirmed
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev Overcall's ValoremOptionsClearinghouse (upstream 6436c82, Sourcify exact match).
     address internal constant CLEARINGHOUSE = 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0;
     address internal constant SEAPORT_16 = 0x0000000000000068F116a894984e2DB1123eB395;
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address internal constant NVDA = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
 
-    /// @dev The NVDA market registry. NOT the top-level `registry` key in Overcall's frontend
-    ///      config — that one is the JUGGERNAUT market and wiring it here would collateralise
-    ///      calls with the wrong token. See ops/recon/R1-overcall-registry.md (leekzor/callhouse).
-    address internal constant REGISTRY_NVDA = 0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA;
-
-    /// @dev Overcall's premium fee recipient, taken from a real filled order's second
-    ///      consideration item. Also the Valorem fee-switch key.
-    address internal constant OVERCALL_FEE_RECIPIENT = 0xdAe7e82A2E7D566C67E87C164B05a1C560190782;
-
     /// @dev Chainlink NVDA/USD AggregatorProxy, phase 1, 8 decimals, description "RHNVDA / USD".
     address internal constant NVDA_USD_FEED = 0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15;
 
-    /// @dev Overcall lists with no zone and no conduit. Seaport pulls the ERC-1155 directly.
+    /// @dev Seaport pulls the ERC-1155 directly: no conduit.
     bytes32 internal constant CONDUIT_KEY = bytes32(0);
-    address internal constant SEAPORT_ZONE = address(0);
 
     /// @dev Four days. The NVDA feed is `us_equities_24/5` and stops all weekend; a tighter
-    ///      window would block every Saturday and Sunday write. See ops/recon/R5-price-feed.md (leekzor/callhouse).
+    ///      window would block every Saturday and Sunday arm. See ops/recon/R5-price-feed.md (leekzor/callhouse).
     uint32 internal constant MAX_PRICE_AGE = 4 days;
 
     /// @dev README (leekzor/callhouse) "Policy (launch)": start at 20 NVDA, not a TVL race.
@@ -63,17 +62,16 @@ contract DeployVault is Script {
         if (admin == address(0)) admin = vm.envAddress("SAFE_ADMIN");
         address feeRecipient = vm.envAddress("SAFE_FEE");
 
-        // Allow every address to be overridden for a fork rehearsal or a second market.
+        // Allow every address to be overridden for a fork rehearsal, a second market, or our own
+        // clearinghouse instance.
         address asset = vm.envOr("ASSET", NVDA);
         address usdg = vm.envOr("USDG", USDG);
         address clear = vm.envOr("CLEARINGHOUSE", CLEARINGHOUSE);
         address seaport = vm.envOr("SEAPORT", SEAPORT_16);
-        address registry = vm.envOr("REGISTRY", REGISTRY_NVDA);
         address feed = vm.envOr("PRICE_FEED", NVDA_USD_FEED);
-        address overcallFee = vm.envOr("OVERCALL_FEE_RECIPIENT", OVERCALL_FEE_RECIPIENT);
         uint256 cap = vm.envOr("DEPOSIT_CAP", LAUNCH_DEPOSIT_CAP);
 
-        _preflight(asset, usdg, clear, registry, feed);
+        _preflight(asset, usdg, clear, seaport, feed);
 
         vm.startBroadcast(pk);
         vault = new Vault(
@@ -82,12 +80,9 @@ contract DeployVault is Script {
                 usdg: IERC20(usdg),
                 clear: IValoremClear(clear),
                 seaport: ISeaport(seaport),
-                registry: IOvercallRegistry(registry),
                 priceFeed: IChainlinkFeed(feed),
                 maxPriceAge: MAX_PRICE_AGE,
-                overcallFeeRecipient: overcallFee,
                 conduitKey: CONDUIT_KEY,
-                seaportZone: SEAPORT_ZONE,
                 admin: admin,
                 feeRecipient: feeRecipient,
                 depositCap: cap,
@@ -99,7 +94,8 @@ contract DeployVault is Script {
 
         console2.log("Vault           ", address(vault));
         console2.log("asset           ", asset);
-        console2.log("registry        ", registry);
+        console2.log("clearinghouse   ", clear);
+        console2.log("seaport (zone = vault)", seaport);
         console2.log("priceFeed       ", feed);
         console2.log("admin           ", admin);
         console2.log("feeRecipient    ", feeRecipient);
@@ -113,21 +109,32 @@ contract DeployVault is Script {
         console2.log("NEXT: script/Configure.s.sol grants KEEPER_ROLE and GUARDIAN_ROLE (docs/DEPLOY.md).");
     }
 
-    /// @dev Refuse to deploy against a registry that does not describe this pair. Getting this
-    ///      wrong is silent until the first roll, and by then it is collateralised.
-    function _preflight(address asset, address usdg, address clear, address registry, address feed) internal view {
-        IOvercallRegistry r = IOvercallRegistry(registry);
-        require(r.collateralToken() == asset, "registry collateral != asset");
-        require(r.exerciseToken() == usdg, "registry exercise != usdg");
-        require(r.clearinghouse() == clear, "registry clearinghouse != clear");
-        require(r.lotSize() == 1e18, "unexpected lot size");
+    /// @dev Refuse to deploy against dependencies that do not have the shape the vault assumes.
+    ///      Getting any of these wrong is silent until the first fill, and by then it is collateralised.
+    function _preflight(address asset, address usdg, address clear, address seaport, address feed) internal view {
+        // Decimals: every unit convention in {Policy} rests on an 18-decimal asset and a 6-decimal USDG.
+        require(IERC20Metadata(asset).decimals() == 18, "asset decimals != 18");
+        require(IERC20Metadata(usdg).decimals() == 6, "usdg decimals != 6");
+
+        // Clear sanity: upstream 6436c82 ships `feeBps == 15` as a constant and the switch off. The
+        // vault honours a later switch-on only once governance accepts the fee.
+        IValoremClear c = IValoremClear(clear);
+        require(c.feeBps() == 15, "clear feeBps != 15");
+        require(!c.feesEnabled(), "clear fee switch is ON: accept it explicitly after deploy, or wait");
+        require(c.supportsInterface(0xd9b67a26), "clear is not ERC-1155");
+
+        // Seaport 1.6 with the canonical ConduitController, so `authorizeOrder` runs before any
+        // transfer on every fulfilment path (integrations/seaport.md).
+        (string memory version,, address controller) = ISeaport(seaport).information();
+        require(keccak256(bytes(version)) == keccak256("1.6"), "seaport is not 1.6");
+        require(controller == 0x00000000F9490004C11Cef243f5400493c00Ad63, "unexpected conduit controller");
 
         (, int256 answer,, uint256 updatedAt,) = IChainlinkFeed(feed).latestRoundData();
         require(answer > 0, "feed answer <= 0");
         require(updatedAt > 0, "feed never updated");
         require(IChainlinkFeed(feed).decimals() == 8, "unexpected feed decimals");
 
-        console2.log("preflight OK. registry cycle:", r.cycleNumber());
+        console2.log("preflight OK. clear feeTo:", c.feeTo());
         console2.log("feed answer (8dp):", uint256(answer));
         console2.log("feed age (s):", block.timestamp - updatedAt);
     }

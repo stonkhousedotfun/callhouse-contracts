@@ -32,7 +32,7 @@ contract AF02_UsdgFreezeRollClose is BaseTest {
     ///      the buyer exercises `assigned` contracts in the window.
     function _setupWeek(uint112 assigned) internal returns (uint256 bobShares) {
         _deposit(alice, 20e18);
-        optionId = _rollOpen(10);
+        optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
         _fill(c, 10);
 

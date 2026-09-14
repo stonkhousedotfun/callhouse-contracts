@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {ISeaport, OrderComponents, OrderParameters} from "../../src/interfaces/ISeaport.sol";
+import {ISeaport, Order, OrderComponents, OrderParameters} from "../../src/interfaces/ISeaport.sol";
 
 /*//////////////////////////////////////////////////////////////
                     SEAPORT 1.6 FULFILMENT TYPES
@@ -36,8 +36,82 @@ struct Fulfillment {
     FulfillmentComponent[] considerationComponents;
 }
 
+/// @dev Seaport's basic-order route enum, all 24 values in declaration order. The vault's listings are
+///      `ERC20_TO_ERC1155_PARTIAL_RESTRICTED` (15): the fulfiller pays ERC20 for the offerer's ERC1155,
+///      and `basicOrderType % 4` must equal the order's `orderType` (PARTIAL_RESTRICTED = 3).
+enum BasicOrderType {
+    ETH_TO_ERC721_FULL_OPEN,
+    ETH_TO_ERC721_PARTIAL_OPEN,
+    ETH_TO_ERC721_FULL_RESTRICTED,
+    ETH_TO_ERC721_PARTIAL_RESTRICTED,
+    ETH_TO_ERC1155_FULL_OPEN,
+    ETH_TO_ERC1155_PARTIAL_OPEN,
+    ETH_TO_ERC1155_FULL_RESTRICTED,
+    ETH_TO_ERC1155_PARTIAL_RESTRICTED,
+    ERC20_TO_ERC721_FULL_OPEN,
+    ERC20_TO_ERC721_PARTIAL_OPEN,
+    ERC20_TO_ERC721_FULL_RESTRICTED,
+    ERC20_TO_ERC721_PARTIAL_RESTRICTED,
+    ERC20_TO_ERC1155_FULL_OPEN,
+    ERC20_TO_ERC1155_PARTIAL_OPEN,
+    ERC20_TO_ERC1155_FULL_RESTRICTED,
+    ERC20_TO_ERC1155_PARTIAL_RESTRICTED,
+    ERC721_TO_ERC20_FULL_OPEN,
+    ERC721_TO_ERC20_PARTIAL_OPEN,
+    ERC721_TO_ERC20_FULL_RESTRICTED,
+    ERC721_TO_ERC20_PARTIAL_RESTRICTED,
+    ERC1155_TO_ERC20_FULL_OPEN,
+    ERC1155_TO_ERC20_PARTIAL_OPEN,
+    ERC1155_TO_ERC20_FULL_RESTRICTED,
+    ERC1155_TO_ERC20_PARTIAL_RESTRICTED
+}
+
+struct AdditionalRecipient {
+    uint256 amount;
+    address payable recipient;
+}
+
+/// @dev Seaport 1.6 `BasicOrderParameters`, field order per `ConsiderationStructs.sol`. On the
+///      ERC20_TO_ERC1155 routes the "offer" is the offerer's ERC1155 and the "consideration" the ERC20
+///      the fulfiller pays to the offerer; the derived order hash must equal the validated one.
+struct BasicOrderParameters {
+    address considerationToken;
+    uint256 considerationIdentifier;
+    uint256 considerationAmount;
+    address payable offerer;
+    address zone;
+    address offerToken;
+    uint256 offerIdentifier;
+    uint256 offerAmount;
+    BasicOrderType basicOrderType;
+    uint256 startTime;
+    uint256 endTime;
+    bytes32 zoneHash;
+    uint256 salt;
+    bytes32 offererConduitKey;
+    bytes32 fulfillerConduitKey;
+    uint256 totalOriginalAdditionalRecipients;
+    AdditionalRecipient[] additionalRecipients;
+    bytes signature;
+}
+
+/// @dev The Seaport 1.6 errors the write-on-fill tests pin.
+interface ISeaportErrors {
+    error OrderAlreadyFilled(bytes32 orderHash);
+    error OrderPartiallyFilled(bytes32 orderHash);
+    error InvalidRestrictedOrder(bytes32 orderHash);
+    error InvalidTime(uint256 startTime, uint256 endTime);
+    error NoSpecifiedOrdersAvailable();
+    error NoReentrantCalls();
+    error OrderIsCancelled(bytes32 orderHash);
+}
+
 /// @notice The Seaport 1.6 fulfilment entry points a buyer uses.
 interface ISeaportFulfil {
+    function fulfillOrder(Order calldata order, bytes32 fulfillerConduitKey) external payable returns (bool fulfilled);
+
+    function fulfillBasicOrder(BasicOrderParameters calldata parameters) external payable returns (bool fulfilled);
+
     function fulfillAdvancedOrder(
         AdvancedOrder calldata advancedOrder,
         CriteriaResolver[] calldata criteriaResolvers,
@@ -55,12 +129,14 @@ interface ISeaportFulfil {
         uint256 maximumFulfilled
     ) external payable returns (bool[] memory availableOrders);
 
+    /// @dev Returns `Execution[]` on chain; declared without a return so the compiler does not try to
+    ///      decode it. The tests read the resulting balances instead.
     function matchAdvancedOrders(
         AdvancedOrder[] calldata orders,
         CriteriaResolver[] calldata criteriaResolvers,
         Fulfillment[] calldata fulfillments,
         address recipient
-    ) external payable returns (bool[] memory);
+    ) external payable;
 }
 
 /// @notice Puts the REAL Seaport 1.6 runtime (and its ConduitController) into the test EVM at the

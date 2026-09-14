@@ -11,10 +11,8 @@ import {OrderComponents} from "../../src/interfaces/ISeaport.sol";
 ///      a separate USDG claim, never a bump in the share price. Every number here is asserted
 ///      exactly; a "roughly right" premium split is a wrong premium split.
 ///
-///      Reference numbers, used over and over below. Ten contracts at $2.00:
-///        gross           20.000000 USDG   (buyer pays)
-///        Overcall 5%      1.000000 USDG   (consideration[1], rounded PER CONTRACT)
-///        to the vault    19.000000 USDG   (consideration[0])
+///      Reference numbers, used over and over below. Ten contracts at $1.90:
+///        to the vault    19.000000 USDG   (the buyer pays it all to the vault: one consideration item)
 ///        protocol 5%      0.950000 USDG   (of the premium harvested, i.e. of the 19)
 ///        to holders      18.050000 USDG
 ///
@@ -33,17 +31,10 @@ contract VaultDistributorTest is BaseTest {
                                 HELPERS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Roll the fixture on to a fresh weekly cycle. The registry's writing window closes
-    ///      at the exercise timestamp, so a second cycle needs new option types and new
-    ///      timings or `rollOpen` reverts with WritingNotOpen.
+    /// @dev Roll the fixture on to a fresh weekly cycle: last week's option types have expired,
+    ///      so a second cycle needs new types and new timings, and a fresh feed round.
     function _newWeek() internal {
-        exerciseTs = uint40(block.timestamp + 6 days);
-        expiryTs = uint40(block.timestamp + 7 days);
-        _installCycle();
-        // A week has passed, so the fixture's feed is now older than MAX_PRICE_AGE. A live
-        // keeper would be looking at a fresh round; without this every second roll reverts
-        // with StalePrice for reasons that have nothing to do with the accrual under test.
-        feed.setUpdatedAt(block.timestamp);
+        _nextWeek();
     }
 
     /// @dev Everything the vault's USDG balance is spoken for: every holder's claim, the
@@ -81,7 +72,7 @@ contract VaultDistributorTest is BaseTest {
         assertEq(vault.totalUsdgDistributed(), 0, "nothing distributed yet");
 
         uint256 gross = _fullCycleOtm(10, _okUnitPrice());
-        assertEq(gross, 20_000_000, "$2.00 x 10 contracts");
+        assertEq(gross, 19_000_000, "$1.90 x 10 contracts, all of it the vault's");
 
         // 18.050000 USDG over 30 shares, 1e27-scaled, floored.
         assertEq(vault.accUsdgPerShare(), 601_666_666_666_666, "index credited");
@@ -227,10 +218,10 @@ contract VaultDistributorTest is BaseTest {
         assertEq(vault.claimableUsdg(alice), 18_050_000, "alice keeps the week she sat through");
         assertEq(vault.claimableUsdg(bob), 0, "bob inherits shares, not accrued premium");
 
-        // Week two: $3.00 x 10 => Overcall 0.150000 per contract, 28.500000 to the vault,
-        // 1.425000 fee (5% of 28.5), 27.075000 net - which indexes exactly over 20e18 shares.
+        // Week two: $2.85 x 10 => 28.500000 to the vault, 1.425000 fee (5% of 28.5), 27.075000
+        // net - which indexes exactly over 20e18 shares.
         _newWeek();
-        _fullCycleOtm(10, 3_000_000);
+        _fullCycleOtm(10, 2_850_000);
 
         assertEq(vault.claimableUsdg(bob), 27_075_000, "bob earns the week he actually held");
         assertEq(vault.claimableUsdg(alice), 18_050_000, "alice earns nothing after selling");
@@ -269,21 +260,18 @@ contract VaultDistributorTest is BaseTest {
                              PROTOCOL FEE
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Fee is 5% of the premium the VAULT harvested, not of what the buyer paid: Overcall's
-    ///      5% never touches the vault, so charging on it would be charging on money we never
-    ///      had. This week is out of the money, so all 19.000000 harvested is premium.
+    /// @dev Fee is 5% of the premium the vault harvested. This week is out of the money, so all
+    ///      19.000000 harvested is premium.
     function test_protocolFeeIsExactlyFivePercentAndLandsAtFeeSafe() public {
         _deposit(alice, 20e18);
 
-        uint256 optionId = _rollOpen(10);
+        uint256 optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
         _fill(c, 10);
 
-        (uint256 toVault, uint256 toOvercall, uint256 gross) = _splitPremium(_okUnitPrice(), 10);
-        assertEq(gross, 20_000_000, "buyer paid");
-        assertEq(toOvercall, 1_000_000, "Overcall's 5%");
-        assertEq(usdg.balanceOf(overcallFee), toOvercall, "Overcall was paid in the same fill");
-        assertEq(usdg.balanceOf(address(vault)), toVault, "the vault received 95% of gross");
+        uint256 toVault = _okUnitPrice() * 10;
+        assertEq(toVault, 19_000_000, "buyer paid $1.90 x 10, all to the vault");
+        assertEq(usdg.balanceOf(address(vault)), toVault, "the vault received the whole premium");
 
         _warpToExercise();
         vault.lockBook();
@@ -314,7 +302,7 @@ contract VaultDistributorTest is BaseTest {
         uint256 assetsBefore = vault.totalAssets();
         uint256 perShareBefore = vault.convertToAssets(1e18);
 
-        uint256 optionId = _rollOpen(10);
+        uint256 optionId = _rollOpen();
         _approveListing(optionId, 10, _okUnitPrice());
         // Nobody fills.
 
@@ -366,11 +354,11 @@ contract VaultDistributorTest is BaseTest {
         assertEq(vault.accUsdgPerShare(), 902_500_000_000_000, "week one index");
         assertEq(vault.claimableUsdg(alice), 18_050_000, "week one");
 
-        // Week two: $3.00 x 5 => 14.250000 to the vault, 0.712500 fee, 13.537500 net.
+        // Week two: $2.85 x 5 => 14.250000 to the vault, 0.712500 fee, 13.537500 net.
         // 13_537_500 * 1e27 / 20e18 = 676_875_000_000_000; 902_500_000_000_000 + that =
         // 1_579_375_000_000_000. Fees: 950_000 + 712_500 = 1_662_500.
         _newWeek();
-        _fullCycleOtm(5, 3_000_000);
+        _fullCycleOtm(5, 2_850_000);
 
         assertEq(vault.accUsdgPerShare(), 1_579_375_000_000_000, "index accumulated, not replaced");
         assertEq(vault.claimableUsdg(alice), 31_587_500, "both weeks");
@@ -406,9 +394,9 @@ contract VaultDistributorTest is BaseTest {
         uint256 shares = _deposit(alice, 1e34);
         assertEq(shares, 1e34, "first deposit is 1:1");
 
-        // Week one: $1.00 x 5 => Overcall 0.050000 per contract, 4.750000 to the vault,
-        // 0.237500 fee, 4.512500 net. 4_512_500 * 1e27 / 1e34 = 0.45 of a unit, floored to 0.
-        _fullCycleOtm(5, 1_000_000);
+        // Week one: $0.95 x 5 => 4.750000 to the vault, 0.237500 fee, 4.512500 net.
+        // 4_512_500 * 1e27 / 1e34 = 0.45 of a unit, floored to 0.
+        _fullCycleOtm(5, 950_000);
 
         assertEq(vault.accUsdgPerShare(), 0, "too small to index at all");
         assertEq(vault.totalUsdgDistributed(), 0, "nothing could be credited");
@@ -417,7 +405,7 @@ contract VaultDistributorTest is BaseTest {
         assertEq(usdg.balanceOf(feeSafe), 237_500, "the fee was still taken on a real harvest");
         assertEq(usdg.balanceOf(address(vault)), 4_512_500, "the money is in the vault, just unindexed");
 
-        // Week two: $2.00 x 49 => 93.100000 to the vault, 4.655000 fee, 88.445000 net.
+        // Week two: $1.90 x 49 => 93.100000 to the vault, 4.655000 fee, 88.445000 net.
         // On its own 88.445000 would index to 8 units (80.000000). The pot is 88.445000 + the
         // 4.512500 carried = 92.957500, which indexes to 9 units (90.000000) and carries
         // 2.957500 forward again.
@@ -458,7 +446,7 @@ contract VaultDistributorTest is BaseTest {
         nvda.mint(address(vault), 2e18 - 1);
         assertEq(vault.totalSupply(), 0, "no shares exist");
 
-        // One contract at $2.00 => 1.900000 to the vault, 0.095000 fee, 1.805000 net.
+        // One contract at $1.90 => 1.900000 to the vault, 0.095000 fee, 1.805000 net.
         _fullCycleOtm(1, _okUnitPrice());
 
         assertEq(vault.usdgUnallocated(), 1_805_000, "parked, with nobody to credit");
@@ -472,7 +460,7 @@ contract VaultDistributorTest is BaseTest {
         assertEq(shares, 10, "donation inflated the price: 2e18 assets per share");
         assertEq(vault.claimableUsdg(alice), 0, "nothing credited to her on deposit");
 
-        // Week two: $2.00 x 10 => 19.000000 to the vault, 0.950000 fee, 18.050000 net.
+        // Week two: $1.90 x 10 => 19.000000 to the vault, 0.950000 fee, 18.050000 net.
         // The orphaned 1.805000 rides along and is NOT charged a fee a second time: had it
         // been, the fee would be 5% of 20.805000 = 1.040250, not 0.950000.
         _newWeek();
@@ -534,9 +522,7 @@ contract VaultDistributorTest is BaseTest {
         // then have to come back to him by two different routes, `claimUsdg` and
         // `completeRedeem`. Queueing everything would only exercise the escrow route.
         _newWeek();
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
 
         vm.prank(bob);
         vault.queueRedeem(5e18);
@@ -591,8 +577,7 @@ contract VaultDistributorTest is BaseTest {
     ///      they sold, while keeping every previous week in full.
     ///
     ///      The arithmetic, by hand:
-    ///        week one, 10 x $2.00: buyer pays 20.000000, Overcall takes 5% per contract
-    ///          (0.100000 x 10 = 1.000000), the vault receives 19.000000, the protocol takes
+    ///        week one, 10 x $1.90: the vault receives 19.000000, the protocol takes
     ///          5% of that premium (0.950000) and 18.050000 indexes over a 30e18 supply.
     ///          The index floors to 601_666_666_666_666, crediting 18.049999 and carrying one
     ///          base unit as dust. alice 20/30 -> 12.033333, bob 10/30 -> 6.016666.
@@ -616,9 +601,7 @@ contract VaultDistributorTest is BaseTest {
         // Week two: open, list and FILL, but do not close. The premium is now physically in
         // the vault and still belongs to nobody.
         _newWeek();
-        uint256 optionId = _rollOpen(10);
-        OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
 
         // Week one's whole net (18.049999 credited + 1 carried) plus week two's 19.000000.
         assertEq(usdg.balanceOf(address(vault)), 18_050_000 + 19_000_000, "week two's premium has landed");
@@ -662,18 +645,15 @@ contract VaultDistributorTest is BaseTest {
                               PARTIAL FILL
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev F-03 at its awkward edge. The listing is PARTIAL_OPEN, so a buyer may take four of
-    ///      ten contracts, and the vault must harvest exactly four contracts' worth and no
-    ///      more. The unit price is chosen so nothing divides evenly, which pins the two
-    ///      roundings that a "roughly right" implementation would get backwards.
+    /// @dev F-03 at its awkward edge. The listing is PARTIAL_RESTRICTED, so a buyer may take four
+    ///      of ten contracts, and the vault must write and harvest exactly four contracts' worth
+    ///      and no more. The unit price is chosen so nothing divides evenly, which pins the
+    ///      rounding that a "roughly right" implementation would get backwards.
     ///
-    ///      The arithmetic, by hand, at $1.234567 per contract:
-    ///        Overcall's 5% is floored PER CONTRACT: 1_234_567 * 500 / 10_000 = 61_728
-    ///          (61_728.35 truncated), so the vault's share is 1_172_839 per contract.
-    ///        Listing 10 puts 11_728_390 and 617_280 in the two consideration items; filling 4
-    ///          pays 4/10 of each, which is 4_691_356 and 246_912 - both exactly four times
-    ///          the per-contract figures, which is the whole point of flooring per contract
-    ///          rather than on the total.
+    ///      The arithmetic, by hand, at $1.172839 per contract:
+    ///        Listing 10 puts 11_728_390 in the consideration item; filling 4 pays 4/10 of it,
+    ///          which is 4_691_356, exactly four times the per-contract figure: the gross is an
+    ///          exact multiple of the order size, so every fraction Seaport can express is exact.
     ///        The protocol fee is 5% of the 4_691_356 of premium harvested, floored: 234_567
     ///          (234_567.8 truncated), leaving 4_456_789 for holders. 234_567 * 20 is
     ///          4_691_340, sixteen units short of the gross, and the 0.8 of a unit the floor
@@ -683,14 +663,14 @@ contract VaultDistributorTest is BaseTest {
         _deposit(alice, 20e18);
         uint256 assetsBefore = vault.totalAssets();
 
-        uint256 unitPrice = 1_234_567;
-        uint256 optionId = _rollOpen(10);
+        uint256 unitPrice = 1_172_839;
+        uint256 optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, unitPrice);
         _fill(c, 4);
 
         assertEq(usdg.balanceOf(address(vault)), 4_691_356, "the vault was paid for four contracts only");
-        assertEq(usdg.balanceOf(overcallFee), 246_912, "Overcall's 5% on four contracts, floored per contract");
-        assertEq(usdg.balanceOf(address(vault)) + usdg.balanceOf(overcallFee), unitPrice * 4, "and that is the gross");
+        assertEq(usdg.balanceOf(address(vault)), unitPrice * 4, "and that is the gross");
+        assertEq(vault.contractsWritten(), 4, "and wrote exactly the four it sold");
 
         _warpToExercise();
         vault.lockBook();
@@ -707,9 +687,9 @@ contract VaultDistributorTest is BaseTest {
         assertEq(vault.claimableUsdg(alice), 4_456_789, "sole holder takes all of it");
         assertEq(vault.usdgDust(), 0, "20e18 shares divide it exactly");
 
-        // The six unsold contracts were still collateralised; they expire worthless in the
-        // vault and the collateral comes back whole.
-        assertEq(vault.totalAssets(), assetsBefore, "all ten lots of collateral returned");
+        // The six unsold contracts were never written, so there was nothing to expire; the four
+        // that were come back whole.
+        assertEq(vault.totalAssets(), assetsBefore, "all four lots of collateral returned");
         assertEq(vault.contractsWritten(), 0, "position closed");
         _assertUsdgInvariant("after a partial fill");
     }
@@ -746,7 +726,7 @@ contract VaultDistributorTest is BaseTest {
 
         // Out of the money, so everything the vault harvests is premium and all of it is
         // fee-bearing at 5%.
-        (uint256 toVault,,) = _splitPremium(unitPrice, n);
+        uint256 toVault = unitPrice * n;
         uint256 expectedFee = (toVault * 500) / 10_000;
         uint256 expectedNet = toVault - expectedFee;
 
@@ -797,7 +777,7 @@ contract VaultDistributorTest is BaseTest {
         unitPrice = bound(unitPrice, 880_000, 5_000_000);
 
         // Out of the money: the whole harvest is premium, so the pot is it less a 5% fee.
-        (uint256 toVault,,) = _splitPremium(unitPrice, n);
+        uint256 toVault = unitPrice * n;
         uint256 pot = toVault - (toVault * 500) / 10_000;
 
         _fullCycleOtm(n, unitPrice);

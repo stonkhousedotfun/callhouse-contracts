@@ -143,12 +143,11 @@ contract VaultDepositTest is BaseTest {
                                 PHASES
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev New money in Listed must sit in idle, NOT be bolted onto the open short. A late
-    ///      depositor who could be assigned against a call written before they arrived would
-    ///      be paying for someone else's week.
+    /// @dev New money in Listed sits in idle and is NOT bolted onto the open short; it does add
+    ///      write capacity for the next fill, which is sized on total assets (decision D9).
     function test_depositAndMintWorkWhileListed() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
 
         assertEq(_phase(), 1, "Listed");
         assertEq(vault.contractsWritten(), 10, "10 contracts written");
@@ -173,7 +172,7 @@ contract VaultDepositTest is BaseTest {
 
     function test_depositRevertsInExercisable() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
         _warpToExercise();
         vault.lockBook();
         assertEq(_phase(), 2, "Exercisable");
@@ -187,7 +186,7 @@ contract VaultDepositTest is BaseTest {
 
     function test_mintRevertsInExercisable() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
         _warpToExercise();
         vault.lockBook();
 
@@ -310,7 +309,7 @@ contract VaultDepositTest is BaseTest {
         _deposit(bob, 20e18);
         assertEq(vault.maxDeposit(carol), 0, "full while flat");
 
-        _rollOpen(47); // 95% utilization of 50 idle
+        _openAndSell(47); // 95% utilization of 50 idle: every one of them written by a fill
         assertEq(vault.lockedAssets(), 47e18, "collateral left the vault balance");
         assertEq(nvda.balanceOf(address(vault)), 3e18, "and the raw balance really did drop");
         assertEq(vault.totalAssets(), DEPOSIT_CAP, "but NAV is unchanged: 3e18 idle + 47e18 locked");
@@ -335,7 +334,7 @@ contract VaultDepositTest is BaseTest {
     ///      It now returns 0 outside Idle and Listed, and `maxMint` mirrors it.
     function test_maxDepositRespectsThePhaseGate() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
 
         // Listed is a phase where `deposit` works, so the quote must be live and exact:
         // 20e18 of NAV against a 50e18 cap leaves 30e18, whether or not it is locked.
@@ -456,7 +455,7 @@ contract VaultDepositTest is BaseTest {
 
     function test_redeemRevertsUseQueueOnceACallIsOpen() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
 
         assertFalse(vault.canRedeemInstantly(), "a call is open");
 
@@ -467,7 +466,7 @@ contract VaultDepositTest is BaseTest {
 
     function test_withdrawRevertsUseQueueOnceACallIsOpen() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
 
         vm.prank(alice);
         vm.expectRevert(Vault.UseQueue.selector);
@@ -479,7 +478,7 @@ contract VaultDepositTest is BaseTest {
     ///      paying an early exit out of idle would hand the assignment risk to whoever stayed.
     function test_useQueueEvenWhenIdleCouldCoverIt() public {
         _deposit(alice, 20e18);
-        _rollOpen(10);
+        _openAndSell(10);
         assertEq(vault.idleAssets(), 10e18, "idle could cover a small exit");
 
         vm.prank(alice);
@@ -494,7 +493,7 @@ contract VaultDepositTest is BaseTest {
         assertEq(vault.previewRedeem(10e18), 10e18, "flat: the real figure");
         assertEq(vault.previewWithdraw(10e18), 10e18, "flat: the real figure");
 
-        _rollOpen(10);
+        _openAndSell(10);
 
         assertEq(vault.previewRedeem(10e18), 0, "open: quotes nothing");
         assertEq(vault.previewWithdraw(10e18), 0, "open: quotes nothing");
@@ -659,9 +658,7 @@ contract VaultDepositTest is BaseTest {
     ///      shares start from the fixed index.
     ///
     ///      HAND-CHECKED ARITHMETIC (verify against the fixture, do not trust the number):
-    ///        buyer pays 10 contracts x $2.00           = 20_000_000 USDG gross
-    ///        Overcall's 5%, floored per contract       =  1_000_000 to overcallFee
-    ///        vault receives                            = 19_000_000
+    ///        buyer pays 10 contracts x $1.90           = 19_000_000 USDG, all of it to the vault
     ///        protocol fee, 5% of the premium           =    950_000, held in pendingFeeUsdg
     ///          (a checkpoint passes feeFree 0; strike proceeds cannot be here yet)
     ///        net pushed into the index                 = 18_050_000
@@ -677,7 +674,7 @@ contract VaultDepositTest is BaseTest {
     function test_lateDepositorInListedDoesNotEarnTheWeeksPremium() public {
         _deposit(alice, 20e18);
 
-        uint256 optionId = _rollOpen(10);
+        uint256 optionId = _rollOpen();
         OrderComponents memory c = _approveListing(optionId, 10, _okUnitPrice());
         _fill(c, 10);
 
@@ -725,7 +722,7 @@ contract VaultDepositTest is BaseTest {
     function test_capCountsCollateralWrittenIntoValorem() public {
         _deposit(alice, 30e18);
         _deposit(bob, 20e18);
-        _rollOpen(47);
+        _openAndSell(47);
 
         assertEq(vault.maxDeposit(carol), 0, "a full vault stays full while short");
     }

@@ -8,10 +8,8 @@ import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../src/mocks/MockStockToken.sol";
 import {MockFeed} from "../src/mocks/MockFeed.sol";
 import {MockClear} from "../src/mocks/MockClear.sol";
-import {MockRegistry} from "../src/mocks/MockRegistry.sol";
 import {MockSeaport} from "../src/mocks/MockSeaport.sol";
 import {IValoremClear} from "../src/interfaces/IValoremClear.sol";
-import {IOvercallRegistry} from "../src/interfaces/IOvercallRegistry.sol";
 import {IChainlinkFeed} from "../src/interfaces/IChainlinkFeed.sol";
 import {
     ISeaport,
@@ -29,6 +27,14 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///      20:00 UTC and expiry Saturday 20:00 UTC, exactly 24h apart. Spot is set to $220 so the
 ///      226 rung sits just BELOW the 3% floor and the 246 rung just above the 12% ceiling,
 ///      which makes both band edges testable with real-shaped inputs.
+///
+///      NO REGISTRY. The vault validates option types from the clearinghouse alone, so the fixture
+///      creates the five weekly types directly on Clear (mock or real) with our own tuple and
+///      hands the vault whichever id a test wants to arm.
+///
+///      WRITE ON FILL. `_rollOpen()` ARMS a type and writes nothing; `_approveListing` lists up
+///      to capacity; every `_fill` writes exactly what it sells inside the vault's zone hook.
+///      `_openAndSell(n)` chains the three for the many tests that want "n written and sold".
 abstract contract BaseTest is Test {
     /*//////////////////////////////////////////////////////////////
                                  ACTORS
@@ -38,7 +44,6 @@ abstract contract BaseTest is Test {
     address internal keeper = makeAddr("keeper");
     address internal guardian = makeAddr("guardian");
     address internal feeSafe = makeAddr("feeSafe");
-    address internal overcallFee = 0xdAe7e82A2E7D566C67E87C164B05a1C560190782;
 
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
@@ -58,8 +63,13 @@ abstract contract BaseTest is Test {
     /// @dev The same address as {clear} when the mock is in use, typed for the mock-only test
     ///      helpers (`setFeesEnabled`, `setFeeBps`, bucket views). Zero under the real bytecode.
     MockClear internal mockClear;
-    MockRegistry internal registry;
-    MockSeaport internal seaport;
+    /// @dev The Seaport the vault is wired to. {MockSeaport} by default (with the verified 1.6 hook
+    ///      order); a suite that needs the genuine fulfilment paths overrides {_deploySeaport} (see
+    ///      test/helpers/RealSeaportBase.sol) and {_fill}.
+    ISeaport internal seaport;
+    /// @dev The same address as {seaport} when the mock is in use, typed for the mock-only helpers
+    ///      (`fulfil`, `validated`, `cancelled`, `filled`). Zero under the real bytecode.
+    MockSeaport internal mockSeaport;
     MockFeed internal feed;
     Vault internal vault;
 
@@ -96,8 +106,7 @@ abstract contract BaseTest is Test {
         nvda = new MockStockToken("NVDA Stock Token", "NVDAx");
         usdg = new MockERC20("Global Dollar", "USDG", 6);
         clear = _deployClear();
-        registry = new MockRegistry(address(nvda), address(usdg), address(clear));
-        seaport = new MockSeaport();
+        seaport = _deploySeaport();
         feed = new MockFeed(8, SPOT_FEED, "NVDA / USD");
 
         // Fund BEFORE creating option types: Valorem's `newOptionType` (real and mock alike) requires
@@ -118,12 +127,9 @@ abstract contract BaseTest is Test {
                 usdg: IERC20(address(usdg)),
                 clear: IValoremClear(address(clear)),
                 seaport: ISeaport(address(seaport)),
-                registry: IOvercallRegistry(address(registry)),
                 priceFeed: IChainlinkFeed(address(feed)),
                 maxPriceAge: MAX_PRICE_AGE,
-                overcallFeeRecipient: overcallFee,
                 conduitKey: bytes32(0),
-                seaportZone: address(0),
                 admin: admin,
                 feeRecipient: feeSafe,
                 depositCap: DEPOSIT_CAP,
@@ -149,7 +155,14 @@ abstract contract BaseTest is Test {
         return IValoremClear(address(mockClear));
     }
 
-    /// @dev Create the five Valorem option types and register them as this week's cycle.
+    /// @dev The Seaport to wire the vault to. The default is the hook-faithful {MockSeaport}; override to
+    ///      etch the real 1.6 runtime (test/helpers/RealSeaportBase.sol), and override {_fill} with it.
+    function _deploySeaport() internal virtual returns (ISeaport) {
+        mockSeaport = new MockSeaport();
+        return ISeaport(address(mockSeaport));
+    }
+
+    /// @dev Create this week's five option types on the clearinghouse, as the keeper would.
     function _installCycle() internal {
         delete optionIds;
         delete strikes;
@@ -160,7 +173,16 @@ abstract contract BaseTest is Test {
             optionIds.push(id);
             strikes.push(s[i]);
         }
-        registry.setCycleWithStrikes(optionIds, strikes, exerciseTs, expiryTs);
+    }
+
+    /// @dev Roll the fixture forward to a fresh week from now: new types, and a re-stamped feed. A
+    ///      week has passed since the fixture published the price and the vault's staleness gate
+    ///      would refuse the arm against a frozen `updatedAt`; a live feed keeps ticking.
+    function _nextWeek() internal {
+        exerciseTs = uint40(block.timestamp + 6 days);
+        expiryTs = uint40(block.timestamp + 7 days);
+        _installCycle();
+        feed.setAnswer(SPOT_FEED);
     }
 
     function _fund(address who, uint256 nvdaAmount, uint256 usdgAmount) internal {
@@ -176,29 +198,22 @@ abstract contract BaseTest is Test {
         vm.stopPrank();
     }
 
-    /// @dev Write `n` contracts against the nearest in-band rung.
-    function _rollOpen(uint112 n) internal returns (uint256 optionId) {
+    /// @dev ARM the nearest in-band rung. Nothing is written until a fill.
+    function _rollOpen() internal returns (uint256 optionId) {
         optionId = optionIds[RUNG_PICK];
         vm.prank(keeper);
-        vault.rollOpen(optionId, n);
+        vault.rollOpen(optionId);
     }
 
-    /// @dev Top this cycle's claim up by `n` contracts as the keeper.
-    function _writeMore(uint112 n) internal {
-        vm.prank(keeper);
-        vault.writeMore(n);
-    }
-
-    /// @dev Build an order in exactly the shape Overcall publishes.
-    ///      zone 0, zoneHash 0, conduitKey 0, orderType PARTIAL_OPEN, startTime 0, endTime =
-    ///      the cycle's exercise timestamp, and the 5% fee rounded PER CONTRACT.
+    /// @dev Build an order in exactly the shape the vault authorises under write-on-fill:
+    ///      offerer AND zone the vault, PARTIAL_RESTRICTED, zoneHash 0, conduitKey 0, startTime 0,
+    ///      endTime = the cycle's exercise timestamp, ONE consideration item of `unit x n` USDG to
+    ///      the vault.
     function _buildOrder(uint256 optionId, uint256 contractsCount, uint256 unitPriceUsdg)
         internal
         view
         returns (OrderComponents memory c)
     {
-        (uint256 toVault, uint256 toOvercall,) = _splitPremium(unitPriceUsdg, contractsCount);
-
         OfferItem[] memory offer = new OfferItem[](1);
         offer[0] = OfferItem({
             itemType: ItemType.ERC1155,
@@ -208,30 +223,23 @@ abstract contract BaseTest is Test {
             endAmount: contractsCount
         });
 
-        ConsiderationItem[] memory consid = new ConsiderationItem[](2);
+        ConsiderationItem[] memory consid = new ConsiderationItem[](1);
+        uint256 gross = unitPriceUsdg * contractsCount;
         consid[0] = ConsiderationItem({
             itemType: ItemType.ERC20,
             token: address(usdg),
             identifierOrCriteria: 0,
-            startAmount: toVault,
-            endAmount: toVault,
+            startAmount: gross,
+            endAmount: gross,
             recipient: payable(address(vault))
-        });
-        consid[1] = ConsiderationItem({
-            itemType: ItemType.ERC20,
-            token: address(usdg),
-            identifierOrCriteria: 0,
-            startAmount: toOvercall,
-            endAmount: toOvercall,
-            recipient: payable(overcallFee)
         });
 
         c = OrderComponents({
             offerer: address(vault),
-            zone: address(0),
+            zone: address(vault),
             offer: offer,
             consideration: consid,
-            orderType: OrderType.PARTIAL_OPEN,
+            orderType: OrderType.PARTIAL_RESTRICTED,
             startTime: 0,
             endTime: exerciseTs,
             zoneHash: bytes32(0),
@@ -241,22 +249,12 @@ abstract contract BaseTest is Test {
         });
     }
 
-    /// @dev The exact rounding Overcall's client uses: floor the fee PER CONTRACT, then
-    ///      multiply. Rounding on the total makes the order unfillable in fractions.
-    function _splitPremium(uint256 unitPriceUsdg, uint256 contractsCount)
-        internal
-        pure
-        returns (uint256 toVault, uint256 toOvercall, uint256 gross)
-    {
-        uint256 feePerContract = (unitPriceUsdg * 500) / 10_000;
-        toOvercall = feePerContract * contractsCount;
-        toVault = (unitPriceUsdg - feePerContract) * contractsCount;
-        gross = unitPriceUsdg * contractsCount;
-    }
-
-    /// @dev A unit price comfortably above the policy floor (0.40% of spot = $0.88).
+    /// @dev A unit price comfortably above the policy floor (0.40% of spot = $0.88). $1.90 is what
+    ///      the vault netted per contract under the old two-item order at $2.00, so every
+    ///      hand-checked USDG figure in the suites (19 USDG per ten contracts, a 0.95 fee, 18.05
+    ///      net) is unchanged; only the buyer's outlay is.
     function _okUnitPrice() internal pure returns (uint256) {
-        return 2_000_000; // $2.00 per contract
+        return 1_900_000;
     }
 
     function _approveListing(uint256 optionId, uint256 contractsCount, uint256 unitPriceUsdg)
@@ -268,12 +266,26 @@ abstract contract BaseTest is Test {
         vault.approveListing(c);
     }
 
-    /// @dev Fill `fillAmount` of a live order as the buyer.
-    function _fill(OrderComponents memory c, uint256 fillAmount) internal {
+    /// @dev Fill `fillAmount` of a live order as the buyer. The vault's `authorizeOrder` writes
+    ///      exactly `fillAmount` inside the call. Virtual so a real-Seaport suite can route the same
+    ///      fill through `fulfillAdvancedOrder`.
+    function _fill(OrderComponents memory c, uint256 fillAmount) internal virtual {
         vm.startPrank(buyer);
         usdg.approve(address(seaport), type(uint256).max);
-        seaport.fulfil(c, fillAmount);
+        mockSeaport.fulfil(c, fillAmount);
         vm.stopPrank();
+    }
+
+    /// @dev Arm, list `n` at `unitPrice`, and sell all `n`: the vault ends Listed with `n` written
+    ///      and sold and `unitPrice x n` of premium banked.
+    function _openAndSell(uint112 n, uint256 unitPrice) internal returns (uint256 optionId, OrderComponents memory c) {
+        optionId = _rollOpen();
+        c = _approveListing(optionId, n, unitPrice);
+        _fill(c, n);
+    }
+
+    function _openAndSell(uint112 n) internal returns (uint256 optionId, OrderComponents memory c) {
+        return _openAndSell(n, _okUnitPrice());
     }
 
     /// @dev Exercise `n` contracts as the buyer, during the exercise window.
@@ -297,12 +309,10 @@ abstract contract BaseTest is Test {
         vault.rollClose();
     }
 
-    /// @dev Run one clean cycle: open, list, fill, expire out of the money, close.
+    /// @dev Run one clean cycle: arm, list, fill, expire out of the money, close.
     function _fullCycleOtm(uint112 n, uint256 unitPrice) internal returns (uint256 grossPremium) {
-        uint256 optionId = _rollOpen(n);
-        OrderComponents memory c = _approveListing(optionId, n, unitPrice);
-        _fill(c, n);
-        (,, grossPremium) = _splitPremium(unitPrice, n);
+        _openAndSell(n, unitPrice);
+        grossPremium = unitPrice * n;
         _warpToExercise();
         vault.lockBook();
         _warpToExpiry();

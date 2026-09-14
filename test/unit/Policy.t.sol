@@ -31,14 +31,6 @@ contract PolicyHarness {
         Policy.checkPremium(prem, spot, n, p);
     }
 
-    function splitPremium(uint256 unitPrice, uint256 n) external pure returns (uint256, uint256, uint256) {
-        return Policy.splitPremium(unitPrice, n);
-    }
-
-    function minListableUnitPrice() external pure returns (uint256) {
-        return Policy.minListableUnitPrice();
-    }
-
     function maxContracts(uint256 idle, PolicyParams memory p) external pure returns (uint256) {
         return Policy.maxContracts(idle, p);
     }
@@ -223,73 +215,6 @@ contract PolicyTest is Test {
         PolicyParams memory p = _p();
         vm.expectRevert(abi.encodeWithSelector(Policy.PremiumBelowMinimum.selector, uint256(0), uint256(7_200_000)));
         h.checkPremium(0, SPOT, 10, p);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                          OVERCALL 5% SPLIT
-    //////////////////////////////////////////////////////////////*/
-
-    function test_splitPremium_95_5() public view {
-        // $10.00 per contract, 10 contracts.
-        (uint256 toVault, uint256 toOvercall, uint256 gross) = h.splitPremium(10_000_000, 10);
-        assertEq(gross, 100_000_000, "gross is unit * n");
-        assertEq(toOvercall, 5_000_000, "Overcall takes 5%");
-        assertEq(toVault, 95_000_000, "vault keeps 95%");
-    }
-
-    /// @dev The exact rounding Overcall's client uses. A unit price whose 5% does not divide
-    ///      evenly must still produce per-contract-rounded amounts, or Seaport rejects the
-    ///      partial fill with InexactFraction. See ops/recon/R3-overcall-api.md (leekzor/callhouse).
-    function test_splitPremium_roundsPerContractNotOnTotal() public view {
-        // unit price 1_000_019: 5% is 50_000.95, which floors to 50_000 PER CONTRACT.
-        (uint256 toVault, uint256 toOvercall, uint256 gross) = h.splitPremium(1_000_019, 3);
-        assertEq(toOvercall, 50_000 * 3, "fee floors per contract, then multiplies");
-        assertEq(toVault, (1_000_019 - 50_000) * 3, "writer gets the per-contract remainder");
-        assertEq(gross, 1_000_019 * 3);
-
-        // Rounding on the TOTAL would have given a different, unfillable number.
-        // Rounding on the total gives 150_002 here, two base units more than the
-        // per-contract split. That order signs fine and then cannot be partially filled.
-        uint256 totalRounded = (gross * 500) / 10_000;
-        assertEq(totalRounded, 150_002, "total-rounding overshoots");
-        assertEq(toOvercall, 150_000, "per-contract rounding is what Overcall expects");
-        assertTrue(totalRounded != toOvercall, "the two roundings really do differ here");
-        assertTrue((gross - totalRounded) % 3 != 0, "and the total-rounded writer amount is not divisible by N");
-    }
-
-    /// @dev Every consideration amount must be an exact multiple of the order size, which is
-    ///      what makes a PARTIAL_OPEN order fillable in fractions.
-    function testFuzz_splitPremium_amountsDivideByOrderSize(uint256 unitPrice, uint256 n) public view {
-        unitPrice = bound(unitPrice, 20, 1e12);
-        n = bound(n, 1, 1_000);
-        (uint256 toVault, uint256 toOvercall,) = h.splitPremium(unitPrice, n);
-        assertEq(toVault % n, 0, "consideration[0] must divide by N");
-        assertEq(toOvercall % n, 0, "consideration[1] must divide by N");
-    }
-
-    function testFuzz_splitPremium_alwaysSumsToGross(uint256 unitPrice, uint256 n) public view {
-        unitPrice = bound(unitPrice, 0, type(uint64).max);
-        n = bound(n, 0, 10_000);
-        (uint256 toVault, uint256 toOvercall, uint256 gross) = h.splitPremium(unitPrice, n);
-        assertEq(toVault + toOvercall, gross, "split must be lossless");
-    }
-
-    function testFuzz_splitPremium_roundingFavoursVault(uint256 unitPrice, uint256 n) public view {
-        unitPrice = bound(unitPrice, 0, type(uint64).max);
-        n = bound(n, 0, 10_000);
-        (uint256 toVault, uint256 toOvercall, uint256 gross) = h.splitPremium(unitPrice, n);
-        assertGe(toVault * 500, toOvercall * 9_500, "vault never short-changed by rounding");
-        assertLe(toOvercall * 10_000, gross * 500, "Overcall never takes more than 5%");
-    }
-
-    /// @dev Below this unit price the 5% fee floors to zero and Overcall's schema rejects the
-    ///      order outright, so a policy that permits it would produce unlistable weeks.
-    function test_minListableUnitPrice() public view {
-        assertEq(h.minListableUnitPrice(), 20, "5% of 20 base units is the smallest non-zero fee");
-        (, uint256 feeAtFloor,) = h.splitPremium(20, 1);
-        assertEq(feeAtFloor, 1, "fee is exactly 1 base unit at the floor");
-        (, uint256 feeBelow,) = h.splitPremium(19, 1);
-        assertEq(feeBelow, 0, "one below the floor the fee rounds away entirely");
     }
 
     /*//////////////////////////////////////////////////////////////

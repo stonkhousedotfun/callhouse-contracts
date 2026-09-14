@@ -59,6 +59,12 @@ has_role() { cast call "$1" "hasRole(bytes32,address)(bool)" "$2" "$3" --rpc-url
 
 chain=$(cast chain-id --rpc-url "$RPC") || fail "no RPC at $RPC"
 [ "$chain" = 4663 ] || fail "chain id $chain, expected an anvil fork of 4663"
+# The anvil must have been started with --code-size-limit 98304, or the Vault (above EIP-170's 24,576 B)
+# cannot be deployed here although mainnet 4663 accepts it. Probe with the same create eth_call the D17
+# verification used: init code `PUSH2 0x7530 PUSH1 0 RETURN` returns 30,000 zero bytes as runtime.
+if ! cast call --create 0x6175306000f3 --rpc-url "$RPC" >/dev/null 2>&1; then
+  fail "this anvil refuses a 30,000 B contract: restart it with --code-size-limit 98304 (chain 4663 allows 98,304 B)"
+fi
 for a in $FACTORY $SINGLETON $FALLBACK; do
   [ "$(cast codesize "$a" --rpc-url "$RPC")" -gt 0 ] || fail "no Safe contract at $a on this fork"
 done

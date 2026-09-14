@@ -13,17 +13,27 @@ import {Distributor} from "./Distributor.sol";
 import {AdapterValorem} from "./AdapterValorem.sol";
 import {AdapterSeaport} from "./AdapterSeaport.sol";
 import {IValoremClear} from "./interfaces/IValoremClear.sol";
-import {IOvercallRegistry} from "./interfaces/IOvercallRegistry.sol";
 import {IStockToken} from "./interfaces/IStockToken.sol";
 import {IChainlinkFeed} from "./interfaces/IChainlinkFeed.sol";
-import {ISeaport, OrderComponents} from "./interfaces/ISeaport.sol";
+import {ISeaport, IZone, OrderComponents, ZoneParameters} from "./interfaces/ISeaport.sol";
 import {ValoremLib} from "./lib/ValoremLib.sol";
 
 /// @title Vault
 /// @notice A pooled covered-call account for one Robinhood Chain Stock Token.
-/// @dev Deposit the Stock Token, receive shares. Each cycle a keeper writes an Overcall call
-///      on Valorem against the idle balance, lists the option on Seaport for USDG, and after
-///      expiry redeems the claim and distributes the premium. Yield is USDG or it is nothing.
+/// @dev Deposit the Stock Token, receive shares. Each cycle a keeper ARMS a Valorem option type
+///      (`rollOpen`), lists it on Seaport 1.6 for USDG, and every fill of that listing writes
+///      exactly the filled contracts into Valorem inside Seaport's `authorizeOrder` hook, with the
+///      vault as the order's zone. After expiry the vault redeems the claim and distributes the
+///      premium. Yield is USDG or it is nothing.
+///
+///      WRITTEN == SOLD, BY CONSTRUCTION (AUDIT-FINDINGS F-01, decision D1). The vault never holds
+///      an unsold option token: nothing is written at `rollOpen`, `authorizeOrder` writes `k` only
+///      when Seaport is moving `k` tokens to a buyer in the same call, and `validateOrder` reverts
+///      the whole fill if any token stayed behind. Valorem assigns exercise pro rata by amount
+///      written across every writer of an id, so a third party writing into the vault's bucket
+///      and self-exercising can assign the vault at most what it sold, every contract of which
+///      earned a premium. The vault never calls a Seaport fulfil function itself, so its hooks
+///      cannot be bypassed by the one caller Seaport exempts from them (the zone).
 ///
 ///      WHAT THIS CONTRACT DELIBERATELY DOES NOT DO
 ///      - It never marks the short call to market. The share price moves only when the asset
@@ -74,9 +84,6 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice The Stock Token this vault writes calls against.
     IERC20 public immutable asset;
 
-    /// @notice The Overcall registry for this market. One registry per collateral token.
-    IOvercallRegistry public immutable registry;
-
     /// @notice Spot source for the OTM band gate and the UI. Never consulted at settlement.
     IChainlinkFeed public immutable priceFeed;
 
@@ -85,8 +92,9 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     uint32 internal constant MIN_PRICE_AGE = 1 hours;
     uint32 internal constant MAX_PRICE_AGE_CEIL = 7 days;
 
-    // The longest cycle the vault will underwrite (21 days from the write) is compiled into
-    // {ValoremLib.MAX_CYCLE_TENOR}, next to the write gate that enforces it.
+    // The bounds on an option type's window (exercise at least 1 hour out, a window of at least
+    // 1 day, a tenor of at most 21 days) are compiled into {ValoremLib}, next to the arm gate
+    // that enforces them.
 
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
@@ -103,7 +111,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice Maximum asset base units the vault will hold from deposits.
     uint256 public depositCap;
 
-    /// @notice When true, `rollOpen`, `writeMore` and `approveListing` are blocked. Nothing else is.
+    /// @notice When true, `rollOpen`, `approveListing` and every Seaport fill are blocked.
+    ///         Nothing else is.
     bool public writesHalted;
 
     /// @notice Governance has looked at the Valorem engine fee and accepted paying it.
@@ -126,15 +135,16 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      stale price, which this check does catch.
     uint32 public maxPriceAge;
 
-    /// @notice The registry cycle number this vault is currently written into.
+    /// @notice The vault's own cycle counter: incremented by every `rollOpen`. Nothing outside
+    ///         the vault numbers its cycles.
     uint32 public cycleNumber;
 
-    /// @dev Snapshot of the cycle's timings, taken at `rollOpen`. Held locally because the
-    ///      registry will roll forward to the next cycle while this one is still settling.
+    /// @dev Snapshot of the armed option type's window, taken at `rollOpen` from the
+    ///      clearinghouse. The type is immutable in Valorem, so the snapshot is exact.
     uint40 public cycleExerciseTs;
     uint40 public cycleExpiryTs;
 
-    /// @notice Strike of the option written this cycle, USDG base units per contract.
+    /// @notice Strike of the option armed this cycle, USDG base units per contract.
     uint256 public cycleStrikeUsdg;
 
     /// @notice Asset base units promised to settled redemption epochs, excluded from NAV.
@@ -232,14 +242,25 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
 
     error WrongPhase(Phase expected, Phase actual);
     error WritesAreHalted();
-    error WritingNotOpen();
-    error NoCycle();
-    error RegistryAssetMismatch(address expected, address got);
-    error OptionNotApproved(uint256 optionId);
-    error OptionNotInCurrentCycle(uint256 optionId, uint32 optionCycle, uint32 currentCycle);
+    /// @dev `rollOpen` while the previous cycle's claim is still held (a redeem that could not
+    ///      complete). Nothing new is armed until that claim is collected.
+    error StillStranded();
+    /// @dev Mirrors of the {ValoremLib} arm/fill gate errors, declared here so they appear in the
+    ///      vault's ABI; the library is what reverts with them.
+    error NotAnOptionType(uint256 tokenId);
+    error ExerciseTooSoon(uint40 exerciseTs, uint40 earliest);
+    error PremiumBelowFloorAtFill(uint256 grossUsdg, uint256 floorUsdg);
+    error ReserveBreached(uint256 balance, uint256 reserved);
     error ValoremFeeNotAccepted(uint8 feeBps);
     error OraclePaused();
     error StalePrice(uint256 updatedAt, uint256 maxAge);
+    /// @dev The Seaport 1.6 zone hooks accept calls from Seaport and nobody else.
+    error NotSeaport();
+    /// @dev A restricted order named the vault as zone but is not the vault's live listing.
+    error NotLiveListing(bytes32 orderHash);
+    /// @dev After the fill's transfers the vault still held option tokens it did not hold before
+    ///      the fill: the write and the sale disagreed, so the whole fill is reverted.
+    error InventoryLeftBehind(uint256 balance, uint256 baseline);
     error NotYetExercisable(uint40 exerciseTs);
     error NotYetExpired(uint40 expiryTs);
     error UseQueue();
@@ -261,23 +282,22 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      frozen vault, frozen receiver). Nothing moved; the USDG stays owed and collectable.
     error UsdgLegBlocked(uint256 usdgOwed);
     error WriteWindowClosed(uint40 exerciseTs);
-    error ListingStillValid();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev The zone of every listing is the vault itself and is derived, not configured; the
+    ///      clearinghouse is a deploy-time choice (Overcall's instance or one deployed by
+    ///      script/DeployClear.s.sol) and the vault reads everything it needs from it directly.
     struct Config {
         IERC20 asset;
         IERC20 usdg;
         IValoremClear clear;
         ISeaport seaport;
-        IOvercallRegistry registry;
         IChainlinkFeed priceFeed;
         uint32 maxPriceAge;
-        address overcallFeeRecipient;
         bytes32 conduitKey;
-        address seaportZone;
         address admin;
         address feeRecipient;
         uint256 depositCap;
@@ -289,25 +309,14 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         ERC20(c.name, c.symbol)
         Distributor(c.usdg)
         AdapterValorem(c.clear)
-        AdapterSeaport(c.seaport, c.overcallFeeRecipient, c.conduitKey, c.seaportZone)
+        AdapterSeaport(c.seaport, c.conduitKey)
     {
-        if (address(c.asset) == address(0) || c.admin == address(0) || c.feeRecipient == address(0)) revert ZeroAddr();
-
-        // The registry is per-market and immutable on its own side. Bind to it only if it
-        // genuinely describes this vault's pair; a mismatched registry would let the keeper
-        // write calls collateralised by the wrong token.
-        if (c.registry.collateralToken() != address(c.asset)) {
-            revert RegistryAssetMismatch(address(c.asset), c.registry.collateralToken());
-        }
-        if (c.registry.exerciseToken() != address(c.usdg)) {
-            revert RegistryAssetMismatch(address(c.usdg), c.registry.exerciseToken());
-        }
-        if (c.registry.clearinghouse() != address(c.clear)) {
-            revert RegistryAssetMismatch(address(c.clear), c.registry.clearinghouse());
-        }
+        if (
+            address(c.asset) == address(0) || address(c.clear) == address(0) || address(c.seaport) == address(0)
+                || address(c.priceFeed) == address(0) || c.admin == address(0) || c.feeRecipient == address(0)
+        ) revert ZeroAddr();
 
         asset = c.asset;
-        registry = c.registry;
         priceFeed = c.priceFeed;
         _setMaxPriceAge(c.maxPriceAge);
         feeRecipient = c.feeRecipient;
@@ -319,7 +328,8 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
 
         _grantRole(DEFAULT_ADMIN_ROLE, c.admin);
 
-        // Seaport pulls the option tokens straight out of the vault on fill.
+        // Seaport pulls the option tokens straight out of the vault on fill, the moment
+        // `authorizeOrder` has minted them.
         _approveOptionTransfers(address(c.clear));
 
         epochId = 1;
@@ -483,10 +493,13 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      par-style NAV for a book that is already short that call. If the week ends assigned,
     ///      the loss is socialised through the share price to EVERY share, the late ones
     ///      included: the depositor cannot be assigned "against their own collateral" only, and
-    ///      nothing here pretends otherwise. On top of that, {writeMore} lets the keeper write a
-    ///      further tranche against idle balance that includes the new deposit, so late money
-    ///      can also be written against directly. What a late depositor does NOT get is premium
-    ///      indexed before their shares existed ({_checkpointHarvest}).
+    ///      nothing here pretends otherwise. On top of that, every fill sizes its write against
+    ///      the vault's TOTAL assets at that moment ({ValoremLib.writeOnFill}), so a deposit made
+    ///      mid-week adds write capacity and late money can be written against directly; the
+    ///      same holds for assets behind shares that were queued after a fill (decision D9, A-6:
+    ///      queued shares stay in supply and exposed until settlement, exactly as at `rollOpen`).
+    ///      What a late depositor does NOT get is premium indexed before their shares existed
+    ///      ({_checkpointHarvest}).
     ///
     ///      This is intended, and it is why the deposit window shuts at `cycleExerciseTs`: before
     ///      that nothing can be assigned, so the NAV a late depositor pays is not yet marked down
@@ -817,136 +830,199 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
                              PHASE MACHINE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Write this cycle's calls and move to Listed.
-    /// @param optionId_ The Overcall rung to write. Must be approved in the live cycle.
-    /// @param contractsCount Whole lots to write.
-    function rollOpen(uint256 optionId_, uint112 contractsCount) external onlyRole(KEEPER_ROLE) nonReentrant {
+    /// @notice ARM a cycle on a Valorem option type and move to Listed. Writes nothing.
+    /// @dev The keeper names an option id it (or anyone) created with `clear.newOptionType`; the
+    ///      vault validates the type from the clearinghouse itself ({ValoremLib.open}) and
+    ///      snapshots its strike and window. Collateral moves only inside Seaport fills.
+    ///
+    ///      NO REGISTRY, AND THE VAULT NUMBERS ITS OWN CYCLES (decision D16). An earlier design
+    ///      bound the vault to Overcall's per-market registry for the approved rung, the strike and
+    ///      the cycle number. Every fact it supplied is now read from Valorem, where the option
+    ///      tuple is immutable, and every bound it promised is enforced by the arm gate. The vault
+    ///      therefore depends on no third-party key to open a week.
+    ///
+    ///      A STRANDED CLAIM BLOCKS THE NEXT ARM. `claimKey != 0` while Idle means a `rollClose`
+    ///      could not redeem the previous claim; the strike proceeds inside it are owed to the
+    ///      holders of record at that close, and layering a new cycle on top would mix two
+    ///      settlements. Nothing new is armed until that claim is collected.
+    /// @param optionId_ The Valorem option type to arm.
+    function rollOpen(uint256 optionId_) external onlyRole(KEEPER_ROLE) nonReentrant {
         if (phase != Phase.Idle) revert WrongPhase(Phase.Idle, phase);
-
-        (uint256 strikeUsdg, uint32 number, uint40 exerciseTs, uint40 expiryTs) = _write(optionId_, contractsCount);
-
-        cycleNumber = number;
-        cycleExerciseTs = exerciseTs;
-        cycleExpiryTs = expiryTs;
-        cycleStrikeUsdg = strikeUsdg;
-        _resetListingBudget();
-        phase = Phase.Listed;
-
-        emit RollOpen(number, optionId_, contractsCount, strikeUsdg);
-    }
-
-    /// @notice Write another tranche of this cycle's option into the SAME Valorem claim.
-    /// @dev WHY THIS EXISTS. Valorem assigns exercise across EVERY writer of an option id, pro
-    ///      rata by what each wrote (upstream 6436c82 puts every write before the first exercise
-    ///      into one bucket, and a claim's share of a bucket's assignment is its share of the
-    ///      bucket's writes). It does not care who SOLD. A vault that wrote 50 and sold 10, next
-    ///      to other writers who wrote 50 and sold all of it, expects 30 assigned on an
-    ///      in-the-money expiry while only 10 of its contracts ever earned a premium. The unsold
-    ///      inventory is pure exposure. Writing in tranches sized to each listing bounds that
-    ///      exposure by the live listing's unfilled part instead of the whole week's size.
-    ///
-    ///      Passing the existing claim id to `clear.write` adds to the claim rather than opening
-    ///      a second one, so `claimKey`, the settlement path and every claim view are unchanged:
-    ///      `rollClose` still redeems exactly one claim, whatever it holds.
-    ///
-    ///      Every check a fresh write makes is re-run at today's state (see {ValoremLib.write}):
-    ///      halt, the registry's write window and approval, the live cycle still being this
-    ///      vault's cycle, the Valorem fee, the oracle, the strike band AT LIVE SPOT, and size
-    ///      on the claim's TOTAL against idle plus locked. Additionally no tranche may be written
-    ///      once `cycleExerciseTs` is reached, because the deposit gate rests on nothing being
-    ///      assignable before then.
-    /// @param n Whole lots to add.
-    function writeMore(uint112 n) external onlyRole(KEEPER_ROLE) nonReentrant {
-        if (phase != Phase.Listed) revert WrongPhase(Phase.Listed, phase);
-        _write(optionId, n);
-    }
-
-    /// @dev The shared tail of {rollOpen} and {writeMore}. Passes storage as it stands: in Idle
-    ///      `claimKey` is zero, which is what tells the library this is a fresh claim and makes it
-    ///      ignore the previous cycle's `cycleNumber`, `cycleExerciseTs` and `cycleStrikeUsdg`.
-    ///      Sizing is on {totalAssets} = idle + locked, which in Idle is just idle.
-    function _write(uint256 optionId_, uint112 n)
-        private
-        returns (uint256 strikeUsdg, uint32 number, uint40 exerciseTs, uint40 expiryTs)
-    {
         if (writesHalted) revert WritesAreHalted();
+        if (claimKey != 0) revert StillStranded();
 
-        uint256 key;
-        uint256 collateral;
-        (key, collateral, strikeUsdg, number, exerciseTs, expiryTs) = ValoremLib.write(
+        (uint256 strikeUsdg, uint40 exerciseTs, uint40 expiryTs) = ValoremLib.open(
             clear,
-            ValoremLib.Write({
-                registry: registry,
+            ValoremLib.Open({
                 feed: priceFeed,
                 asset: asset,
                 exerciseAsset: address(usdg),
                 optionId: optionId_,
-                claimId: claimKey,
-                strikeUsdg: cycleStrikeUsdg,
-                sizingAssets: totalAssets(),
-                written: contractsWritten,
-                n: n,
-                cycleNumber: cycleNumber,
-                cycleExerciseTs: cycleExerciseTs,
                 maxPriceAge: maxPriceAge,
                 feeAccepted: valoremFeeAccepted
             }),
             policy
         );
 
-        _recordWrite(optionId_, key, n, collateral);
+        uint32 number = ++cycleNumber;
+        optionId = optionId_;
+        cycleExerciseTs = exerciseTs;
+        cycleExpiryTs = expiryTs;
+        cycleStrikeUsdg = strikeUsdg;
+        _resetListingBudget();
+        phase = Phase.Listed;
+
+        // `contractsCount` is always 0 under write-on-fill: every write is reported by its own
+        // `CallsWritten` from inside the fill that sold it.
+        emit RollOpen(number, optionId_, 0, strikeUsdg);
     }
 
-    /// @notice Authorise a Seaport listing for this cycle's option tokens.
+    /*//////////////////////////////////////////////////////////////
+                          SEAPORT 1.6 ZONE HOOKS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev The vault's option-token balance before the first write of the current Seaport call,
+    ///      and whether it has been taken. TRANSIENT storage (EIP-1153; verified live on chain
+    ///      4663, integrations/robinhood-chain.md), so the baseline exists for exactly one
+    ///      transaction and costs no storage write.
+    ///
+    ///      WHY A BASELINE AND NOT ZERO. Within one Seaport call every `authorizeOrder` runs before
+    ///      any transfer and every `validateOrder` after all of them, and the same listing may
+    ///      appear more than once (`fulfillAvailableAdvancedOrders`). Two authorisations therefore
+    ///      write k1 + k2 before either transfer, and both validations must see the balance back at
+    ///      what it was before the FIRST write. The baseline is snapshotted once per transaction
+    ///      and never zeroed: after a successful call the balance equals the baseline again, so a
+    ///      second Seaport call in the same transaction inherits a still-valid one.
+    uint256 private transient _fillBaseline;
+    bool private transient _fillArmed;
+
+    /// @notice Seaport 1.6 zone hook, called BEFORE any transfer and before the fill is recorded,
+    ///         on every fulfilment path. Writes exactly the contracts Seaport is about to move.
+    /// @dev THE ONLY PLACE COLLATERAL ENTERS VALOREM. Seaport calls this for a restricted order
+    ///      whenever the caller is not the zone; the vault never calls a Seaport fulfil function,
+    ///      so every fill of its listing runs through here. The checks, in order:
+    ///        1. The caller is Seaport. Nobody else can make the vault write.
+    ///        2. The order is THIS vault's live listing: the hash matches `listingHash` (which
+    ///           commits to zone, type, items, times, salt and counter) and the offerer is the
+    ///           vault. A foreign order naming the vault as zone fails here, before any state
+    ///           moves, so it can never make the vault write on somebody else's behalf.
+    ///        3. Listed, and not halted: the guardian's brake stops sales the instant it is
+    ///           pulled, without cancelling anything on Seaport.
+    ///      Then {ValoremLib.writeOnFill} runs the fill gate (clock, fee, oracle, band floor and
+    ///      premium floor at live spot, size on the total, reserve) and writes `k = zp.offer[0]
+    ///      .amount`, the fraction-applied amount Seaport hands the zone. The tokens it mints land
+    ///      in the vault, and Seaport's transfer step moves them straight on to the buyer.
+    ///
+    ///      SKIP OR REVERT IS SEAPORT'S CALL. Inside `fulfillAvailable*` a revert here skips the
+    ///      order and rolls its state back (the buyer's other orders still fill); on every other
+    ///      path it reverts the fill. If this hook SUCCEEDS and Seaport's status update then fails
+    ///      (a duplicate occurrence overfilling the remainder), Seaport reverts the whole
+    ///      transaction rather than skipping, so a write can never be left behind without its
+    ///      sale (integrations/seaport.md §4.4).
+    ///
+    ///      `nonReentrant` is defence in depth: Seaport's own transient guard already stops any
+    ///      re-entry into Seaport while the hook runs, and hooks are sequential, never nested.
+    function authorizeOrder(ZoneParameters calldata zp) external nonReentrant returns (bytes4) {
+        if (msg.sender != address(seaport)) revert NotSeaport();
+        bytes32 live = listingHash;
+        if (live == bytes32(0) || zp.orderHash != live || zp.offerer != address(this)) {
+            revert NotLiveListing(zp.orderHash);
+        }
+        if (phase != Phase.Listed) revert WrongPhase(Phase.Listed, phase);
+        if (writesHalted) revert WritesAreHalted();
+
+        uint256 id = optionId;
+        if (!_fillArmed) {
+            _fillArmed = true;
+            _fillBaseline = clear.balanceOf(address(this), id);
+        }
+
+        // The listing's gross is an exact multiple of its size ({SeaportOrderLib}), so the unit
+        // price is exact and this fill's gross is what Seaport will actually collect for it.
+        // dividing first is exact here because `listingGrossUsdg % listingAmount == 0` was enforced at approval
+        // forge-lint: disable-next-line(divide-before-multiply)
+        uint256 gross = (listingGrossUsdg / listingAmount) * zp.offer[0].amount;
+        // `n <= listingAmount <= Policy.maxContracts(...) <= maxContractsCap`, a uint64, so the cast is exact
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint112 n = uint112(zp.offer[0].amount);
+
+        (uint256 key, uint256 collateral) = ValoremLib.writeOnFill(
+            clear,
+            ValoremLib.Fill({
+                feed: priceFeed,
+                asset: asset,
+                optionId: id,
+                claimId: claimKey,
+                strikeUsdg: cycleStrikeUsdg,
+                sizingAssets: totalAssets(),
+                reserved: reservedAssets,
+                grossUsdg: gross,
+                written: contractsWritten,
+                n: n,
+                cycleExerciseTs: cycleExerciseTs,
+                maxPriceAge: maxPriceAge,
+                feeAccepted: valoremFeeAccepted
+            }),
+            policy
+        );
+        _recordWrite(id, key, n, collateral);
+
+        return IZone.authorizeOrder.selector;
+    }
+
+    /// @notice Seaport 1.6 zone hook, called AFTER every transfer of the fill. Asserts that no
+    ///         option token written for this fill stayed in the vault.
+    /// @dev `zp.offer` carries the AUTHORISED amounts, not measured transfers, so the post-condition
+    ///      reads the balance itself: it must equal the pre-fill baseline, i.e. everything
+    ///      `authorizeOrder` minted has left. Anything else (a transfer Seaport routed elsewhere, a
+    ///      donation landing mid-fill) reverts the fill, and with it the write, so the vault is
+    ///      never left holding an unsold contract it has been assigned on. Not `nonReentrant`: a
+    ///      buyer's `onERC1155Received` runs between the two hooks and may call the vault, but it
+    ///      cannot change this balance ({AdapterValorem.onERC1155Received} refuses transfers in) and
+    ///      it cannot reach Seaport (Seaport's guard is set), so there is nothing to protect here.
+    function validateOrder(ZoneParameters calldata) external view returns (bytes4) {
+        if (msg.sender != address(seaport)) revert NotSeaport();
+        uint256 bal = clear.balanceOf(address(this), optionId);
+        uint256 baseline = _fillBaseline;
+        if (bal != baseline) revert InventoryLeftBehind(bal, baseline);
+        return IZone.validateOrder.selector;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                LISTINGS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Authorise a Seaport listing for this cycle's option type, sized to capacity.
     /// @dev The keeper proposes the whole order; this contract checks every field against its
-    ///      own state before authorising it. A compromised keeper cannot list the inventory
-    ///      to itself, for a dollar, or past the exercise window.
+    ///      own state before authorising it. A compromised keeper cannot list to itself, for a
+    ///      dollar, past the exercise window, or for more than the vault could write.
+    ///
+    ///      CAPACITY, NOT INVENTORY. There is no inventory: the offer may be as large as what the
+    ///      size gate would still admit this cycle, `Policy.maxContracts(NAV) - contractsWritten`.
+    ///      Each fill is re-sized at the hook against the NAV of that moment, so a listing
+    ///      approved at capacity can still be refused at the margin if NAV fell in between.
     function approveListing(OrderComponents calldata components) external onlyRole(KEEPER_ROLE) nonReentrant {
         if (phase != Phase.Listed) revert WrongPhase(Phase.Listed, phase);
         if (writesHalted) revert WritesAreHalted();
 
-        uint256 available = clear.balanceOf(address(this), optionId);
+        uint256 cap = Policy.maxContracts(totalAssets(), policy);
+        uint256 written = contractsWritten;
+        uint256 capacity = cap > written ? cap - written : 0;
 
         (, uint256 grossUsdg, uint256 amount) = _approveListing(
-            components, optionId, available, address(usdg), address(clear), cycleExerciseTs, cycleStrikeUsdg
+            components, optionId, capacity, address(usdg), address(clear), cycleExerciseTs, cycleStrikeUsdg
         );
 
         // The economic floors are checked here rather than in the adapter because they need the
-        // live spot, and the adapter is deliberately free of oracle knowledge. They are the SAME
-        // two floors {invalidateStaleListing} reads (see {_listingFloors}): the strike must still
-        // clear the band floor at live spot (a rally must not let the keeper sell a rung that is
-        // now near the money, exactly as {writeMore} refuses to write more of it) and the gross
-        // must clear the premium floor. Only the band's LOWER bound: after a sell-off the strike
-        // sits above the band ceiling, which makes the call safer to sell, not riskier.
+        // live spot, and the adapter is deliberately free of oracle knowledge. The fill gate
+        // re-derives both at its own spot ({ValoremLib.writeOnFill}); refusing them here as well
+        // stops the keeper publishing a listing no fill could ever clear. Only the band's LOWER
+        // bound: after a sell-off the strike sits above the band ceiling, which makes the call
+        // safer to sell, not riskier.
         _requireOracleLive();
         (uint256 minStrike, uint256 minGross) = _listingFloors(amount);
         if (cycleStrikeUsdg < minStrike) revert Policy.StrikeBelowBand(cycleStrikeUsdg, minStrike);
         if (grossUsdg < minGross) revert Policy.PremiumBelowMinimum(grossUsdg, minGross);
-    }
-
-    /// @notice Kill the live listing once the policy would no longer authorise it. Anyone.
-    /// @dev WHY THIS EXISTS. A listing is a fixed price that lives until `cycleExerciseTs`. After
-    ///      a mid-week rally the strike can sit inside the band floor and the premium below the
-    ///      floor for the new spot, and a buyer can fill at the stale price one second before the
-    ///      exercise window opens and exercise straight away. The keeper can reprice, but with a
-    ///      dead keeper only the guardian could stop it.
-    ///
-    ///      So anybody may bump the Seaport counter, but ONLY when {approveListing} would refuse
-    ///      this exact listing at live spot: the cycle's strike is below the band floor, or the
-    ///      listing's gross is below the premium floor for its size. Both paths read those floors
-    ///      from the one {_listingFloors}, so a listing {approveListing} has just accepted cannot
-    ///      be killed at the same spot (it refuses a strike below the band floor too, not only a
-    ///      thin premium). A paused Stock Token oracle
-    ///      counts as stale (a fresh approval would revert `OraclePaused`); a stale feed reverts,
-    ///      because with no price nobody can show the listing is mispriced. Nobody can kill a
-    ///      listing the policy would still authorise, so this is not a griefing lever.
-    function invalidateStaleListing() external nonReentrant {
-        if (listingHash == bytes32(0)) revert NoLiveListing();
-        if (!_oraclePaused()) {
-            (uint256 minStrike, uint256 minGross) = _listingFloors(listingAmount);
-            if (cycleStrikeUsdg >= minStrike && listingGrossUsdg >= minGross) revert ListingStillValid();
-        }
-        _invalidateAllListings();
     }
 
     /// @notice Cancel the live listing on Seaport.
@@ -1004,7 +1080,15 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // returns 0 from then on. An earlier draft emitted a hardcoded 0 here, which made every
         // assigned week look unassigned in the public cycle tape.
         uint256 assignedCount = contractsAssigned();
-        (uint256 assetsReturned, uint256 usdgFromAssignment) = _redeemClaim(asset, usdg);
+        uint256 assetsReturned;
+        uint256 usdgFromAssignment;
+        if (claimKey == 0) {
+            // Nothing sold, so nothing was ever written: there is no claim to redeem and no
+            // collateral to bring home. The armed type is simply forgotten.
+            optionId = 0;
+        } else {
+            (assetsReturned, usdgFromAssignment) = _redeemClaim(asset, usdg);
+        }
         emit RollClose(cycleNumber, assetsReturned, usdgFromAssignment, assignedCount);
 
         _harvest(usdgFromAssignment);
@@ -1171,10 +1255,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         if (_oraclePaused()) revert OraclePaused();
     }
 
-    /// @dev The two live-spot floors a listing of `amount` contracts must clear: the band's lower
-    ///      strike bound and the gross premium floor. ONE function so {approveListing} (refuses
-    ///      below either) and {invalidateStaleListing} (kills below either) can never disagree
-    ///      about what the policy would still authorise. A stale feed reverts inside {_spotUsdg}.
+    /// @dev The two live-spot floors a listing of `amount` contracts must clear at approval: the
+    ///      band's lower strike bound and the premium floor. The fill gate re-derives both at
+    ///      its own spot ({ValoremLib.writeOnFill}), so this is an early refusal for the keeper,
+    ///      not the line of defence. A stale feed reverts inside {_spotUsdg}.
     function _listingFloors(uint256 amount) private view returns (uint256 minStrike, uint256 minGross) {
         uint256 spot = _spotUsdg();
         PolicyParams memory p = policy;
@@ -1242,8 +1326,9 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
                              HALT / ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Block `rollOpen`, `writeMore` and `approveListing`. Never blocks redemptions,
-    ///         claims, `settleQueue`, `cancelListing`, `lockBook` or `rollClose`.
+    /// @notice Block `rollOpen`, `approveListing` and every fill (the fill hook refuses, so the
+    ///         guardian can stop sales instantly without cancelling anything). Never blocks
+    ///         redemptions, claims, `settleQueue`, `cancelListing`, `lockBook` or `rollClose`.
     function haltWrites() external {
         if (!hasRole(GUARDIAN_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
             revert AccessControlUnauthorizedAccount(msg.sender, GUARDIAN_ROLE);
@@ -1303,9 +1388,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
                                INTERFACE
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev ERC-1155 receiver (Valorem mints to the writer) and the Seaport 1.6 zone interface.
+    ///      EIP-1271 is deliberately NOT advertised and not implemented: the vault signs nothing.
     function supportsInterface(bytes4 interfaceId) public view override(AccessControl) returns (bool) {
         return interfaceId == 0x4e2312e0 // ERC1155Receiver
-            || interfaceId == 0x1626ba7e // EIP-1271
-            || super.supportsInterface(interfaceId);
+            || interfaceId == type(IZone).interfaceId || super.supportsInterface(interfaceId);
     }
 }

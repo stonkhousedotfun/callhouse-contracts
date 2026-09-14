@@ -47,9 +47,7 @@ contract VaultQueueFairnessTest is BaseTest {
     function test_earlierQueuerKeepsTheTrancheOnlyHerSharesEarned() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
-        uint256 id = _rollOpen(10);
-        OrderComponents memory c = _approveListing(id, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
         _queue(alice, 5e18);
         _deposit(carol, 10e18);
         _queue(bob, 10e18);
@@ -77,9 +75,7 @@ contract VaultQueueFairnessTest is BaseTest {
     function test_depositThenQueueTakesNoneOfAnEarlierQueuersPremium() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
-        uint256 id = _rollOpen(10);
-        OrderComponents memory c = _approveListing(id, 10, _okUnitPrice());
-        _fill(c, 10);
+        _openAndSell(10);
         _queue(alice, 10e18);
 
         uint256 carolShares = _deposit(carol, 30e18);
@@ -101,7 +97,7 @@ contract VaultQueueFairnessTest is BaseTest {
     function test_trancheIndexedBetweenEntriesStaysWithTheEntryItAccruedTo() public {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
-        uint256 id = _rollOpen(10);
+        uint256 id = _rollOpen();
         OrderComponents memory c = _approveListing(id, 10, _okUnitPrice());
         _fill(c, 5);
         _deposit(carol, 1e18);
@@ -139,7 +135,7 @@ contract VaultQueueFairnessTest is BaseTest {
         _deposit(alice, 10e18);
         _deposit(bob, 10e18);
         _deposit(carol, 10e18);
-        uint256 id = _rollOpen(20);
+        uint256 id = _rollOpen();
         OrderComponents memory c = _approveListing(id, 20, _okUnitPrice());
 
         uint256[3] memory debt;
