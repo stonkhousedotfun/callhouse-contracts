@@ -118,21 +118,33 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     /// @notice Governance has looked at the Valorem engine fee and accepted paying it.
     bool public valoremFeeAccepted;
 
-    /// @notice How stale the spot price may be before a write is refused.
+    /// @notice How stale the spot price may be before an arm or a fill is refused.
     /// @dev THIS MUST BE DAYS, NOT HOURS, AND THAT IS NOT SLOPPINESS.
-    ///      The NVDA/USD feed on this chain is a `us_equities_24/5` feed: it stops updating when
-    ///      the US equity market closes and restarts at 20:00 ET Sunday. Observed gaps are 17h
-    ///      intra-week, ~52h over a normal weekend, and ~78h over a three-day holiday weekend.
-    ///      Overcall's write window stays open across all of that, so a 24-hour rule would have
-    ///      blocked `rollOpen` every Saturday and Sunday and guaranteed a 0% week.
-    ///      A stale weekend price is also the economically correct one: the market is shut, so
-    ///      Friday's close IS spot. The check is here to catch a genuinely broken feed, not to
-    ///      insist on freshness the feed never promised. Launch value is 4 days.
-    ///      See ops/recon/R5-price-feed.md for the round-by-round evidence.
+    ///      The NVDA/USD feed on this chain is a `us_equities_24/5` feed, and Chainlink states it
+    ///      publishes NO updates, heartbeat included, while the market is closed. Observed gaps:
+    ///      up to 21.04 h intra-week (round 746), ~52 h over a normal weekend (187,006 s on
+    ///      2026-09-11/14), 76.09 h over the Friday holiday of 2026-07-03 and 78.24 h over Labor
+    ///      Day. The arm and every fill of a cycle run across all of that, so a 24-hour rule would
+    ///      have refused every Saturday and Sunday and guaranteed a 0% week. Launch value is 4
+    ///      days; a two-day unscheduled closure next to a weekend would exceed it and fail closed,
+    ///      which is acceptable. See integrations/chainlink.md for the round-by-round evidence.
     ///
-    ///      NOTE: chain 4663 publishes no Chainlink L2 sequencer uptime feed, so the usual
-    ///      sequencer-down guard cannot be implemented. A sequencer outage shows up instead as a
-    ///      stale price, which this check does catch.
+    ///      WHAT THE WEEKEND VALUE IS. The frozen answer is the last print BEFORE the close, not
+    ///      the close itself: on chain, 3 of 12 observed closures froze 2.2-4.6 h early and one
+    ///      printed after the regular close. Friday's spot is therefore approximate to a few
+    ///      hours of trading, and the band floor and premium floor a weekend fill clears are that
+    ///      approximate. The check is here to catch a genuinely broken feed, not to insist on a
+    ///      freshness the feed never promised.
+    ///
+    ///      WHAT THE CHECK DOES NOT CATCH. (1) Chain 4663 publishes no Chainlink L2 sequencer
+    ///      uptime feed, so the usual sequencer-down guard cannot be implemented; at 4 days this
+    ///      check does NOT notice a sequencer or DON outage shorter than that, and only an outage
+    ///      that outlasts it fails closed. (2) The feed does not re-print at a Stock Token
+    ///      multiplier `effectiveAt`: NVDA's 2026-09-10 dividend step was followed by the next
+    ///      round about 11.8 h later, because a dividend-sized move is far below the 0.5%
+    ///      deviation trigger, so for those hours the per-token basis the band is priced on lags
+    ///      the token. The keeper is expected to avoid pricing inside such a window; nothing here
+    ///      enforces it.
     uint32 public maxPriceAge;
 
     /// @notice The vault's own cycle counter: incremented by every `rollOpen`. Nothing outside
@@ -1247,8 +1259,9 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
 
     /// @notice Close the book once the exercise window opens. No new listings after this.
     /// @dev Permissionless on purpose. It only ever moves the vault from Listed to
-    ///      Exercisable, and only after a timestamp the registry already fixed, so there is
-    ///      nothing to gain by calling it and something to lose if nobody can.
+    ///      Exercisable, and only after a timestamp the armed option type already fixed (it is
+    ///      immutable in Valorem), so there is nothing to gain by calling it and something to lose
+    ///      if nobody can.
     function lockBook() external nonReentrant {
         if (phase != Phase.Listed) revert WrongPhase(Phase.Listed, phase);
         if (block.timestamp < cycleExerciseTs) revert NotYetExercisable(cycleExerciseTs);

@@ -29,7 +29,7 @@ admin from block one and every admin action is a Safe transaction (path B below)
 
 | Script | What it does |
 |---|---|
-| `script/Deploy.s.sol` | preflight (asset 18 / USDG 6 decimals, Clear `feeBps == 15` and switch off, Seaport 1.6 with the canonical ConduitController, feed), then libraries + vault. Warns loudly when the admin is a plain key |
+| `script/Deploy.s.sol` | preflight (asset 18 / USDG 6 decimals, Clear `feeBps == 15` and switch off and ERC-1155, Seaport 1.6 with the canonical ConduitController, feed answer and 8 decimals), then libraries + vault. The constructor takes one `Vault.Config` struct (asset, USDG, clearinghouse, Seaport, price feed, `maxPriceAge`, conduit key, admin, fee recipient, deposit cap, name, symbol): there is no registry and no zone parameter, the zone is the vault itself and is derived. Warns loudly when the admin is a plain key |
 | `script/DeployClear.s.sol` | OPTIONAL: deploys our own ValoremOptionsClearinghouse from the vendored upstream artifact (`feeTo` = our admin) and asserts `feeBps() == 15`, `feesEnabled() == false`; pass its address to Deploy as `CLEARINGHOUSE` |
 | `script/Configure.s.sol` | grants `KEEPER_ROLE` and `GUARDIAN_ROLE`. With `ADMIN_PK` it broadcasts from that key (refuses a key without admin); without, it only writes a Safe Transaction Builder batch |
 | `script/HandoverAdmin.s.sol` | `STEP=grant` gives the admin role to the Safe and writes a harmless smoke batch; `STEP=renounce` removes the key's admin role, and refuses until the Safe has executed a transaction after the grant |
@@ -48,7 +48,8 @@ admin from block one and every admin action is a Safe transaction (path B below)
 | Guardian key | 1 of 1 on separate hardware, as `ops/safes.md` §3 (leekzor/callhouse) requires |
 | Keeper key | hot EOA used by the keeper service; it can never move funds. `ops/safes.md` §2 (leekzor/callhouse) |
 | RPC | `RH_RPC`, preferably an archive endpoint |
-| Explorer verification | Blockscout for 4663 sits behind a Cloudflare challenge that `forge` fails; run `ops/bsproxy.js` (leekzor/callhouse) and point `--verifier-url` at it |
+| Source verification | **Sourcify** (`--verifier sourcify --chain 4663`), which supports 4663 and holds exact matches for the third-party contracts already; Blockscout then imports the match with one click ("Verify & publish → via Sourcify"). Blockscout's own API sits behind a Cloudflare challenge that `forge` cannot pass, so do not use `--verifier blockscout` against it. Verify the vault AND both libraries |
+| Cycle timing (keeper) | the vault reads exercise and expiry from the option type and never the wall clock. The weekly type should expire at the US close, **Friday 16:00 ET = 20:00 UTC while US daylight saving is in effect, 21:00 UTC otherwise** (DST ends 2026-11-01), or Thursday's close when Friday is a full-day NYSE holiday; the arm gate accepts any window from 1 hour + 1 day out to 21 days, so both fit |
 | Commit | the release tag, checked out, `forge build` clean, unit + invariant and fork suites and the rehearsal green on that exact commit. `Verify.s.sol` compares the chain against this checkout's `out/` |
 
 Checks on the day, before broadcasting:
@@ -103,7 +104,13 @@ export DEPLOYER_PK=...                       # the bootstrap admin key
 export ADMIN=$(cast wallet address --private-key $DEPLOYER_PK)
 export SAFE_FEE=0x...                        # fee Safe
 forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching --non-interactive \
-  --verify --verifier blockscout --verifier-url http://127.0.0.1:<bsproxy-port>/api
+  --verify --verifier sourcify --chain 4663
+# if --verify was skipped or failed, per contract:
+# forge verify-contract --verifier sourcify --chain 4663 $VAULT src/Vault.sol:Vault \
+#   --libraries src/lib/SeaportOrderLib.sol:SeaportOrderLib:$SEAPORT_ORDER_LIB \
+#   --libraries src/lib/ValoremLib.sol:ValoremLib:$VALOREM_LIB
+# forge verify-contract --verifier sourcify --chain 4663 $SEAPORT_ORDER_LIB src/lib/SeaportOrderLib.sol:SeaportOrderLib
+# forge verify-contract --verifier sourcify --chain 4663 $VALOREM_LIB src/lib/ValoremLib.sol:ValoremLib
 ```
 
 `--non-interactive` is required: the Vault runtime (25,470 B) is above EIP-170's 24,576 B, and
@@ -190,7 +197,8 @@ admin, the deployer holds nothing. From here every admin action is a Safe transa
 
 ```bash
 DEPLOYER_PK=... SAFE_ADMIN=0x... SAFE_FEE=0x... \
-  forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching --non-interactive --verify ...
+  forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching --non-interactive \
+  --verify --verifier sourcify --chain 4663
 SAFE_ADMIN=0x... forge script script/Configure.s.sol --rpc-url $RH_RPC --no-storage-caching   # batch only
 ```
 
@@ -221,7 +229,10 @@ In leekzor/callhouse:
   `VAULT_ADDRESS`, `START_BLOCK`. Keeper: its environment and `KEEPER_PK` (runtime only).
 - Before the first live week: one real 1-contract fill through the self-hosted page (the vault's
   listing is a restricted Seaport order with the vault as zone; Overcall's book does not list it, and
-  there is no EIP-1271 to settle).
+  there is no EIP-1271 to settle). The keeper creates the week's option type itself with
+  `clear.newOptionType` (permissionless) and arms it with `rollOpen(optionId)`; the arm gate
+  re-reads the tuple from the clearinghouse, so a wrong strike, lot, window or asset is refused
+  before anything is listed.
 
 ---
 
@@ -267,6 +278,6 @@ What this rehearsal does **not** prove:
 - The Safe{Wallet} Transaction Builder UI importing these exact files (only the format and calldata
   were checked; the Safe contract executed the same calls).
 - Hardware-wallet signing, or the Safe{Wallet} transaction service on 4663.
-- Blockscout source verification through `ops/bsproxy.js` (not run on a fork).
+- Sourcify source verification (not run on a fork; Sourcify verifies against the live chain).
 - Anything after configuration: the first `rollOpen`, a listing, a fill. The keeper dry run
   (`keeper/DRYRUN.md` in leekzor/callhouse) covers three full cycles on a separately deployed vault.

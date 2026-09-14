@@ -12,8 +12,12 @@ import {ISeaport} from "../src/interfaces/ISeaport.sol";
 /// @notice Deploys one Callhouse vault.
 /// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/ (leekzor/callhouse)
 ///      and the integration dossiers in projects/callhouse/integrations/. Run with:
-///        forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast \
-///          --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
+///        forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --non-interactive \
+///          --verify --verifier sourcify --chain 4663
+///      Source verification goes through Sourcify (chain 4663 is supported and Blockscout imports a
+///      Sourcify match with one click); Blockscout's own API sits behind a Cloudflare challenge that
+///      `forge` cannot pass. `--non-interactive` because the Vault is above EIP-170's 24,576 B and
+///      forge's broadcast step otherwise stops at a prompt, although chain 4663 allows 98,304 B.
 ///
 ///      SeaportOrderLib and ValoremLib are `public` libraries and must both be deployed and linked.
 ///      Foundry does this automatically during `forge script`; if you link manually, pass both
@@ -46,8 +50,9 @@ contract DeployVault is Script {
     /// @dev Seaport pulls the ERC-1155 directly: no conduit.
     bytes32 internal constant CONDUIT_KEY = bytes32(0);
 
-    /// @dev Four days. The NVDA feed is `us_equities_24/5` and stops all weekend; a tighter
-    ///      window would block every Saturday and Sunday arm. See ops/recon/R5-price-feed.md (leekzor/callhouse).
+    /// @dev Four days. The NVDA feed is `us_equities_24/5` and publishes nothing all weekend (worst
+    ///      observed gap 78.24 h); a tighter window would block every Saturday and Sunday arm and
+    ///      fill. See {Vault.maxPriceAge} and integrations/chainlink.md.
     uint32 internal constant MAX_PRICE_AGE = 4 days;
 
     /// @dev README (leekzor/callhouse) "Policy (launch)": start at 20 NVDA, not a TVL race.

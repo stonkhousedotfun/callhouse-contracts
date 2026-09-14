@@ -14,14 +14,16 @@ vault validates the option type from the clearinghouse itself and sells through 
 Nothing is deployed yet, and the contracts are **unaudited** (owner decision 2026-09-13: no
 external audit; the gate is the test suite described below, and that is the whole gate).
 
-This repository is the audit target. The app (keeper, indexer, web, ops) lives in
-leekzor/callhouse and mounts this repository as a git submodule at `contracts/`.
+This repository is the contracts, and the thing any review would target. The app (keeper,
+indexer, web, ops) lives in leekzor/callhouse and mounts this repository as a git submodule at
+`contracts/`.
 
 | Document | What it is |
 |---|---|
-| [`docs/AUDIT-SCOPE.md`](docs/AUDIT-SCOPE.md) | the audit scope: what is in and out, the properties to break, the areas of concern, build instructions. Auditors start here |
-| [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) | the money maths: two ledgers, the accrual index, the redeem queue, fees. Read it before changing anything in `src/` |
-| [`SECURITY.md`](SECURITY.md) | the threat model (including what a compromised keeper or admin can leak through pricing), the properties enforced in bytecode, the 2026-09-12 internal review and the 2026-09-13 findings, reporting |
+| [`docs/AUDIT-SCOPE.md`](docs/AUDIT-SCOPE.md) | the review scope: what is in and out, the properties to break, the areas of concern, what the tests do and do not prove, build instructions. Anyone reading the code for bugs starts here |
+| [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) | the money maths: two ledgers, the accrual index, the redeem queue, the stranded-claim state, fees, the thirteen invariants as asserted. Read it before changing anything in `src/` |
+| [`SECURITY.md`](SECURITY.md) | the threat model (including what a compromised keeper or admin can leak through pricing, and what each third-party key can do), the properties enforced in bytecode, the 2026-09-12 internal review and the 2026-09-13 audit findings with their fixes, reporting |
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | the contract-side runbook: bootstrap admin, optional own clearinghouse, Verify, the Safe handover, the fork rehearsal record |
 
 Paths in this repository's docs resolve from its root. A path followed by (leekzor/callhouse)
 lives in the app repository and resolves from that repository's root; a marker after a list
@@ -259,9 +261,17 @@ which the vault treats as opt-in); `script/DeployClear.s.sol` deploys an instanc
 vendored upstream artifact if that dependency is not wanted. `Verify.s.sol` also pins the live
 Seaport runtime's `extcodehash` to the 4663 Seaport 1.6 runtime the tests were run against.
 
-Blockscout for chain 4663 sits behind a Cloudflare challenge that keys on the **absence** of a
-`Referer` header, which `forge` never sends. `ops/bsproxy.js` (leekzor/callhouse) is a tiny local
-proxy that injects one so `forge verify-contract` works.
+Source verification goes through **Sourcify**, which supports chain 4663 (`forge verify-contract
+--verifier sourcify --chain 4663 <address> <contract>` for the vault and both libraries, or
+`--verify --verifier sourcify` on the deploy); Blockscout then imports the match with one click
+("Verify & publish → via Sourcify"). Blockscout's own API sits behind a Cloudflare challenge that
+`forge` cannot pass, so do not point `--verifier blockscout` at it.
+
+**Cycle timing** is a keeper concern, not a contract one: the vault reads exercise and expiry from
+the option type it arms and never the wall clock. The weekly type the keeper creates should expire
+at the US close, Friday 16:00 ET, which is 20:00 UTC while US daylight saving is in effect and
+21:00 UTC otherwise (DST ends 2026-11-01); a full-day NYSE holiday on a Friday moves it to
+Thursday's close. `MAX_CYCLE_TENOR` (21 days) tolerates both.
 
 ---
 
@@ -271,19 +281,28 @@ proxy that injects one so `forge verify-contract` works.
 |---|---|---|
 | `DEFAULT_ADMIN_ROLE` | 2/3 Safe | set the keeper, the fee recipient, the policy inside hard caps, the deposit cap, `maxPriceAge`, accept the Valorem fee, unhalt |
 | `KEEPER_ROLE` | hot wallet | `rollOpen(optionId)` (arms a type it or anyone created on the clearinghouse), `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
-| `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites` (stops arms, listings AND fills instantly), `cancelListing`, `invalidateAllListings` |
+| `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites` (stops arms, listings AND fills instantly), `cancelListing`, `invalidateAllListings`. It can stop, never start: `unhaltWrites` is admin-only |
 | Seaport 1.6 | the protocol contract | `authorizeOrder` / `validateOrder`, the zone hooks that write on every fill; nobody else may call them (`NotSeaport`) |
-| anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `sweepFee` whenever a fee is pending; `settleQueue` while `Idle` with shares queued; buying the listed calls through any Seaport fulfil function |
+| anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `settleQueue` while `Idle` with shares queued; `retryStrandedClaim` whenever a claim is stranded; `sweepFee` whenever a fee is pending; buying the listed calls through any Seaport fulfil function; writing the same option id on Valorem and exercising (assigning the vault pro rata on what it SOLD, nothing more) |
 
-The keeper cannot move a token, but it sets the sale price inside policy, and a compromised keeper
-(or the bootstrap admin, which can loosen policy and grant itself the keeper role) can sell at the
-floor to itself. SECURITY.md §3 has the bound per week.
+The keeper cannot move a token, but it chooses the option type (strike, window) inside the arm
+gate and sets the sale price inside policy, and a compromised keeper (or the bootstrap admin,
+which can loosen policy and grant itself the keeper role) can sell at the floor to itself: about
+1.1% of sold notional per week at launch policy, about 2.2% for the admin. SECURITY.md §3 has the
+derivation.
 
 A halt blocks `rollOpen`, `approveListing` and every fill (`authorizeOrder` refuses) **only**.
-`queueRedeem`, `settleQueue`, `completeRedeem`, `claimUsdg`, `cancelListing`,
-`invalidateAllListings`, `lockBook` and `rollClose` all keep working, because a halt must never
-trap a depositor. Inside `fulfillAvailable*` a refused hook SKIPS the vault's order rather than
-reverting the buyer's batch; on every other path the fill reverts.
+`queueRedeem`, `settleQueue`, `completeRedeem`, `claimUsdg`, `retryStrandedClaim`,
+`cancelListing`, `invalidateAllListings`, `lockBook` and `rollClose` all keep working, because a
+halt must never trap a depositor. Inside `fulfillAvailable*` a refused hook SKIPS the vault's
+order rather than reverting the buyer's batch; on every other path the fill reverts.
+
+**A stranded claim** (a `rollClose` whose Valorem redeem reverted because USDG was paused, the
+vault or Clear frozen on USDG, Clear's USDG burnt, or the vault blocklisted on the Stock Token) does
+not stop the close: the vault goes to `Idle` with the claim kept, the queue settles on what is idle
+and records its share of the claim, deposits and instant redemption stay shut, `rollOpen` reverts
+`StillStranded`, and anyone can `retryStrandedClaim()` until Valorem lets the redeem through
+(`docs/ACCOUNTING.md` §5, `test/regression/AF02_UsdgFreezeRollClose.t.sol`).
 
 Deposits close on the cycle's exercise **timestamp**, whether or not anyone calls `lockBook`:
 after it, `deposit`/`mint` revert `DepositsClosed` and `maxDeposit`/`maxMint` return 0 (the same

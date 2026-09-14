@@ -30,7 +30,10 @@ totalAssets() = max(asset.balanceOf(vault) + lockedAssets() - reservedAssets, 0)
 The reserve comes off the whole book and only the final figure saturates. An earlier form clamped
 `balance − reserved` at zero and then added the locked collateral, so an issuer `adminBurn` that took
 the balance below the reserve while a call was open overstated NAV by the shortfall (AUDIT-FINDINGS
-F-05). While `balance < reservedAssets` deposits are refused outright (§5).
+F-05). While `balance < reservedAssets` deposits are refused outright (§5). While a claim is
+STRANDED (§5) the locked term is scaled to the part live shares still own,
+`lockedAssets() × strandedRemainingWad / 1e18` (`Vault._lockedForNav`), because every epoch that
+settled meanwhile has already taken its share of the claim out of the live shares' hands.
 
 USDG is **not** in the share price. It accrues through `accUsdgPerShare` and is claimed separately
 with `claimUsdg()`.
@@ -257,11 +260,14 @@ settleQueue()            anyone; reverts WrongPhase unless phase == Idle, Nothin
   _settleQueue()         exactly as above
 ```
 
-While `Idle` the vault holds no claim, so `idleAssets()` is `totalAssets()` and
+While `Idle` and not stranded the vault holds no claim, so `idleAssets()` is `totalAssets()` and
 `payoutAsset = q × (totalAssets() + 1) / (totalSupply + 1)` is to the base unit what `redeem(q)`
 would pay at that moment (`test_settleQueue_paysWhatAnInstantRedeemWouldHave`). Nothing moves: the
 shares are burnt, the payout is reserved, and `completeRedeem` pays it as for any epoch, so it
-works while halted and under an issuer freeze (`test_settleQueue_worksUnderAnIssuerFreeze`).
+works while halted and under an issuer freeze (`test_settleQueue_worksUnderAnIssuerFreeze`). While
+`Idle` and stranded, instant redemption is off and this IS the exit: the epoch is paid its slice of
+the idle balance now and records its pro-rata share of the stranded claim for later ("A stranded
+claim", below).
 
 The +1/+1 in `payoutAsset` is load-bearing here. The first draft paid `idleAssets() × q /
 totalSupply` with no virtual share, which is more than the instant price whenever `idle > supply`.
@@ -738,8 +744,8 @@ never sets the Valorem fee on; the fee-on fill path is covered by `VaultWriteOnF
 `AF04_FeeSizing.t.sol`.
 
 The per-entry USDG split of §5 changes no formula above: an entry's `usdgOut` is still drawn out of
-`ep.usdgRemaining` and capped by it, so invariants 2 and 6 hold as written. None of the eight checks
-that each entry received its own index growth. The handler queues and deposits, so that code runs
+`ep.usdgRemaining` and capped by it, so invariants 2 and 6 hold as written. None of the thirteen
+checks that each entry received its own index growth. The handler queues and deposits, so that code runs
 in every run, but the figures are asserted only in `test/unit/VaultQueueFairness.t.sol` (three
 deterministic tests and a fuzz over three entries around two tranches).
 

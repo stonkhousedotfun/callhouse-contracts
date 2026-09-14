@@ -16,12 +16,16 @@ import {ValoremLib} from "./lib/ValoremLib.sol";
 ///      PARTIAL ASSIGNMENT IS NORMAL. Every write on an option id before its first exercise
 ///      lands in one bucket, whoever the writer is, and Valorem assigns exercise PRO RATA BY
 ///      AMOUNT WRITTEN across that bucket (upstream 6436c82 `_assignExercise`,
-///      `_getAssetAmountsForClaimIndex`; integrations/valorem.md §4). So a vault that wrote N
-///      contracts can come back with anywhere from 0 to N assigned, in fractions of a contract
-///      when it shares the bucket with other writers. Every accounting path below is written to
-///      accept the full range, and nothing asserts a 1:1 return of the underlying. What the vault
-///      guarantees is the other bound: under write-on-fill it writes only what it sells, so it can
-///      never be assigned on more contracts than it was paid a premium for.
+///      `_getAssetAmountsForClaimIndex`; integrations/valorem.md §4). A write after the first
+///      exercise opens a new bucket, and the order buckets are drawn in is fixed at
+///      `newOptionType` (`settlementSeed == optionKey`, never re-seeded), so it is public and a
+///      late writer can choose its bucket. So a vault that wrote N contracts can come back with
+///      anywhere from 0 to N assigned, in fractions of a contract when it shares a bucket with
+///      other writers, and the vault's share of a shared bucket is not something it controls.
+///      Every accounting path below is written to accept the full range, and nothing asserts a
+///      1:1 return of the underlying. What the vault guarantees is the other bound: under
+///      write-on-fill it writes only what it sells, so it can never be assigned on more contracts
+///      than it was paid a premium for, whatever a third party writes or exercises beside it.
 abstract contract AdapterValorem {
     using SafeERC20 for IERC20;
 
