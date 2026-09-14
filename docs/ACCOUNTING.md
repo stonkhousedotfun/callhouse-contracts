@@ -550,7 +550,7 @@ figure. A premium above the strike is refused as a fat finger (`UnitPriceExceeds
 ## 7. The invariants
 
 Asserted after every call of the stateful suite, `test/invariant/VaultInvariant.t.sol` (64 runs ×
-600 calls in the default profile). There are **eleven** `invariant_*` functions; USDG solvency is
+600 calls in the default profile). There are **thirteen** `invariant_*` functions; USDG solvency is
 split into an aggregate half and a per-holder half. Formulas below are what the code asserts, not a
 paraphrase of intent. `burned` and `burnReserveShortfall` are ghosts of the handler's `adminBurn`
 action (the issuer's bare `_burn`, at most two ordinary and two reserve-aimed burns a run, none
@@ -559,7 +559,9 @@ balance below the reserve, `max(reserved − balAfter, 0) − max(reserved − b
 `strandAssetsLeft` / `strandUsdgLeft` are `Σ strands[g].assetsLeft` / `Σ strands[g].usdgLeft` over
 every generation: the settled epochs' share of redeemed stranded claims their owners have not yet
 collected (§5). `navLocked` is `lockedAssets()`, or `lockedAssets() × strandedRemainingWad / 1e18`
-while a claim is stranded.
+while a claim is stranded. `totalSold` is the sum of every successful `fill`'s size over the run, in
+contracts (under write on fill, also everything the vault ever wrote); `armedOptionIds` is every id
+`rollOpen` armed, oldest first.
 
 ```
 1. asset conservation                                  invariant_assetConservation
@@ -638,6 +640,25 @@ while a claim is stranded.
 11. the vault holds no option tokens                   invariant_vaultHoldsNoOptionTokens
    optionId != 0  =>  clear.balanceOf(vault, optionId) == 0      (written == sold, F-01 closure)
    claimKey != 0  =>  clear.balanceOf(vault, claimKey) == 1
+
+12. assignment never exceeds what was sold             invariant_assignedNeverExceedsSold
+   assignedOut <= totalSold * 1e18                               (lifetime, every cycle summed)
+   contractsAssigned() <= contractsWritten
+   claimKey != 0  =>  claim.amountExercised <= contractsWritten * 1e18
+   (the F-01 bound in the form a depositor cares about: with the third-party writer steering the
+    bucket and exercising far more than the vault sold, the vault's lifetime assignment is still
+    bounded by the contracts it sold; the pre-redesign handler, writing at arm, fails this in the
+    first in-the-money week)
+
+13. long supply is unexercised collateral              invariant_longSupplyIsUnexercisedCollateral
+   for every id in armedOptionIds (live and past cycles alike):
+     clear.optionSupply(id) == clear.unexercisedContracts(id)
+     clear.optionSupply(id) == balanceOf(buyer, id) + balanceOf(thirdPartyWriter, id) + balanceOf(vault, id)
+     clear.balanceOf(vault, id) == 0
+   (MockClear tracks the supply upstream Clear keeps implicitly: write mints exactly what it
+    collateralises, exercise burns exactly what it assigns, an expired id's longs are never burnt and
+    its buckets never move again, so the identity has to survive the close; every outstanding option
+    token is in a buyer's or the adversary's hands, never the vault's, for every id it ever armed)
 ```
 
 The handler's `completeRedeem` also asserts, on every successful call, that `reservedAssets` fell by
@@ -685,10 +706,14 @@ exist. Two new actions play the F-01 adversary: `thirdPartyWrite` puts a strange
 the vault's bucket on the same option id, and `thirdPartyExercise` exercises them (warping into the
 window). Invariant 6's identity became `lockedAssets() == written × 1e18 − claim.amountExercised`
 (± 1 wei of per-index rounding), stated against Valorem's own WAD figure because the vault's share
-of a shared bucket is fractional, with `contractsAssigned() ≤ contractsWritten` alongside it. A
+of a shared bucket is fractional, with `contractsAssigned() ≤ contractsWritten` alongside it. An
 eleventh invariant, `invariant_vaultHoldsNoOptionTokens`, asserts after every call that
-`clear.balanceOf(vault, optionId) == 0` and that the vault holds its claim NFT. Asserted inline on
-every successful call:
+`clear.balanceOf(vault, optionId) == 0` and that the vault holds its claim NFT. The S4 hardening
+pass (2026-09-13) added the twelfth and thirteenth: `invariant_assignedNeverExceedsSold` states the
+F-01 bound cumulatively over the run (`assignedOut ≤ totalSold × 1e18`, the ghost being every
+fill's size summed), and `invariant_longSupplyIsUnexercisedCollateral` ties each armed id's
+outstanding option tokens to its unexercised buckets and to the buyer's and adversary's balances,
+for past cycles as well as the live one. Asserted inline on every successful call:
 
 ```
 rollOpen(id)             contractsWritten == 0; claimKey == 0; cycleNumber == before + 1

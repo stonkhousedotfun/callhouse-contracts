@@ -10,6 +10,9 @@
 # refuse the Vault at 24,577 B and make the rehearsal fail for a reason mainnet does not have.
 #
 # PATH A — the launch plan for now (docs/DEPLOY.md "bootstrap"): the deployer key is the admin.
+#   A0  DeployClear: our own ValoremOptionsClearinghouse from the vendored artifact, feeTo = the bootstrap
+#       admin. Path A deploys the vault against THIS instance (CLEARINGHOUSE override in Deploy and Verify);
+#       path B against Overcall's default, so both deploy-time choices are rehearsed.
 #   A1  Deploy with ADMIN = deployer. Verify (bootstrap, unconfigured).
 #   A2  Configure with the deployer key. Verify (bootstrap, configured).
 #   A3  Verify has teeth: swapped library addresses must FAIL the bytecode/link checks.
@@ -45,6 +48,7 @@ cd "$(dirname "$0")/.."
 FACTORY=0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67        # SafeProxyFactory 1.4.1
 SINGLETON=0x29fcB43b46531BcA003ddC8FCB67FFE91900C762      # SafeL2 1.4.1
 FALLBACK=0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99       # CompatibilityFallbackHandler 1.4.1
+OVERCALL_CLEAR=0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0 # Overcall's Valorem Clear, Deploy.s.sol's default
 ZERO=0x0000000000000000000000000000000000000000
 
 step() { printf '\n== %s\n' "$*"; }
@@ -61,8 +65,10 @@ chain=$(cast chain-id --rpc-url "$RPC") || fail "no RPC at $RPC"
 [ "$chain" = 4663 ] || fail "chain id $chain, expected an anvil fork of 4663"
 # The anvil must have been started with --code-size-limit 98304, or the Vault (above EIP-170's 24,576 B)
 # cannot be deployed here although mainnet 4663 accepts it. Probe with the same create eth_call the D17
-# verification used: init code `PUSH2 0x7530 PUSH1 0 RETURN` returns 30,000 zero bytes as runtime.
-if ! cast call --create 0x6175306000f3 --rpc-url "$RPC" >/dev/null 2>&1; then
+# verification used: init code `PUSH2 0x7530 PUSH1 0 RETURN` returns 30,000 zero bytes as runtime. A default
+# anvil answers `EVM error CreateContractSizeLimit`; one started with the flag (and mainnet 4663) returns the
+# bytes. `--create` is a cast subcommand, so the RPC option has to come before it.
+if ! cast call --rpc-url "$RPC" --create 0x6175306000f3 >/dev/null 2>&1; then
   fail "this anvil refuses a 30,000 B contract: restart it with --code-size-limit 98304 (chain 4663 allows 98,304 B)"
 fi
 for a in $FACTORY $SINGLETON $FALLBACK; do
@@ -106,8 +112,11 @@ echo "  admin Safe $SAFE_ADMIN"
 echo "  fee Safe   $SAFE_FEE"
 mkdir -p broadcast
 
+# `--non-interactive`: the Vault is above EIP-170's 24,576 B (25,470 B), and forge's broadcast step asks for a
+# confirmation before deploying such a contract even though foundry.toml raises `code_size_limit` for the
+# simulation. Mainnet deploys need the same flag (docs/DEPLOY.md A1); on a non-terminal the prompt is fatal.
 deploy() { # env assignments...; sets VAULT SEAPORT_ORDER_LIB VALOREM_LIB
-  env "$@" forge script --no-storage-caching script/Deploy.s.sol --rpc-url "$RPC" --broadcast --slow > broadcast/rehearsal-deploy.log 2>&1 \
+  env "$@" forge script --no-storage-caching --non-interactive script/Deploy.s.sol --rpc-url "$RPC" --broadcast --slow > broadcast/rehearsal-deploy.log 2>&1 \
     || { tail -30 broadcast/rehearsal-deploy.log; fail "deploy failed"; }
   grep -E "preflight|feed |WARNING" broadcast/rehearsal-deploy.log || true
   local run=broadcast/Deploy.s.sol/4663/run-latest.json
@@ -118,12 +127,29 @@ deploy() { # env assignments...; sets VAULT SEAPORT_ORDER_LIB VALOREM_LIB
   local gas=0; for g in $(jq -r '.receipts[].gasUsed' "$run"); do gas=$((gas + g)); done
   echo "  Vault $VAULT  SeaportOrderLib $SEAPORT_ORDER_LIB  ValoremLib $VALOREM_LIB  ($gas gas, $(jq '.receipts | length' "$run") txs)"
 }
-COMMON() { echo VAULT="$VAULT" SEAPORT_ORDER_LIB="$SEAPORT_ORDER_LIB" VALOREM_LIB="$VALOREM_LIB" SAFE_FEE="$SAFE_FEE" KEEPER="$KEEPER" GUARDIAN="$GUARDIAN"; }
+# CLEARINGHOUSE is the instance the current path deploys against; Verify reads the same variable.
+COMMON() { echo VAULT="$VAULT" SEAPORT_ORDER_LIB="$SEAPORT_ORDER_LIB" VALOREM_LIB="$VALOREM_LIB" SAFE_FEE="$SAFE_FEE" KEEPER="$KEEPER" GUARDIAN="$GUARDIAN" CLEARINGHOUSE="$CLEARINGHOUSE"; }
 
 # ============================== PATH A: bootstrap (deployer is admin) ==============================
 
-step "A1  Deploy.s.sol with ADMIN = deployer; Verify (bootstrap, unconfigured)"
-deploy DEPLOYER_PK="$(pk deployer)" ADMIN="$DEPLOYER" SAFE_FEE="$SAFE_FEE"
+step "A0  DeployClear.s.sol: our own ValoremOptionsClearinghouse (feeTo = the bootstrap admin)"
+env DEPLOYER_PK="$(pk deployer)" CLEAR_FEE_TO="$DEPLOYER" forge script --no-storage-caching script/DeployClear.s.sol \
+  --rpc-url "$RPC" --broadcast --slow > broadcast/rehearsal-deployclear.log 2>&1 \
+  || { tail -30 broadcast/rehearsal-deployclear.log; fail "DeployClear failed"; }
+OUR_CLEAR=$(grep -E "ValoremOptionsClearinghouse +0x[0-9a-fA-F]{40}" broadcast/rehearsal-deployclear.log | awk '{print $2}' | tail -1)
+[ -n "$OUR_CLEAR" ] || fail "our Clear's address not found in the DeployClear log"
+[ "$(cast codesize "$OUR_CLEAR" --rpc-url "$RPC")" -gt 0 ] || fail "no code at our Clear $OUR_CLEAR"
+[ "$(cast call "$OUR_CLEAR" "feeTo()(address)" --rpc-url "$RPC")" = "$DEPLOYER" ] || fail "our Clear's feeTo is not the deployer"
+[ "$(cast call "$OUR_CLEAR" "feesEnabled()(bool)" --rpc-url "$RPC")" = false ] || fail "our Clear's fee switch is on"
+[ "$(cast call "$OUR_CLEAR" "feeBps()(uint8)" --rpc-url "$RPC")" = 15 ] || fail "our Clear's feeBps != 15"
+[ "$(cast codesize "$OUR_CLEAR" --rpc-url "$RPC")" = "$(cast codesize "$OVERCALL_CLEAR" --rpc-url "$RPC")" ] \
+  || fail "our Clear's runtime size differs from Overcall's (same artifact expected)"
+echo "  our Clear $OUR_CLEAR ($(cast codesize "$OUR_CLEAR" --rpc-url "$RPC") B, same size as Overcall's $OVERCALL_CLEAR)"
+CLEARINGHOUSE=$OUR_CLEAR
+
+step "A1  Deploy.s.sol with ADMIN = deployer against OUR Clear; Verify (bootstrap, unconfigured)"
+deploy DEPLOYER_PK="$(pk deployer)" ADMIN="$DEPLOYER" SAFE_FEE="$SAFE_FEE" CLEARINGHOUSE="$CLEARINGHOUSE"
+[ "$(cast call "$VAULT" "clear()(address)" --rpc-url "$RPC")" = "$OUR_CLEAR" ] || fail "the vault is not wired to our Clear"
 [ "$(has_role "$VAULT" $ADMIN_ROLE "$DEPLOYER")" = true ] || fail "deployer is not admin"
 verify $(COMMON) DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false
 
@@ -173,8 +199,11 @@ VAULT_A=$VAULT
 
 # ================================ PATH B: Safe is admin from block one =============================
 
-step "B1  Deploy.s.sol with SAFE_ADMIN; Configure writes the batch and broadcasts nothing"
+CLEARINGHOUSE=$OVERCALL_CLEAR
+
+step "B1  Deploy.s.sol with SAFE_ADMIN against Overcall's Clear (the default); Configure writes the batch and broadcasts nothing"
 deploy DEPLOYER_PK="$(pk deployer2)" SAFE_ADMIN="$SAFE_ADMIN" SAFE_FEE="$SAFE_FEE"
+[ "$(cast call "$VAULT" "clear()(address)" --rpc-url "$RPC")" = "$OVERCALL_CLEAR" ] || fail "the vault is not wired to Overcall's Clear"
 env $(COMMON) SAFE_ADMIN="$SAFE_ADMIN" forge script --no-storage-caching script/Configure.s.sol --rpc-url "$RPC" 2>&1 \
   | grep -E "safe batch written|NOTHING BROADCAST" || fail "configure (batch) did not run"
 [ "$(has_role "$VAULT" "$KEEPER_ROLE" "$KEEPER")" = false ] || fail "batch mode granted a role"
@@ -213,5 +242,5 @@ grep -q "FAIL  vault: runtime == compiled Vault" broadcast/rehearsal-tamper.log 
 echo "  byte 100 flipped 0x$orig -> 0x$flip: caught"
 
 printf '\nREHEARSAL PASSED on fork block %s\n' "$block"
-printf 'path A vault %s (bootstrap -> handed over)\npath B vault %s (Safe from block one)\nadmin Safe %s  fee Safe %s\n' \
-  "$VAULT_A" "$VAULT" "$SAFE_ADMIN" "$SAFE_FEE"
+printf 'path A vault %s (bootstrap -> handed over, on our Clear %s)\npath B vault %s (Safe from block one, on Overcall'"'"'s Clear)\nadmin Safe %s  fee Safe %s\n' \
+  "$VAULT_A" "$OUR_CLEAR" "$VAULT" "$SAFE_ADMIN" "$SAFE_FEE"

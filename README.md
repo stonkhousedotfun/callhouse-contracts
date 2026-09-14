@@ -49,15 +49,15 @@ test/
   fixtures/                 the vendored Clear artifact and the 4663 Seaport 1.6 / ConduitController runtimes
   unit/                     per-surface suites, incl. VaultWriteOnFill (mock hooks) and VaultRealSeaport (every real fulfil path)
   regression/               the five audit PoCs (AF-01..AF-05), each asserting the FIXED behaviour
-  invariant/                stateful campaign, ten invariants, with a third-party writer in the vault's bucket
-  fork/                     against live chain 4663 (write on fill through the live Seaport and Clear)
+  invariant/                stateful campaign, thirteen invariants, with a third-party writer in the vault's bucket
+  fork/                     against live chain 4663 (a whole week through the live Seaport and Clear, the real USDG freeze)
 script/
   Deploy.s.sol              constructor args, with an on-chain preflight (decimals, Clear fee state, Seaport 1.6)
   DeployClear.s.sol         OPTIONAL: our own ValoremOptionsClearinghouse from the vendored artifact
   Configure.s.sol           keeper and guardian grants: from the admin key, or as a Safe batch
   HandoverAdmin.s.sol       move DEFAULT_ADMIN_ROLE from the bootstrap key to the Safe
   Verify.s.sol              read-only post-deploy check, bytecode and Seaport runtime hash included
-  rehearse-deploy.sh        both admin paths on an anvil fork (--code-size-limit 98304), with real Safes
+  rehearse-deploy.sh        both admin paths on an anvil fork (--code-size-limit 98304), with real Safes; path A on our own Clear (A0), path B on Overcall's
   rehearsal/                ExecuteSafeBatch.s.sol (anvil only)
 docs/                       AUDIT-SCOPE.md, ACCOUNTING.md, DEPLOY.md
 lib/                        forge-std, openzeppelin-contracts (git submodules)
@@ -132,9 +132,10 @@ FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
 profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
 verbosity.
 
-Current state: **397 unit, regression and invariant tests across 23 suites, 16 fork tests** (the
+Current state: **399 unit, regression and invariant tests across 23 suites, 20 fork tests** (the
 fork suite runs with `FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC`; it needs the live RPC
-and is not part of the offline gate). Measured 2026-09-13 on branch `redesign/s3-parallel`.
+and is not part of the offline gate). Measured 2026-09-13 on branch
+`redesign/a2-own-strikes-2026-09-13` after the S4 hardening pass.
 
 ### CI, and why the local gate is the gate
 
@@ -148,10 +149,16 @@ them with `set -o pipefail` when piping: a piped failure that hides behind `tee`
 that did not pass.
 
 There is no external audit (owner decision D14, 2026-09-13) and no separate security gauntlet.
-The contracts are unaudited. What stands behind them is the gate above: 397 tests including the
+The contracts are unaudited. What stands behind them is the gate above: 399 tests including the
 five audit proofs of concept re-asserted as fixed behaviour on the real Valorem bytecode, the
 real Seaport 1.6 runtime driven through every fulfilment path, a 64 × 600 stateful campaign with a
-third-party writer in the vault's bucket, and the fork suite against chain 4663.
+third-party writer in the vault's bucket (thirteen invariants, among them: the vault never holds
+an unsold option token, its lifetime assignment never exceeds what it sold, and option-token
+supply equals unexercised collateral for every id it ever armed), the fork suite against chain
+4663 (an assigned week and an unfilled week settled on the live Clear through the live Seaport, a
+stranded close under the real USDG freeze role and its recovery, the TSTORE probe answered by the
+live node), and `script/rehearse-deploy.sh` on an anvil fork of 4663 with the chain's 98,304 B
+code limit (our own Clear deployed and used on path A, Overcall's on path B; `docs/DEPLOY.md`).
 
 ---
 

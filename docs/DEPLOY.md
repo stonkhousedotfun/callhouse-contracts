@@ -4,8 +4,10 @@ The contract-side runbook for mainnet (chain 4663). Hosting the keeper, indexer 
 separate runbook, `ops/deploy.md` in leekzor/callhouse. Every step here is rehearsed end to end by
 `script/rehearse-deploy.sh` on an anvil fork; the latest record is at the bottom.
 
-**Nothing here is done yet.** The contracts are unaudited; do not run the mainnet steps before the
-audit engagement has closed and the deployed commit is the audited tag.
+**Nothing here is done yet.** The contracts are unaudited and stay labelled so (owner decision D14:
+no external audit; the gate is the test suite, README "CI, and why the local gate is the gate"). Do
+not run the mainnet steps on a commit that has not passed the full gate, fork suite and rehearsal
+included, or that differs from the commit `Verify.s.sol` will be run from.
 
 ---
 
@@ -31,7 +33,7 @@ admin from block one and every admin action is a Safe transaction (path B below)
 | `script/DeployClear.s.sol` | OPTIONAL: deploys our own ValoremOptionsClearinghouse from the vendored upstream artifact (`feeTo` = our admin) and asserts `feeBps() == 15`, `feesEnabled() == false`; pass its address to Deploy as `CLEARINGHOUSE` |
 | `script/Configure.s.sol` | grants `KEEPER_ROLE` and `GUARDIAN_ROLE`. With `ADMIN_PK` it broadcasts from that key (refuses a key without admin); without, it only writes a Safe Transaction Builder batch |
 | `script/HandoverAdmin.s.sol` | `STEP=grant` gives the admin role to the Safe and writes a harmless smoke batch; `STEP=renounce` removes the key's admin role, and refuses until the Safe has executed a transaction after the grant |
-| `script/Verify.s.sol` | read-only; the check count is re-derived on the next rehearsal (the redesign added the zone, interface, Seaport runtime-hash, Clear fee-state and decimals checks and removed the registry and Overcall-fee ones). Reverts if any fail |
+| `script/Verify.s.sol` | read-only; 63 checks bootstrap-unconfigured, 69 bootstrap-configured, 72 safe phase with the owner set pinned, 71 without (re-derived by the 2026-09-13 rehearsal; the redesign added the zone, interface, Seaport runtime-hash, Clear fee-state and decimals checks and removed the registry and Overcall-fee ones). Reverts if any fail |
 | `script/rehearsal/ExecuteSafeBatch.s.sol` | rehearsal only: runs a batch file through a Safe with owner keys. Refuses any node that is not anvil |
 
 ---
@@ -40,19 +42,20 @@ admin from block one and every admin action is a Safe transaction (path B below)
 
 | Item | Detail |
 |---|---|
-| Deployer key | an EOA kept offline. It is the vault admin until the handover. Fund it for about 7.6M gas (rehearsal: 7,569,702 for the two libraries and the vault) plus the configure and handover transactions |
+| Deployer key | an EOA kept offline. It is the vault admin until the handover. Fund it for about 8.4M gas (rehearsal 2026-09-13: 8,355,876 for the two libraries and the vault; 5,831,215 when the libraries already exist) plus the configure and handover transactions, and about 3.5M more if `DeployClear.s.sol` is used |
 | Admin Safe | 2 of 3, created in Safe{Wallet} on Robinhood Chain (supported; SafeL2 1.4.1 and SafeProxyFactory 1.4.1 are deployed at their canonical addresses). Owners on hardware. No modules, no guard. `ops/safes.md` §1 (leekzor/callhouse) |
 | Fee Safe | receives the protocol fee (5% of premium). Its legal owner is a counsel question, `ops/launch-legal.md` §2 item 5 (leekzor/callhouse) |
 | Guardian key | 1 of 1 on separate hardware, as `ops/safes.md` §3 (leekzor/callhouse) requires |
 | Keeper key | hot EOA used by the keeper service; it can never move funds. `ops/safes.md` §2 (leekzor/callhouse) |
 | RPC | `RH_RPC`, preferably an archive endpoint |
 | Explorer verification | Blockscout for 4663 sits behind a Cloudflare challenge that `forge` fails; run `ops/bsproxy.js` (leekzor/callhouse) and point `--verifier-url` at it |
-| Commit | the audited tag, checked out, `forge build` clean, unit + invariant and fork suites green on that exact commit. `Verify.s.sol` compares the chain against this checkout's `out/` |
+| Commit | the release tag, checked out, `forge build` clean, unit + invariant and fork suites and the rehearsal green on that exact commit. `Verify.s.sol` compares the chain against this checkout's `out/` |
 
 Checks on the day, before broadcasting:
 
 ```bash
-forge build --sizes                              # Vault under 24,576 B
+forge build --sizes                              # Vault under 98,304 B (chain 4663's limit; forge's 24,576 B
+                                                 # "margin" line and exit 1 are noise here, README item 1)
 cast call 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0 "feesEnabled()(bool)" --rpc-url $RH_RPC
                                                  # false; if true, stop: the engine fee needs a governance decision
 ```
@@ -66,11 +69,32 @@ Libraries are deployed through the deterministic CREATE2 factory (`0x4e59b44847b
 present on 4663), so their addresses depend only on their bytecode, not on who deploys them. For this
 commit: SeaportOrderLib `0xAe4ba02cd5Ace94DA3bbd68f746DafaA66d013f2`, ValoremLib
 `0xb1E1aEF7cB829E0890e74eE324e6eEa437761626` (it changed with the 2026-09-13 lot-size fix). If they already exist (anyone may deploy them first), forge
-reuses them; `Verify.s.sol` checks their code byte for byte either way.
+reuses them; `Verify.s.sol` checks their code byte for byte either way. For this commit (S4
+rehearsal, 2026-09-13): SeaportOrderLib `0x6B617a0B578Ef6EDCD07774468f08b3778272D8A`, ValoremLib
+`0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d`; the addresses quoted above are the pre-redesign ones and
+change with every library byte.
 
 ---
 
 ## Path A — bootstrap (the plan)
+
+### A0. (Optional) Our own clearinghouse
+
+The vault settles on whichever Valorem Clear it is constructed with. The default is Overcall's
+unmodified instance; to remove that dependency entirely, deploy our own from the vendored upstream
+artifact first and pass its address to every later step as `CLEARINGHOUSE` (Deploy's preflight and
+Verify both read it):
+
+```bash
+DEPLOYER_PK=... CLEAR_FEE_TO=$ADMIN \
+  forge script script/DeployClear.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching
+export CLEARINGHOUSE=0x...                   # from the "ValoremOptionsClearinghouse" log line
+```
+
+`feeTo` is the only power over a Clear instance (the 15 bps fee switch, the URI generator, sweeping
+fees); with `CLEAR_FEE_TO=$ADMIN` it follows the vault's admin. The script asserts `feeBps() == 15`,
+`feesEnabled() == false` and the wiring before it returns. The rehearsal runs path A on an instance
+deployed this way and path B on Overcall's, so both choices are exercised.
 
 ### A1. Deploy
 
@@ -78,9 +102,15 @@ reuses them; `Verify.s.sol` checks their code byte for byte either way.
 export DEPLOYER_PK=...                       # the bootstrap admin key
 export ADMIN=$(cast wallet address --private-key $DEPLOYER_PK)
 export SAFE_FEE=0x...                        # fee Safe
-forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching \
+forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching --non-interactive \
   --verify --verifier blockscout --verifier-url http://127.0.0.1:<bsproxy-port>/api
 ```
+
+`--non-interactive` is required: the Vault runtime (25,470 B) is above EIP-170's 24,576 B, and
+forge's broadcast step stops at a confirmation prompt for such a contract even though
+`foundry.toml` raises `code_size_limit` to chain 4663's real 98,304 B limit for the simulation. The
+flag only suppresses that prompt; the chain accepts the contract (README "Four things that will bite
+you", item 1).
 
 The preflight refuses an asset without 18 decimals or a USDG without 6, a clearinghouse whose
 `feeBps` is not 15 or whose fee switch is on (accept it explicitly after deploy instead), a Seaport
@@ -160,7 +190,7 @@ admin, the deployer holds nothing. From here every admin action is a Safe transa
 
 ```bash
 DEPLOYER_PK=... SAFE_ADMIN=0x... SAFE_FEE=0x... \
-  forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching --verify ...
+  forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching --non-interactive --verify ...
 SAFE_ADMIN=0x... forge script script/Configure.s.sol --rpc-url $RH_RPC --no-storage-caching   # batch only
 ```
 
@@ -195,34 +225,42 @@ In leekzor/callhouse:
 
 ---
 
-## Rehearsal record — 2026-09-13
+## Rehearsal record — 2026-09-13 (S4, the redesigned contracts)
 
-**Predates the redesign; to be re-run.** `script/rehearse-deploy.sh` (which now requires the anvil to
-run with `--code-size-limit 98304`, chain 4663's real limit, and probes for it) against
-`anvil --fork-url https://rpc.mainnet.chain.robinhood.com --chain-id 4663`, fork block **62212405**, every forge call with `--no-storage-caching`, on commit `6ed528f` (after the lot-size and queue-fairness fixes). **Passed.**
+`script/rehearse-deploy.sh` against `anvil --fork-url https://rpc.mainnet.chain.robinhood.com
+--chain-id 4663 --code-size-limit 98304`, fork block **62533535**, every forge call with
+`--no-storage-caching`, the deploys with `--non-interactive`, on the tree committed as "harden:
+invariants, sizes, scripts, fork tests" on branch `redesign/a2-own-strikes-2026-09-13`. **Passed.**
 
-Setup: admin Safe `0x40B2B8fAf07563A99203b55377ed2c9148a30468` and fee Safe
-`0x2e91b07AB8c64CF2e0Bb3593945818fEF387BC05`, both 2 of 3, created through the canonical SafeProxyFactory
-1.4.1 on the fork. Preflight: registry cycle 1, feed answer `21829793457` (218.29793457 USD), feed age
-171,469 s (47.6 h, a weekend gap, inside the 4-day window).
+Setup: admin Safe `0x0fdf84096bd56eDa08632C6c9C90B88C2579c8BC` and fee Safe
+`0x686d631f20F05fd017e320baA116B20a5245d8DF`, both 2 of 3, created through the canonical
+SafeProxyFactory 1.4.1 on the fork. Preflight: feed answer `21472631815` (214.72631815 USD), feed age
+15,679 s (4.4 h). The 30,000 B create probe (`cast call --rpc-url … --create 0x6175306000f3`) passed
+on the anvil; a default anvil answers `EVM error CreateContractSizeLimit` to it and the live chain
+returns the bytes, both checked by hand the same day.
 
 | Step | Result |
 |---|---|
-| A1 deploy, `ADMIN` = deployer | SeaportOrderLib `0xAe4ba02cd5Ace94DA3bbd68f746DafaA66d013f2` and ValoremLib `0xb1E1aEF7cB829E0890e74eE324e6eEa437761626` via CREATE2, Vault `0x1ACF2372B7F66968Ca894A62E7F3Ec05e67Ce1e8`; 3 transactions, 7,569,702 gas; plain-key WARNING printed |
-| A2 verify, bootstrap, unconfigured | 55 of 55 |
-| A3 configure with the deployer key; verify | 2 calls; 61 of 61 |
-| Verify has teeth (1) | library addresses swapped: 3 FAIL (link sites, both library bytecodes) |
+| A0 DeployClear, `CLEAR_FEE_TO` = deployer | our ValoremOptionsClearinghouse at `0xA6Bb16048497Eb06b6314c37644A0B3Fe03a515A`, 16,110 B (the same runtime size as Overcall's `0x9a7b40e5…C0C0`); `feeTo` the deployer, `feesEnabled() == false`, `feeBps() == 15` re-read with `cast` |
+| A1 deploy, `ADMIN` = deployer, `CLEARINGHOUSE` = our Clear | SeaportOrderLib `0x6B617a0B578Ef6EDCD07774468f08b3778272D8A` and ValoremLib `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d` via CREATE2, Vault `0xf04ac66aeb14d235eb519ede1cec98602f5e3c09` (25,470 B, above EIP-170, accepted); 3 transactions, 8,355,876 gas; `clear()` re-read as our instance; plain-key WARNING printed; verify (bootstrap, unconfigured) **63 of 63** |
+| A2 configure with the deployer key; verify | 2 calls; **69 of 69** |
+| A3 Verify has teeth (1) | library addresses swapped: 5 FAIL (the 8 link sites, both libraries' deploy-address word and runtime) |
 | A4 handover grant | Safe granted; renounce **refused**: "the Safe has not executed a transaction since the grant" |
 | A5 smoke batch | executed through the admin Safe, 2 of 3 owners supplied out of address order |
-| A6 renounce; verify, safe phase | deployer renounced; 64 of 64 with the owner set pinned; a configure signed by the renounced key refused: "ADMIN_PK does not hold DEFAULT_ADMIN_ROLE" |
-| B1 deploy, `SAFE_ADMIN`; configure | Vault `0x69da14d9a33efa32e535c3ea0da9e341ff1b8cfa`, 1 transaction (libraries reused), 5,445,268 gas; batch written, nothing broadcast; decoded independently to `grantRole(keccak("KEEPER_ROLE") = 0xfc8737ab…4fab, keeper)` and `grantRole(keccak("GUARDIAN_ROLE") = 0x55435dd2…5041, guardian)` |
-| B2 the Safe executes that exact file; verify | 2 transactions; 63 of 63 |
+| A6 renounce; verify, safe phase | deployer renounced; **72 of 72** with the owner set pinned; a configure signed by the renounced key refused: "ADMIN_PK does not hold DEFAULT_ADMIN_ROLE" |
+| B1 deploy, `SAFE_ADMIN`, Overcall's Clear (the default); configure | Vault `0x69da14d9a33efa32e535c3ea0da9e341ff1b8cfa`, 1 transaction (libraries reused), 5,831,215 gas; `clear()` re-read as Overcall's; batch written, nothing broadcast; decoded independently to `grantRole(keccak("KEEPER_ROLE") = 0xfc8737ab…4fab, keeper)` and `grantRole(keccak("GUARDIAN_ROLE") = 0x55435dd2…5041, guardian)` |
+| B2 the Safe executes that exact file; verify | 2 transactions; **71 of 71** |
 | B3 executor on a non-anvil node | refused against the public RPC (simulation only): "ExecuteSafeBatch runs on an anvil node only" |
-| Verify has teeth (2) | one byte of vault code flipped with `anvil_setCode` (byte 100, 0xab → 0xaa): "vault: runtime == compiled Vault" FAIL |
+| B4 Verify has teeth (2) | one byte of vault code flipped with `anvil_setCode` (byte 100, 0xcb → 0xca): "vault: runtime == compiled Vault" FAIL |
 
-Found while building it: without `--no-storage-caching`, the tamper test passed, because forge served
-the vault's code from its fork cache for an unchanged block number. That is the reason for the warning
-above, and the chain-4663 cache on the rehearsal machine was cleared.
+Found while re-running it after the redesign: (1) the script's create probe had `--rpc-url` after
+`--create`, which `cast` (1.3.5) rejects because `--create` is a subcommand, so the probe had never
+run; (2) `forge script --broadcast` stops at an interactive EIP-170 confirmation for the 25,470 B
+Vault whatever `code_size_limit` says, fatal on a non-terminal, hence `--non-interactive` in the
+script and in the A1/B1 commands above. The earlier record (commit `6ed528f`, pre-redesign, fork
+block 62212405, Verify 55/61/64/63) is superseded; its finding stands: without
+`--no-storage-caching`, the tamper test passed because forge served the vault's code from its fork
+cache for an unchanged block number, which is the reason for the warning above.
 
 What this rehearsal does **not** prove:
 

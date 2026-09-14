@@ -68,6 +68,17 @@ contract VaultHandler is Test {
     uint256 public totalAssignedOut;
     /// @notice Asset base units the issuer has burnt out of the vault with `adminBurn`. Gone for good.
     uint256 public totalBurned;
+    /// @notice Contracts the vault has SOLD over the whole run, every cycle summed: the fill sizes of
+    ///         every successful `fill`. Under write on fill this is also everything it ever wrote.
+    /// @dev The other side of {totalAssignedOut}: the vault can only be assigned on collateral it
+    ///      put behind a contract it sold, so the lifetime assignment is bounded by the lifetime
+    ///      sale ({VaultInvariantTest.invariant_assignedNeverExceedsSold}). Stated in contracts;
+    ///      the bound multiplies by the lot.
+    uint256 public totalSold;
+    /// @dev Every option id the vault has ever armed, in order, so the option-token supply of each
+    ///      can be tied back to its holders and its unexercised buckets after the cycle is over as
+    ///      well as during it ({VaultInvariantTest.invariant_longSupplyIsUnexercisedCollateral}).
+    uint256[] internal armedIds;
     /// @notice The part of every burn that landed on `reservedAssets` rather than on live shares:
     ///         `max(reserved - balanceAfter, 0) - max(reserved - balanceBefore, 0)`, summed over burns.
     /// @dev A shortfall of the balance below the reserve can ORIGINATE only in a burn. Payouts
@@ -620,6 +631,11 @@ contract VaultHandler is Test {
     }
 
     /// @notice The USDG counterpart of {strandAssetsLeft}, inside `usdgReservedForQueue`.
+    /// @notice Every option id the vault has armed this run, oldest first.
+    function armedOptionIds() external view returns (uint256[] memory) {
+        return armedIds;
+    }
+
     function strandUsdgLeft() public view returns (uint256 left) {
         for (uint256 g = 1; g <= vault.strandGen(); g++) {
             (,,,, uint256 usdgLeft) = vault.strands(g);
@@ -660,6 +676,7 @@ contract VaultHandler is Test {
             assertEq(vault.claimKey(), 0, "arming opened a claim");
             assertEq(vault.optionId(), optionId, "armed the wrong type");
             assertEq(vault.cycleNumber(), number + 1, "the vault's own counter did not advance");
+            armedIds.push(optionId);
             succeeded++;
             cOpen++;
         } catch (bytes memory err) {
@@ -939,6 +956,7 @@ contract VaultHandler is Test {
 
             // WRITTEN == SOLD, BY CONSTRUCTION.
             assertEq(vault.contractsWritten(), writtenBefore + fillAmount, "the fill did not write exactly its size");
+            totalSold += fillAmount;
             assertEq(clear.balanceOf(address(vault), live.optionId), 0, "option tokens stayed in the vault");
             assertEq(clear.balanceOf(address(vault), vault.claimKey()), 1, "the vault does not hold its claim");
             if (keyBefore == 0) {
@@ -1574,8 +1592,9 @@ contract VaultHandler is Test {
 }
 
 /// @notice Stateful invariants for {Vault} (tasks I-01, I-02).
-/// @dev The ten properties below are the ones that, if they ever stop holding, mean someone
-///      cannot be paid. They are checked after every single handler call, in every phase, with
+/// @dev The thirteen properties below are the ones that, if they ever stop holding, mean someone
+///      cannot be paid or the vault has written what it did not sell. They are checked after every
+///      single handler call, in every phase, with
 ///      collateral locked, orders half filled, buyers assigned, redeemers queued, USDG paused or
 ///      frozen, the vault blocklisted on its Stock Token and claims stranded (F-02).
 /// forge-config: default.invariant.runs = 64
@@ -1594,22 +1613,16 @@ contract VaultInvariantTest is BaseTest {
     ///      queued shares sit in escrow AT the vault and keep accruing until settlement, so
     ///      leaving it out of the solvency sum would understate what the vault owes.
     address[5] internal holders;
+    /// @dev The third-party writer and exerciser, the only address besides the buyer that can ever
+    ///      hold an option token of an id the vault armed.
+    address internal mallory;
 
     function setUp() public override {
         super.setUp();
 
+        mallory = makeAddr("mallory");
         handler = new VaultHandler(
-            vault,
-            nvda,
-            usdg,
-            mockClear,
-            mockSeaport,
-            feed,
-            buyer,
-            makeAddr("mallory"),
-            admin,
-            guardian,
-            [alice, bob, carol]
+            vault, nvda, usdg, mockClear, mockSeaport, feed, buyer, mallory, admin, guardian, [alice, bob, carol]
         );
 
         // Hoisted: reading KEEPER_ROLE is itself an external call and would eat the prank.
@@ -1958,6 +1971,61 @@ contract VaultInvariantTest is BaseTest {
         }
     }
 
+    /// @notice THE F-01 BOUND, LIFETIME FORM. Over the whole run, every asset base unit the vault's
+    ///         claims ever gave up to an exerciser is backed by a contract the vault SOLD; and the
+    ///         live claim is never assigned on more than `contractsWritten`, which under write on
+    ///         fill is what this cycle sold.
+    /// @dev {invariant_reservesAreReal} states the per-claim identity against Valorem's WAD figures.
+    ///      This one is the cumulative statement across cycles, which is the number a depositor
+    ///      cares about: with a third-party writer steering the bucket, exercising far more than the
+    ///      vault sold, the vault's lifetime assignment still never exceeds `totalSold` lots. Before
+    ///      the redesign the same handler (pre-writing at arm) would have failed it in the first
+    ///      in-the-money week.
+    function invariant_assignedNeverExceedsSold() public view {
+        assertLe(
+            handler.totalAssignedOut(),
+            handler.totalSold() * 1e18,
+            "the vault has been assigned on more collateral than it ever sold contracts for"
+        );
+        uint256 written = vault.contractsWritten();
+        assertLe(vault.contractsAssigned(), written, "this cycle: assigned on more than it sold");
+        uint256 key = vault.claimKey();
+        if (key != 0) {
+            IValoremClear.Claim memory c = mockClear.claim(key);
+            assertLe(c.amountExercised, written * 1e18, "Valorem assigned the vault on more than it wrote (and sold)");
+        }
+    }
+
+    /// @notice Long supply is unexercised collateral, for every option id the vault ever armed. Every
+    ///         option token outstanding is held by a buyer or the third-party writer, never the
+    ///         vault, and their number equals the contracts still unexercised across the id's
+    ///         buckets, whose collateral sits in the clearinghouse.
+    /// @dev Upstream Clear keeps this implicitly: `write` mints exactly what it collateralises and
+    ///      `exercise` burns exactly what it assigns. {MockClear} tracks the supply so the suite can
+    ///      say it out loud, on the armed id and on every earlier one (an expired id's longs are
+    ///      never burnt, and its buckets never move again, so the identity has to survive the
+    ///      close). It is what makes {invariant_vaultHoldsNoOptionTokens} mean "the vault wrote
+    ///      nothing it did not sell" rather than only "the vault's balance is zero": if a write ever
+    ///      minted more than it collateralised, or an exercise burnt less than it assigned, the
+    ///      supply would stop matching the buckets here.
+    function invariant_longSupplyIsUnexercisedCollateral() public view {
+        uint256[] memory ids = handler.armedOptionIds();
+        for (uint256 i; i < ids.length; i++) {
+            uint256 id = ids[i];
+            uint256 supply = mockClear.optionSupply(id);
+            assertEq(supply, mockClear.unexercisedContracts(id), "option tokens outstanding != unexercised contracts");
+            assertEq(
+                supply,
+                mockClear.balanceOf(buyer, id) + mockClear.balanceOf(mallory, id)
+                    + mockClear.balanceOf(address(vault), id),
+                "option tokens outstanding are not all in the buyer's and the third-party writer's hands"
+            );
+            assertEq(
+                mockClear.balanceOf(address(vault), id), 0, "the vault holds an option token of a past or live cycle"
+            );
+        }
+    }
+
     /// @notice Idle means flat. If it does not, instant redemption would pay out collateral
     ///         that is still collateralising somebody's short call.
     ///
@@ -2291,6 +2359,8 @@ contract VaultInvariantTest is BaseTest {
         invariant_depositGateTracksTheReserve();
         invariant_strandSharesAreConserved();
         invariant_vaultHoldsNoOptionTokens();
+        invariant_assignedNeverExceedsSold();
+        invariant_longSupplyIsUnexercisedCollateral();
     }
 
     /// @notice Proves the handler reaches a stranded close (F-02), the queue paying its idle slice

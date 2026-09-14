@@ -53,15 +53,23 @@ Bounding it (a cap on unsold inventory) was rejected in favour of closing it:
 
 **What stands behind this, and what does not (decision D14).** There is no external audit and no
 separate internal security gauntlet. The contracts are unaudited. The gate is the test suite:
-`forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (397 tests;
+`forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (399 tests;
 the invariant campaign runs 64 × 600 calls with a third-party writer and exerciser in the vault's
-bucket and asserts after every call that the vault holds no option token and is assigned on no more
-than it sold), the real Seaport 1.6 runtime driven through every fulfilment path (single, advanced
-fractions, the same listing twice in one `fulfillAvailableAdvancedOrders` within and beyond the
-remainder, match, basic, skip-versus-revert, a hostile contract buyer), and the fork suite against
-chain 4663 (first fill and top-up fill through the live Seaport and Clear, exercising transient
-storage on the live EVM). Findings 9, 12, 13, 16 and 17 in §4 describe mechanisms the redesign
-removed (`writeMore`, price-cut slots, `invalidateStaleListing`); they stay as history.
+bucket and asserts after every call, through thirteen invariants, that the vault holds no option
+token, that its lifetime assignment never exceeds the contracts it sold, and that every armed id's
+option-token supply equals its unexercised collateral and sits with the buyer or the adversary),
+the real Seaport 1.6 runtime driven through every fulfilment path (single, advanced fractions, the
+same listing twice in one `fulfillAvailableAdvancedOrders` within and beyond the remainder, match,
+basic, skip-versus-revert, a hostile contract buyer), the fork suite against chain 4663 (20 tests:
+first fill and top-up fill through the live Seaport and Clear; an assigned week exercised by the
+buyer and closed by a stranger with assignment equal to what was sold and the strike credited
+fee-free; an unfilled week closing flat; a stranded close under the REAL USDG `ASSET_PROTECTION`
+freeze of the vault and its permissionless recovery after the unfreeze; the TSTORE/TLOAD create
+probe answered by the live node through the RPC), and the deploy rehearsal on an anvil fork with
+the chain's 98,304 B code limit (`script/rehearse-deploy.sh`: our own Clear deployed from the
+vendored artifact and used on path A, Overcall's on path B, both admin paths, Verify's teeth).
+Findings 9, 12, 13, 16 and 17 in §4 describe mechanisms the redesign removed (`writeMore`,
+price-cut slots, `invalidateStaleListing`); they stay as history.
 
 ## 1. The one-sentence model
 
