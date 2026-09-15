@@ -11,10 +11,17 @@ the order's zone, and every fill of that listing WRITES exactly the filled contr
 inside Seaport's `authorizeOrder` hook (**write on fill**: the vault never holds an unsold option
 token, so `written == sold` by construction). The USDG premium accrues to holders through a
 per-share index. The protocol fee is 5% of premium only; strike proceeds from an assignment are
-credited to holders fee-free. There is no dependency on Overcall's registry or order book: the
-vault validates the option type from the clearinghouse itself and sells through its own fill page.
-Nothing is deployed yet, and the contracts are **unaudited** (owner decision 2026-09-13: no
-external audit; the gate is the test suite described below, and that is the whole gate).
+credited to holders fee-free. Overcall's registry, order book and venue fee belonged to the earlier
+design and are not used: the vault validates the option type from the clearinghouse itself, and its
+one venue is the app's cycle page, `app.stonkhouse.fun/vault/nvda/cycle`.
+
+The vault is live on chain 4663 at `0x88a98931E3682137E7e4D3426f623247f4A4ecbb` (deployed
+2026-09-15; its on-chain name "Callhouse NVDA" and symbol `cNVDA` date from before the rename), and
+it settles on our own Valorem Clear, `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`.
+`docs/DEPLOY.md` "Live deployment" lists every address, who holds each key and what is
+source-verified. The contracts are **unaudited**: there is no external audit (owner decision
+2026-09-13). What stands behind them is the test suite described below and the internal reviews in
+`SECURITY.md` §4, the latest on 2026-09-14 (no Critical, High or Medium findings).
 
 This repository is the contracts, and the thing any review would target. The app (keeper,
 indexer, web, ops) lives in leekzor/callhouse and mounts this repository as a git submodule at
@@ -54,7 +61,7 @@ test/
   unit/                     per-surface suites, incl. VaultWriteOnFill (mock hooks) and VaultRealSeaport (every real fulfil path)
   regression/               the audit PoCs (AF-01..AF-05, L-01), each asserting the FIXED behaviour
   invariant/                stateful campaign, thirteen invariants, with a third-party writer in the vault's bucket
-  fork/                     against live chain 4663 (a whole week through the live Seaport and Clear, the real USDG freeze)
+  fork/                     against live chain 4663 (a whole week on a test-deployed vault through the live Seaport and Overcall's Clear, the real USDG freeze)
 script/
   Deploy.s.sol              constructor args, with an on-chain preflight (decimals, Clear fee state, Seaport 1.6)
   DeployClear.s.sol         OPTIONAL: our own ValoremOptionsClearinghouse from the vendored artifact
@@ -107,10 +114,47 @@ week. The redesign closes it by construction rather than by bounding it:
 
 `test/regression/AF01_UnsoldInventory.t.sol` replays the audit's unsteered and steered attacks on
 the real Clear bytecode and asserts the depositor ends exactly where the honest week left her.
-`test/unit/VaultRealSeaport.t.sol` drives every real Seaport 1.6 fulfilment path against the vault
-(`fulfillOrder`, `fulfillAdvancedOrder`, `fulfillAvailableAdvancedOrders` with the same listing
-twice, `matchAdvancedOrders`, `fulfillBasicOrder`), including the whole-transaction revert when
-two occurrences overfill the remainder.
+`test/unit/VaultRealSeaport.t.sol` drives five of the real Seaport 1.6 runtime's eight fulfilment
+entrypoints against the vault (`fulfillOrder`, `fulfillAdvancedOrder`,
+`fulfillAvailableAdvancedOrders` with the same listing twice, `matchAdvancedOrders`,
+`fulfillBasicOrder`), including the whole-transaction revert when two occurrences overfill the
+remainder. No test calls `fulfillAvailableOrders`, `matchOrders` or
+`fulfillBasicOrder_efficient_6GL6yc`.
+
+### Buying and exercising
+
+The app's cycle page serves the keeper's listing, a pre-validated order with an empty signature,
+after checking it against `vault.listingHash()`; the same order also fills through any Seaport 1.6
+client. A buyer receives ERC-1155 id `vault.optionId()` on the Clear. Each unit is the right to buy
+1 NVDA Stock Token for `cycleStrikeUsdg` USDG base units (cycle 1: 223 USDG), and the Clear's
+`exercise` accepts it only while `exerciseTimestamp <= block.timestamp < expiryTimestamp` (cycle 1:
+Fri 2026-09-18 20:00 UTC to Sat 2026-09-19 20:00 UTC).
+
+The live app has no exercise control: the Exercise card described next is not deployed to
+`app.stonkhouse.fun` (checked 2026-09-15), so today a holder exercises on the Clear directly, as in
+the paragraph after it.
+
+Once deployed, the card appears on the cycle page only for a connected wallet whose balance of
+`vault.optionId()` is above zero. It shows that balance, the strike, the NVDA received per contract,
+the exercise and expiry times (UTC and Eastern) and exact USDG totals, and it takes the window from
+the chain's latest block, not the device clock. The Exercise button is enabled only inside the
+window. The holder picks a whole number of contracts up to the balance; the app simulates
+`exercise(optionId, amount)` and shows what the result means, asks for a USDG approval to the Clear
+of exactly the total (the strike cost plus the Clear fee if fees are ever switched on) only when the
+current allowance is below that total, then calls `exercise`. It warns, and requires explicit
+confirmation, when spot times the NVDA received is at or below that total (exercising then costs at
+least as much as the NVDA is worth) or when spot cannot be read. A simulation that fails for a
+reason the app does not recognise leaves the button enabled, and the wallet shows the outcome.
+After expiry the card says the options expired worthless, but only while the vault still names that
+option: `rollClose` zeroes `vault.optionId()` unless the claim strands, and the card then
+disappears.
+
+Without the app, call `exercise(uint256 optionId, uint112 amount)` on the Clear
+`0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6` directly, after approving the Clear for
+`exerciseAmount × amount` USDG (plus `max(floor(that × 15 / 10_000), 1)` if `feesEnabled()`). The
+Clear burns the options (no ERC-1155 approval needed), pulls the USDG, sends 1e18 NVDA base units
+per contract, and does not check whether the option is in the money. Nothing is exercised
+automatically: from `expiryTimestamp` the call reverts `ExpiredOption` and the tokens are worthless.
 
 ---
 
@@ -146,9 +190,12 @@ every call a test makes runs as its own transaction, as it does on chain.
 
 `.github/workflows/ci.yml` runs two jobs: build, format, unit and invariant tests (with a
 non-blocking coverage summary), and the fork tests against chain 4663, using the `RH_RPC` secret
-when it is set and the public endpoint otherwise. Every GitHub Actions run on the leekzor account
-currently dies with `startup_failure` at the account level (billing), before any step runs. Until
-that is fixed CI proves nothing, and the gate is the four commands above run locally:
+when it is set and the public endpoint otherwise. The runs for `165b4ab` and `0e2f6f6` on `main`
+(2026-09-15) pass the fork job and fail the build job: two suites, `VaultInvariant.t.sol` and
+`VaultQueue.t.sol`, revert `CreateContractSizeLimit` deploying their test contract under forge
+`stable`, so that job ran 341 tests (339 passed, 2 failed) instead of 405. The last green build job
+was `634bf55` on 2026-09-13. Until the build job is green, CI does not confirm the offline suite,
+and the gate is the four commands above run locally:
 `forge fmt --check`, `forge build --sizes`, the unit and invariant suite, and the fork suite. Run
 them with `set -o pipefail` when piping: a piped failure that hides behind `tee` is a passed gate
 that did not pass.
@@ -156,12 +203,13 @@ that did not pass.
 There is no external audit (owner decision D14, 2026-09-13) and no separate security gauntlet.
 The contracts are unaudited. What stands behind them is the gate above: 405 tests including the
 five audit proofs of concept re-asserted as fixed behaviour on the real Valorem bytecode, the
-real Seaport 1.6 runtime driven through every fulfilment path, a 64 × 600 stateful campaign with a
+real Seaport 1.6 runtime driven through five of its eight fulfilment entrypoints, a 64 × 600 stateful campaign with a
 third-party writer in the vault's bucket (thirteen invariants, among them: the vault never holds
 an unsold option token, its lifetime assignment never exceeds what it sold, and option-token
 supply equals unexercised collateral for every id it ever armed), the fork suite against chain
-4663 (an assigned week and an unfilled week settled on the live Clear through the live Seaport, a
-stranded close under the real USDG freeze role and its recovery, the TSTORE probe answered by the
+4663 (on a vault the suite deploys against the live Seaport and Overcall's live Clear
+`0x9a7b…C0C0`, whose runtime equals ours except the metadata hash; it never touches the live vault
+or our Clear: an assigned week and an unfilled week settled, a stranded close under the real USDG freeze role and its recovery, the TSTORE probe answered by the
 live node), and `script/rehearse-deploy.sh` on an anvil fork of 4663 with the chain's 98,304 B
 code limit (our own Clear deployed and used on path A, Overcall's on path B; `docs/DEPLOY.md`).
 
@@ -235,9 +283,11 @@ the vault. Foundry does this automatically during `forge script`; to link manual
 `--libraries` once per library.
 
 The full runbook, rehearsed on a fork with real Safes, is **[`docs/DEPLOY.md`](docs/DEPLOY.md)**
-(`script/rehearse-deploy.sh` reproduces it, including negative checks). The launch plan for now is a
-**bootstrap admin**: the deployer key holds `DEFAULT_ADMIN_ROLE` at launch and hands it to the 2-of-3
-Safe later. In short (pass `--no-storage-caching` to every call; see the runbook for why):
+(`script/rehearse-deploy.sh` reproduces it, including negative checks). The live vault was deployed
+with a **bootstrap admin**: the deployer, the hot EOA `0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b`,
+holds `DEFAULT_ADMIN_ROLE` alone, with no timelock. Handing it to a Safe (`HandoverAdmin.s.sol`,
+which refuses a threshold below 2) is planned and has not been done. In short (pass
+`--no-storage-caching` to every call; see the runbook for why):
 
 ```bash
 ADMIN=<deployer address> forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --verify ...
@@ -253,7 +303,9 @@ ADMIN_PHASE=safe forge script script/Verify.s.sol --rpc-url $RH_RPC
 Until the handover, the deployer key has every admin power (fee up to 20% of premium and its
 recipient, deposit cap, policy inside the hard caps, role grants). `Verify.s.sol` compares the
 deployed vault and libraries byte for byte with this commit's build and checks every immutable,
-parameter, role and Safe setting.
+parameter, role and Safe setting. As written it cannot pass against the live vault: it requires
+`policy.minPremiumBps == 40` (`Policy.launchDefaults()`, no override; live is 10) and, unless
+`EXPECT_FRESH=false`, a vault with no cycle and no shares (`docs/DEPLOY.md`, "Live deployment").
 
 `Deploy.s.sol` runs an on-chain preflight before broadcasting: the asset has 18 decimals and USDG 6
 (every unit convention in `Policy` rests on that), the clearinghouse reports `feeBps() == 15` with
@@ -262,7 +314,9 @@ ConduitController, and the price feed answers with 8 decimals. There is no regis
 more. `CLEARINGHOUSE` defaults to Overcall's unmodified Clear instance
 (`0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0`, whose `feeTo` key holds only the 15 bps fee switch,
 which the vault treats as opt-in); `script/DeployClear.s.sol` deploys an instance of our own from the
-vendored upstream artifact if that dependency is not wanted. `Verify.s.sol` also pins the live
+vendored upstream artifact if that dependency is not wanted. The live vault uses such an instance,
+`0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`, whose `feeTo` is the 1-of-1 Safe
+`0xff1454009F024507f3E455eb2027E98fAF4ccF61`. `Verify.s.sol` also pins the live
 Seaport runtime's `extcodehash` to the 4663 Seaport 1.6 runtime the tests were run against.
 
 Source verification goes through **Sourcify**, which supports chain 4663 (`forge verify-contract
@@ -271,11 +325,18 @@ Source verification goes through **Sourcify**, which supports chain 4663 (`forge
 ("Verify & publish → via Sourcify"). Blockscout's own API sits behind a Cloudflare challenge that
 `forge` cannot pass, so do not point `--verifier blockscout` at it.
 
+Live verification status: the vault and both libraries are a Sourcify `match` (partial, not
+`exact_match`); Blockscout shows the vault as partially verified and holds no source for the
+libraries. Our Clear is not source-verified on Sourcify or Blockscout. Its 16,110 B runtime is
+byte-identical to Overcall's Clear `0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0` except the CBOR
+metadata hash, and that instance is a Sourcify `exact_match` to `valorem-labs-inc/clear` @
+`6436c823`.
+
 **Cycle timing** is a keeper concern, not a contract one: the vault reads exercise and expiry from
-the option type it arms and never the wall clock. The weekly type the keeper creates should expire
-at the US close, Friday 16:00 ET, which is 20:00 UTC while US daylight saving is in effect and
-21:00 UTC otherwise (DST ends 2026-11-01); a full-day NYSE holiday on a Friday moves it to
-Thursday's close. `MAX_CYCLE_TENOR` (21 days) tolerates both.
+the option type it arms and never the wall clock. The weekly type the keeper creates opens exercise at the
+US close, Friday 16:00 ET, which is 20:00 UTC while US daylight saving is in effect and 21:00 UTC
+otherwise (DST ends 2026-11-01), and expires 24 hours later, on Saturday (`expiryTs = exerciseTs +
+86400`); a full-day NYSE holiday on a Friday moves the exercise time to Thursday's close. `MAX_CYCLE_TENOR` (21 days) tolerates both.
 
 ---
 
@@ -283,17 +344,17 @@ Thursday's close. `MAX_CYCLE_TENOR` (21 days) tolerates both.
 
 | Role | Holder | Powers |
 |---|---|---|
-| `DEFAULT_ADMIN_ROLE` | 2/3 Safe | set the keeper, the fee recipient, the policy inside hard caps, the deposit cap, `maxPriceAge`, accept the Valorem fee, unhalt |
-| `KEEPER_ROLE` | hot wallet | `rollOpen(optionId)` (arms a type it or anyone created on the clearinghouse), `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
-| `GUARDIAN_ROLE` | 1/1 hardware key | `haltWrites` (stops arms, listings AND fills instantly), `cancelListing`, `invalidateAllListings`. It can stop, never start: `unhaltWrites` is admin-only |
+| `DEFAULT_ADMIN_ROLE` | hot EOA `0xEb82…9d9b` (the deployer), alone; no timelock; the handover to a Safe is planned, not done | grant and revoke every role, set the fee recipient, the policy inside hard caps, the deposit cap (unbounded), `maxPriceAge`, accept the Valorem fee, halt and unhalt. Every change takes effect immediately |
+| `KEEPER_ROLE` | hot EOA `0x06c1…C1d2` | `rollOpen(optionId)` (arms a type it or anyone created on the clearinghouse), `approveListing`, `cancelListing`, `invalidateAllListings`, `rollClose` |
+| `GUARDIAN_ROLE` | EOA `0x2974…6F39`, derived from the same mnemonic as the admin and keeper keys | `haltWrites` (stops arms, listings AND fills instantly), `cancelListing`, `invalidateAllListings`. It can stop, never start: `unhaltWrites` is admin-only |
 | Seaport 1.6 | the protocol contract | `authorizeOrder` / `validateOrder`, the zone hooks that write on every fill; nobody else may call them (`NotSeaport`) |
 | anyone | — | `lockBook` after the exercise timestamp; `rollClose` after expiry + 1 hour; `settleQueue` while `Idle` with shares queued; `retryStrandedClaim` whenever a claim is stranded; `sweepFee` whenever a fee is pending; buying the listed calls through any Seaport fulfil function; writing the same option id on Valorem and exercising (assigning the vault pro rata on what it SOLD, nothing more) |
 
 The keeper cannot move a token, but it chooses the option type (strike, window) inside the arm
 gate and sets the sale price inside policy, and a compromised keeper (or the bootstrap admin,
 which can loosen policy and grant itself the keeper role) can sell at the floor to itself: about
-1.1% of sold notional per week at launch policy, about 2.2% for the admin. SECURITY.md §3 has the
-derivation.
+1.5% of sold notional per week at the live policy (3% OTM band floor, 0.10% premium floor, 50%
+implied volatility), about 2.2% for the admin. SECURITY.md §3 has the derivation.
 
 A halt blocks `rollOpen`, `approveListing` and every fill (`authorizeOrder` refuses) **only**.
 `queueRedeem`, `settleQueue`, `completeRedeem`, `claimUsdg`, `retryStrandedClaim`,
@@ -322,17 +383,18 @@ impossible — that was the critical finding of the 2026-09-12 review, written u
 
 Governance cannot exceed these. `Policy.validate` is called on construction and on every update.
 
-| Parameter | Launch | Hard bound |
+| Parameter | Live (`policy()`, 2026-09-15) | Hard bound |
 |---|---|---|
 | `minOtmBps` | 300 | **floor** 100 — stops an admin selling at-the-money |
 | `maxOtmBps` | 1200 | ceiling 2500 |
-| `minPremiumBps` | 40 | floor 10 |
+| `minPremiumBps` | 10 (`Policy.launchDefaults()` sets 40; the admin lowered it with `setPolicy` on 2026-09-15 and can change it again, down to the floor) | floor 10 |
 | `maxUtilizationBps` | 9500 | ceiling 9985 (leaves Valorem's 15 bps fee inside the free balance) |
 | `protocolFeeBps` | 500 (5% of premium) | ceiling 2000. The fee base is premium only: strike proceeds from assignment are excluded in `Vault._accrueHarvest`, at any setting |
 | `maxContractsCap` | 50 | must be non-zero |
 | `maxPriceAge` | 4 days | 1 hour to 7 days |
+| `depositCap` | 20 NVDA | none: `setDepositCap` is unbounded, and 0 closes deposits |
 | listings per cycle | 3 | constant `Policy.MAX_LISTINGS_PER_CYCLE`; every `approveListing` spends one, cancelled or not. A listing is sized to capacity and Seaport tracks the fraction filled, so a relist is a reprice |
-| exercise lead / window / tenor | 1 hour / 1 day / 7 days | `ValoremLib.MIN_LEAD` (exercise at least 1 hour after the arm), `MIN_EXERCISE_WINDOW` (at least 1 day), **`MAX_CYCLE_TENOR` 21 days** — a bad option type skips a week, it cannot lock collateral for years or be assigned in the block it was sold |
+| exercise lead / window / tenor | compiled, not a policy field | `ValoremLib.MIN_LEAD` (exercise at least 1 hour after the arm), `MIN_EXERCISE_WINDOW` (at least 1 day), **`MAX_CYCLE_TENOR` 21 days** — a bad option type skips a week, it cannot lock collateral for years or be assigned in the block it was sold |
 
 ---
 

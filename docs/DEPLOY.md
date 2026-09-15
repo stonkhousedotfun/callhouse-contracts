@@ -4,26 +4,64 @@ The contract-side runbook for mainnet (chain 4663). Hosting the keeper, indexer 
 separate runbook, `ops/deploy.md` in leekzor/callhouse. Every step here is rehearsed end to end by
 `script/rehearse-deploy.sh` on an anvil fork; the latest record is at the bottom.
 
-**Nothing here is done yet.** The contracts are unaudited and stay labelled so (owner decision D14:
-no external audit; the gate is the test suite, README "CI, and why the local gate is the gate"). Do
-not run the mainnet steps on a commit that has not passed the full gate, fork suite and rehearsal
-included, or that differs from the commit `Verify.s.sol` will be run from.
+**The live vault was deployed on 2026-09-15 on path A** (our own Clear from A0, a bootstrap admin,
+keeper and guardian granted); the handover (A4) has not been done. "Live deployment" below records
+what is on chain. The contracts are unaudited and stay labelled so (owner decision D14: no external
+audit; the gate is the test suite, README "CI, and why the local gate is the gate"). Do not run the
+mainnet steps on a commit that has not passed the full gate, fork suite and rehearsal included, or
+that differs from the commit `Verify.s.sol` will be run from.
+
+## Live deployment (chain 4663, read 2026-09-15)
+
+| What | On chain |
+|---|---|
+| Vault | `0x88a98931E3682137E7e4D3426f623247f4A4ecbb`, block 63,467,882 (2026-09-15 07:06 UTC), tx `0x40ed4448…91f2842`, 25,775 B runtime. `name()` "Callhouse NVDA", `symbol()` `cNVDA`, set before the rename |
+| SeaportOrderLib | `0x6B617a0B578Ef6EDCD07774468f08b3778272D8A` (CREATE2 factory, block 63,467,831) |
+| ValoremLib | `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d` (CREATE2 factory, block 63,467,856) |
+| Clearinghouse (A0) | our own `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`, block 63,467,465, runtime equal to `script/artifacts/ValoremOptionsClearinghouse.json`; `feesEnabled()` false, `feeBps()` 15 |
+| Clear `feeTo` | Safe `0xff1454009F024507f3E455eb2027E98fAF4ccF61`, Safe 1.4.1, **1 of 1** (owner `0x7A3a8C3F6331f63107D5b3aEeA0515e799022C32`), no modules, no guard, nonce 0; no `setFeeTo` pending |
+| `DEFAULT_ADMIN_ROLE` | EOA `0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b` (the deployer), alone, no timelock |
+| `KEEPER_ROLE` | EOA `0x06c131cfEd73A56893f5eB52D17252856FAFC1d2` |
+| `GUARDIAN_ROLE` | EOA `0x29741A8d283a253E8Ce10aDfd04C6507438b6F39` (no transaction sent yet) |
+| `feeRecipient()` | the admin EOA `0xEb82…9d9b` |
+| `policy()` | `minOtmBps` 300, `maxOtmBps` 1200, **`minPremiumBps` 10**, `maxUtilizationBps` 9500, `protocolFeeBps` 500, `maxContractsCap` 50. `minPremiumBps` was lowered from `launchDefaults()`' 40 by `setPolicy` (tx `0x97b7e529…8dc37b`); the admin can change any field inside the compiled bounds, immediately |
+| Other parameters | `depositCap()` 20 NVDA, `maxPriceAge()` 345,600 s (4 days), `valoremFeeAccepted()` false, `writesHalted()` false |
+| Source verification | vault and both libraries: Sourcify `match` (partial, not `exact_match`). Blockscout: the vault partially verified, no source for the libraries. Our Clear: not source-verified on Sourcify or Blockscout; its runtime equals Overcall's Sourcify-`exact_match` Clear `0x9a7b…C0C0` except the CBOR metadata hash |
+
+Where the live deployment departs from the plan in this runbook:
+
+- The handover (A4) has not been done, and deposits are open (cap 20 NVDA) under the one-key admin
+  in the warning below. That key is a hot EOA, and it also receives the protocol fee.
+- The fee recipient is the admin EOA, not a fee Safe.
+- Our Clear's `feeTo` is a 1-of-1 Safe, not the 2-of-3 admin Safe of the 2026-09-14 owner decision
+  in A0.
+- The admin, keeper and guardian keys are derived from one mnemonic; the guardian is not a separate
+  hardware key.
+- This file records no `Verify.s.sol` run against the live deployment, and the script cannot pass
+  against it as written: `_parameters` requires `policy.minPremiumBps == 40` from
+  `Policy.launchDefaults()` with no override (live is 10), `_freshState` runs unless
+  `EXPECT_FRESH=false` and requires phase Idle, cycle 0 and no shares (live: Listed, cycle 1,
+  1.06e18 shares), and `feeRecipient` and `depositCap` must be passed as `SAFE_FEE` (the admin EOA)
+  and `DEPOSIT_CAP`. So the A4 `VERIFY PASSED` step cannot pass on the live vault unless the
+  script or the live policy changes.
+- The planned 1-contract fill before the first live week (see "Hand over to the app") was not done:
+  cycle 1 was armed and listed without it, and as of 2026-09-15 no fill has happened.
 
 ---
 
 ## The plan: bootstrap admin now, Safe later
 
 `Deploy.s.sol` gives `DEFAULT_ADMIN_ROLE` to exactly one address at construction: `ADMIN` if set,
-otherwise `SAFE_ADMIN`. **The launch plan for now is `ADMIN` = the deployer's own address**
-("bootstrap"). The deployer key then configures the vault directly, and the admin role moves to the
-2-of-3 Safe later with `script/HandoverAdmin.s.sol`.
+otherwise `SAFE_ADMIN`. **The live vault used `ADMIN` = the deployer's own address**
+("bootstrap"). The deployer key then configures the vault directly, and the admin role can move to
+a Safe later with `script/HandoverAdmin.s.sol` (planned, not done).
 
 > **Warning.** Until the handover completes, whoever holds the deployer key holds every vault admin
 > power: setting the protocol fee up to its 20%-of-premium ceiling and its recipient, the deposit
 > cap, the policy inside its hard caps, the price age, unhalting, accepting the Valorem engine fee,
 > and granting or revoking every role (including granting itself `KEEPER_ROLE`). It does **not**
-> hold Clear's `feeTo` on the launch plan (that is the admin Safe from A0). Keep that key offline,
-> use it only for the steps below, and schedule the handover.
+> hold Clear's `feeTo` (on the live deployment that is the 1-of-1 Safe `0xff14…CF61`). Use that key
+> only for admin steps.
 
 The alternative, still supported and rehearsed: pass `SAFE_ADMIN` and no `ADMIN`, so the Safe is
 admin from block one and every admin action is a Safe transaction (path B below).
@@ -50,7 +88,7 @@ admin from block one and every admin action is a Safe transaction (path B below)
 | Keeper key | hot EOA used by the keeper service; it can never move funds. `ops/safes.md` §2 (leekzor/callhouse) |
 | RPC | `RH_RPC`, preferably an archive endpoint |
 | Source verification | **Sourcify** (`--verifier sourcify --chain 4663`), which supports 4663 and holds exact matches for the third-party contracts already; Blockscout then imports the match with one click ("Verify & publish → via Sourcify"). Blockscout's own API sits behind a Cloudflare challenge that `forge` cannot pass, so do not use `--verifier blockscout` against it. Verify the vault AND both libraries |
-| Cycle timing (keeper) | the vault reads exercise and expiry from the option type and never the wall clock. The weekly type should expire at the US close, **Friday 16:00 ET = 20:00 UTC while US daylight saving is in effect, 21:00 UTC otherwise** (DST ends 2026-11-01), or Thursday's close when Friday is a full-day NYSE holiday; the arm gate accepts any window from 1 hour + 1 day out to 21 days, so both fit |
+| Cycle timing (keeper) | the vault reads exercise and expiry from the option type and never the wall clock. The weekly type's exercise opens at the US close, **Friday 16:00 ET = 20:00 UTC while US daylight saving is in effect, 21:00 UTC otherwise** (DST ends 2026-11-01), or Thursday's close when Friday is a full-day NYSE holiday, and it expires 24 hours later (`expiryTs = exerciseTs + 86400`, Saturday); the arm gate accepts any window from 1 hour + 1 day out to 21 days, so both fit |
 | Commit | the release tag, checked out, `forge build` clean, unit + invariant and fork suites and the rehearsal green on that exact commit. `Verify.s.sol` compares the chain against this checkout's `out/` |
 
 Checks on the day, before broadcasting:
@@ -58,7 +96,10 @@ Checks on the day, before broadcasting:
 ```bash
 forge build --sizes                              # Vault under 98,304 B (chain 4663's limit; forge's 24,576 B
                                                  # "margin" line and exit 1 are noise here, README item 1)
-cast call 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0 "feesEnabled()(bool)" --rpc-url $RH_RPC
+cast call ${CLEARINGHOUSE:-0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0} "feesEnabled()(bool)" --rpc-url $RH_RPC
+                                                 # the vault's Clear: on path A run it after A0 with $CLEARINGHOUSE
+                                                 # set (the live vault's is 0x53d7…C6; DeployClear also asserts
+                                                 # false); unset, it reads Overcall's Clear (path B)
                                                  # false; if true, stop: the engine fee needs a governance decision
 ```
 
@@ -67,13 +108,14 @@ cast call 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0 "feesEnabled()(bool)" --rpc
 > heights, so a stale cache can hand a mainnet run fake rehearsal state. If you have ever run a
 > rehearsal on this machine, also clear it: `rm -rf ~/.foundry/cache/rpc/4663`.
 
-Libraries are deployed through the deterministic CREATE2 factory (`0x4e59b44847b379578588920cA78FbF26c0B4956C`,
-present on 4663), so their addresses depend only on their bytecode, not on who deploys them, and they
-change with every library byte. For this commit (S4 rehearsal, 2026-09-13): SeaportOrderLib
-`0x6B617a0B578Ef6EDCD07774468f08b3778272D8A`, ValoremLib `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d`
-(the pre-redesign pair, SeaportOrderLib `0xAe4b…13f2` and ValoremLib `0xb1E1…1626`, is history). If
-they already exist (anyone may deploy them first), forge reuses them; `Verify.s.sol` checks their code
-byte for byte either way.
+Libraries are deployed through the deterministic CREATE2 factory
+(`0x4e59b44847b379578588920cA78FbF26c0B4956C`, present on 4663), so their addresses depend only on
+their bytecode, not on who deploys them, and they change with every library byte. For this commit
+(S4 rehearsal, 2026-09-13, and the live deployment): SeaportOrderLib
+`0x6B617a0B578Ef6EDCD07774468f08b3778272D8A`, ValoremLib
+`0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d` (the pre-redesign pair, SeaportOrderLib `0xAe4b…13f2`
+and ValoremLib `0xb1E1…1626`, is history). If they already exist (anyone may deploy them first),
+forge reuses them; `Verify.s.sol` checks their code byte for byte either way.
 
 ---
 
@@ -203,7 +245,8 @@ ADMIN_PHASE=safe EXPECTED_CLEAR_FEE_TO=$SAFE_ADMIN \
 
 Renounce refuses until the Safe's nonce has moved past `GRANT_NONCE`, so the key is never dropped
 before the Safe has executed a transaction as admin. After it, `VERIFY PASSED` in the safe phase
-(76 checks on path A, with `EXPECT_SAFE_OWNER_SET` pinning the three owners): the Safe holds admin,
+(on the live vault only once `Verify.s.sol` accepts the live policy; see "Live deployment") (76
+checks on path A, with `EXPECT_SAFE_OWNER_SET` pinning the three owners): the Safe holds admin,
 the deployer holds nothing, and Clear's `feeTo` is still the Safe (it never moved). From here every
 admin action is a Safe transaction.
 
@@ -243,11 +286,12 @@ In leekzor/callhouse:
   `contracts/out/Vault.sol/Vault.json` and run `pnpm gen:abis` in `indexer/` and `web/`.
 - Web: `NEXT_PUBLIC_VAULT`, `NEXT_PUBLIC_VAULT_FROM_BLOCK`, then **rebuild**. Indexer:
   `VAULT_ADDRESS`, `START_BLOCK`. Keeper: its environment and `KEEPER_PK` (runtime only).
-- Before the first live week: one real 1-contract fill through the self-hosted page (the vault's
-  listing is a restricted Seaport order with the vault as zone; Overcall's book does not list it, and
-  there is no EIP-1271 to settle). The keeper creates the week's option type itself with
-  `clear.newOptionType` (permissionless) and arms it with `rollOpen(optionId)`; the arm gate
-  re-reads the tuple from the clearinghouse, so a wrong strike, lot, window or asset is refused
+- Planned before the first live week, and not done: one real 1-contract fill through the app's cycle page,
+  `app.stonkhouse.fun/vault/nvda/cycle` (the vault's listing is a restricted Seaport order with the
+  vault as zone; Overcall's book does not list it, and there is no EIP-1271 to settle). Cycle 1 was armed and listed
+  without it, and as of 2026-09-15 no fill has happened on the live vault. The keeper creates the week's option type
+  itself with `clear.newOptionType` (permissionless) and arms it with `rollOpen(optionId)`; the arm
+  gate re-reads the tuple from the clearinghouse, so a wrong strike, lot, window or asset is refused
   before anything is listed.
 
 ---
@@ -282,7 +326,7 @@ returns the bytes, both checked by hand the same day.
 
 Found while re-running it after the redesign: (1) the script's create probe had `--rpc-url` after
 `--create`, which `cast` (1.3.5) rejects because `--create` is a subcommand, so the probe had never
-run; (2) `forge script --broadcast` stops at an interactive EIP-170 confirmation for the 25,765 B
+run; (2) `forge script --broadcast` stops at an interactive EIP-170 confirmation for the 25,470 B
 Vault whatever `code_size_limit` says, fatal on a non-terminal, hence `--non-interactive` in the
 script and in the A1/B1 commands above. The earlier record (commit `6ed528f`, pre-redesign, fork
 block 62212405, Verify 55/61/64/63) is superseded; its finding stands: without

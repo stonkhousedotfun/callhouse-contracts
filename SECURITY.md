@@ -12,7 +12,8 @@ what was done about it.
 
 Read `docs/ARCHITECTURE.md` (leekzor/callhouse) §2 for the trust boundaries and
 [docs/ACCOUNTING.md](docs/ACCOUNTING.md) for the money maths. The per-alert response runbooks
-are in `ops/alerts.md` (leekzor/callhouse).
+are in `ops/alerts.md` (leekzor/callhouse). Alerts are not delivered today: the keeper logs and
+stores them, and the relay that would send them is not deployed.
 
 ---
 
@@ -44,24 +45,28 @@ Bounding it (a cap on unsold inventory) was rejected in favour of closing it:
   USDG, lot 1e18, exercise ≥ 1 hour out, window ≥ 1 day, tenor ≤ 21 days, fee off or accepted,
   oracle live, strike inside the band with both bounds) and numbers its own cycles. The
   clearinghouse stays a deploy-time choice: Overcall's unmodified instance (whose key holds only the
-  15 bps fee switch, opt-in for the vault) or one of our own from `script/DeployClear.s.sol`.
+  15 bps fee switch, opt-in for the vault) or one of our own from `script/DeployClear.s.sol`. The
+  live vault uses our own, `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`.
 - **The other four** (AF-02 stranded-claim state machine, AF-03 split payout legs, AF-04 utilisation
   ceiling 9,985 plus a post-write reserve check, AF-05 honest NAV with one deposit gate and a
   pro-rata reserve haircut) are recorded in `docs/ACCOUNTING.md` and in the regressions under
   `test/regression/`, one file per finding, each asserting the FIXED behaviour on the real Valorem
   bytecode where the loss lived in Valorem's bucket engine.
 
-**What stands behind this, and what does not (decision D14).** There is no external audit and no
-separate internal security gauntlet. The contracts are unaudited. The gate is the test suite:
+**What stands behind this, and what does not (decision D14).** There is no external audit. The
+contracts are unaudited. Behind them are the internal reviews in §4 (the latest, 2026-09-14, found
+no Critical, High or Medium) and the test suite:
 `forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (405 tests;
 the invariant campaign runs 64 × 600 calls with a third-party writer and exerciser in the vault's
 bucket and asserts after every call, through thirteen invariants, that the vault holds no option
 token, that its lifetime assignment never exceeds the contracts it sold, and that every armed id's
 option-token supply equals its unexercised collateral and sits with the buyer or the adversary),
-the real Seaport 1.6 runtime driven through every fulfilment path (single, advanced fractions, the
+the real Seaport 1.6 runtime driven through five of its eight fulfilment entrypoints (single, advanced fractions, the
 same listing twice in one `fulfillAvailableAdvancedOrders` within and beyond the remainder, match,
-basic, skip-versus-revert, a hostile contract buyer), the fork suite against chain 4663 (20 tests:
-first fill and top-up fill through the live Seaport and Clear; an assigned week exercised by the
+basic, skip-versus-revert, a hostile contract buyer), the fork suite against chain 4663 (20 tests,
+on a vault the suite deploys against the live Seaport and Overcall's live Clear `0x9a7b…C0C0`,
+whose runtime equals ours except the metadata hash; no test touches the live vault or our Clear:
+first fill and top-up fill; an assigned week exercised by the
 buyer and closed by a stranger with assignment equal to what was sold and the strike credited
 fee-free; an unfilled week closing flat; a stranded close under the REAL USDG `ASSET_PROTECTION`
 freeze of the vault and its permissionless recovery after the unfreeze; the TSTORE/TLOAD create
@@ -79,9 +84,9 @@ offerer; it authorises listings by hash on chain. The keeper proposes, the vault
 field against compiled-in shape rules and the admin-set policy. A fully compromised keeper key
 cannot withdraw, redirect or unlock collateral. It chooses the option type (strike and window,
 inside the arm gate) and it can sell the week's calls at exactly the policy's premium floor to a
-buyer it controls; at launch policy that moves about 1.1% of the sold notional per week from
-depositors to that buyer (sold is written, under write on fill), more in a high-volatility week
-(§3).
+buyer it controls; at the live policy (3% OTM band floor, 0.10% premium floor) and 50% implied
+volatility that moves about 1.5% of the sold notional per week from depositors to that buyer (sold
+is written, under write on fill), more in a high-volatility week (§3).
 
 An earlier revision of this section said a compromised keeper "can waste a week; it cannot take a
 token". The second half was true of tokens and false of value; §4, finding 10 records the
@@ -92,9 +97,9 @@ correction.
 These are not conventions; they are checks in the deployed code, each with regression tests.
 
 - **Hard policy caps.** `Policy.sol` bounds every governance-settable parameter (OTM band,
-  premium floor, utilisation, protocol fee, max contracts) in bytecode. The Admin Safe can only
-  move policy inside them.
-- **The protocol fee never touches principal.** It is charged on premium only (5% at launch,
+  premium floor, utilisation, protocol fee, max contracts) in bytecode. The admin (today the hot
+  EOA `0xEb82…9d9b`) can only move policy inside them.
+- **The protocol fee never touches principal.** It is charged on premium only (5% live,
   20% ceiling): `rollClose` excludes the USDG it measures coming out of the Valorem claim — the
   strike proceeds of an assignment — from the fee base and credits it to holders in full. The
   exclusion is code, not a policy field, so no admin setting can put strike proceeds back under
@@ -164,8 +169,8 @@ These are not conventions; they are checks in the deployed code, each with regre
   cannot turn donation inflation into a profit. See §4, findings 8 and 15.
 - **Three listings per cycle.** Every `approveListing` spends one of `MAX_LISTINGS_PER_CYCLE = 3`,
   cancelled or not. A listing is sized to capacity and Seaport tracks the fraction filled, so a
-  relist is a reprice, and three reprices a week is how far a keeper can walk the quote before the
-  guardian must act. `approveListing` also refuses a strike below the live band floor and a gross
+  relist is a reprice: a cycle allows the first listing and at most two reprices, after which the
+  keeper cannot list again until the next `rollOpen`. `approveListing` also refuses a strike below the live band floor and a gross
   below the live premium floor, as an early refusal for the keeper; the fill gate is the line of
   defence, so a stale listing is simply unfillable rather than needing a permissionless kill.
 - **The protocol fee push is best-effort.** A blocklisted fee recipient, a paused USDG, or a
@@ -187,12 +192,12 @@ These are not conventions; they are checks in the deployed code, each with regre
 
 | Key | Power | Worst case |
 |---|---|---|
-| Keeper (hot) | choose and arm the option type inside the arm gate (`rollOpen`: strike inside the band with both bounds, lot one token, window and tenor inside the compiled bounds), propose every order and its price and size up to capacity (`approveListing`), cancel, call the rolls | **value leakage, not only a wasted week.** It can arm the lowest strike the band admits and list the whole capacity at exactly the premium floor to a buyer it controls, and a colluding fill (which is what writes) can follow the authorisation immediately, before a guardian can react. At launch policy (3% OTM floor, 0.40% premium floor) a 7-day 3%-OTM NVDA call is worth about 1.5% of spot at 50% implied volatility, so about **1.1% of the sold notional per week** (up to 95% of NAV sold) goes to the buyer in expectation; about 2.7% at 80% IV. That is the whole bound: under write on fill there is no unsold inventory for a keeper-and-accomplice to write to the cap and leave unlisted (the AF-01 variant that exceeded the earlier bound). It cannot move a token, sell above strike, list past `cycleExerciseTs`, or write outside the band and the caps |
-| Bootstrap admin (the deployer EOA holding `DEFAULT_ADMIN_ROLE` until `HandoverAdmin.s.sol` completes; no timelock) | everything the Admin Safe row has, from one hot-signable key | everything the keeper row has, and worse: `setPolicy` to the compiled floors (1% OTM, 0.10% premium, 99.85% utilisation), `grantRole(KEEPER_ROLE, itself)`, then arm, list and sell to itself within a block or two. A 7-day 1%-OTM call is worth about 2.3% of spot at 50% IV, so about **2.2% of the sold notional per week** (about 3.9% at 80% IV), plus a 20% fee on whatever premium is left, routed where it likes. Still no vault function that transfers a token to it, and on the launch plan this key does **not** hold Clear's `feeTo` (`DeployClear` sets `CLEAR_FEE_TO` to the admin Safe; `HandoverAdmin` never moves it; `Verify.s.sol` requires `EXPECTED_CLEAR_FEE_TO`). It can still `acceptValoremFee` on the vault. The engine-fee lever is the Admin Safe row |
-| Guardian | halt (`rollOpen`, `approveListing` and every fill), cancel, invalidate all listings | denial of new sales until the admin unhalts, and burnt premium; exits stay open |
-| Admin Safe (2/3) | policy inside caps, fee recipient, Valorem fee acceptance, deposit cap, role grants; on our own Clear, that Clear's `feeTo` from deploy (fee switch, fee sweep, `setFeeTo`; `HandoverAdmin` never moves it) | the bootstrap admin row, needing two of three signers instead of one key. After handover the same Safe holds both vault admin and `feeTo`, so `setFeesEnabled(true)` plus `acceptValoremFee(true)` is 2-of-3 with no delay: every fill then pulls **15 bps of its notional from the vault in NVDA** into Clear's fee balance, sweepable to the Safe (plus 15 bps of the strike USDG from every exerciser). Depositors are compensated only through the fill floor, which adds the fee's spot value to the premium the buyer must pay, so the net is a forced sale of 15 bps of NVDA per fill at the oracle's spot less the 5% protocol fee on that extra premium. With 95% of NAV sold that is about 0.14% of NAV a week in NVDA, capped by Clear's compiled 15 bps. No timelock on any of it |
+| Keeper (hot EOA `0x06c1…C1d2`) | choose and arm the option type inside the arm gate (`rollOpen`: strike inside the band with both bounds, lot one token, window and tenor inside the compiled bounds), propose every order and its price and size up to capacity (`approveListing`), cancel, call the rolls | **value leakage, not only a wasted week.** It can arm the lowest strike the band admits and list the whole capacity at exactly the premium floor to a buyer it controls, and a colluding fill (which is what writes) can follow the authorisation immediately, before a guardian can react. At the live policy (3% OTM floor; 0.10% premium floor, lowered from `launchDefaults()`'s 0.40% by the admin's `setPolicy` of 2026-09-15) a 7-day 3%-OTM NVDA call is worth about 1.6% of spot at 50% implied volatility, so about **1.5% of the sold notional per week** (up to 95% of NAV sold) goes to the buyer in expectation; about 3.0% at 80% IV. That is the whole bound: under write on fill there is no unsold inventory for a keeper-and-accomplice to write to the cap and leave unlisted (the AF-01 variant that exceeded the earlier bound). It cannot move a token, sell above strike, list past `cycleExerciseTs`, or write outside the band and the caps |
+| Admin (the hot deployer EOA `0xEb82…9d9b`, which holds `DEFAULT_ADMIN_ROLE` alone today; no timelock; the handover to a Safe with `HandoverAdmin.s.sol` is planned and not done. The keeper and guardian keys are derived from the same mnemonic, so a leak of that mnemonic is this row) | every admin power from one hot key: policy inside the caps, fee recipient (today `feeRecipient()` is this same EOA), Valorem fee acceptance, deposit cap (unbounded), `maxPriceAge`, halt and unhalt, every role grant and revocation, all effective immediately, mid-cycle included | everything the keeper row has, and worse: `setPolicy` to the compiled floors (1% OTM, 0.10% premium, 99.85% utilisation), `grantRole(KEEPER_ROLE, itself)`, then arm, list and sell to itself within a block or two. A 7-day 1%-OTM call is worth about 2.3% of spot at 50% IV, so about **2.2% of the sold notional per week** (about 3.9% at 80% IV), plus a 20% fee on whatever premium is left, routed where it likes. Still no vault function that transfers a token to it. It does **not** hold our Clear's `feeTo`, which is the 1-of-1 Safe `0xff14…CF61` (`HandoverAdmin` never moves `feeTo`), but it can `acceptValoremFee` on the vault; the engine-fee lever that needs both is in the Clear `feeTo` row |
+| Guardian (EOA `0x2974…6F39`, from the same mnemonic as the admin and keeper keys; it has never sent a transaction) | halt (`rollOpen`, `approveListing` and every fill), cancel, invalidate all listings | denial of new sales until the admin unhalts, and burnt premium; exits stay open |
+| A Safe as admin, after `HandoverAdmin.s.sol` (planned, not done) | the admin row's powers | the admin row, needing the Safe's threshold of signers (the grant refuses a threshold below 2) instead of one key. It does not move Clear's `feeTo` |
 | Anyone | `lockBook`, `rollClose` after expiry + 1 hour, `sweepFee`, `settleQueue` while `Idle`, buying through Seaport, writing the same option id on Valorem and exercising | settling a flat queue at the instant-redeem price; a fill at the listed price inside the fill gate; being assigned alongside the vault pro rata on what the vault SOLD. None moves value from depositors beyond the priced covered call (§0) |
-| Clear `feeTo` of whichever clearinghouse the vault is constructed with (Overcall's EOA `0xdAe7…0782` on the default instance, an unfunded key with nonce 0; the admin Safe on an instance from `script/DeployClear.s.sol`) | the 15 bps engine fee switch (`setFeesEnabled`), `setFeeTo` (which emits no event: nomination is visible only in storage; `Verify.s.sol` reads `pendingFeeTo` from slot 3 on our instance), the URI generator, sweeping accumulated fee balances. Clear itself has no owner, no pause, no blocklist and no proxy | on Overcall's instance: a week the vault refuses to arm or fill until governance accepts the fee (`ValoremFeeNotAccepted`); nothing on collateral. On the instance we deploy (the launch choice, `feeTo` = the admin Safe from deploy) the switch is the Safe's from block one; after handover the same Safe also holds `acceptValoremFee`, so the Admin Safe row carries the 15 bps. Upstream Valorem is dormant (last commit 2023-11), so there is no patch path, bounty or incident response behind either instance |
+| Clear `feeTo`. Live: our Clear `0x53d7…C6`, whose `feeTo` is the 1-of-1 Safe `0xff14…CF61` (Safe 1.4.1, sole owner `0x7A3a…2C32`, no modules, no guard). Overcall's Clear `0x9a7b…C0C0`, `Deploy.s.sol`'s default and not used by the live vault, has the EOA `0xdAe7…0782` | the 15 bps engine fee switch (`setFeesEnabled`), `setFeeTo` (which emits no event: nomination is visible only in storage; `Verify.s.sol` reads `pendingFeeTo` from slot 3 on our instance), the URI generator, sweeping accumulated fee balances. Clear itself has no owner, no pause, no blocklist and no proxy | fees switched on while the vault has not accepted them (`valoremFeeAccepted()` is false today): `rollOpen` and every fill revert `ValoremFeeNotAccepted`, so no sales until the admin accepts or the switch goes off, nothing on collateral, and every exerciser pays 15 bps of the strike USDG on top. Fees on AND accepted by the admin EOA (two transactions from two different addresses, the Safe's sole owner and the admin EOA, with no delay on either): every fill pulls **15 bps of its notional from the vault in NVDA** into Clear's fee balance, sweepable by `feeTo`. Depositors are compensated only through the fill floor, which adds the fee's spot value to the premium the buyer must pay, so the net is a forced sale of 15 bps of NVDA per fill at the oracle's spot less the 5% protocol fee on that extra premium. With 95% of NAV sold that is about 0.14% of NAV a week in NVDA, capped by Clear's compiled 15 bps. Upstream Valorem is dormant (last commit 2023-11), so there is no patch path, bounty or incident response behind the Clear |
 | Seaport 1.6 | no admin, not upgradeable, no pause, no fee switch; the zone hooks run on every fill; `conduitKey == 0` so no conduit owner has power | none beyond the verified 1.6 hook order the design rests on (`authorizeOrder` before any transfer and before the status update on every fulfilment path, `validateOrder` after all transfers, a post-authorise status failure reverts the whole transaction); `Verify.s.sol` pins the runtime hash. No public audit of the 1.6 hook code was found |
 | USDG issuer (Paxos). **One EOA, `0x3Af3…024B`, holds every operational power with no timelock** | instant `pause()` (blocks transfer, transferFrom, approve, permit; not views, not mint or burn); instant `freeze`/`wipeFrozenAddress` (enforced on sender, recipient AND the `transferFrom` spender; a zero-value transfer with a frozen party reverts; 27 freezes on 4663 so far, 0 unfreezes ever); SupplyControl manager, so it can grant itself `allowAnyMintAndBurnAddress` and **burn USDG from any non-frozen address with no allowance** in two transactions; owner of the OFT wrapper; proposer, executor and canceller of the 24 h `TimelockController` that gates the UUPS upgrade and facet replacement | premium and strike proceeds in the vault, in Clear (an assigned week's strike USDG sits in Clear until `rollClose`) and owed to the queue can be frozen, wiped or burnt at any moment. Principal (the Stock Token) is never touched. The contracts make sure it never TRAPS anyone: the close strands rather than bricks (AF-02), the Stock Token leg of a queued exit is paid whatever USDG does (AF-03), the fee push is best-effort, and a wipe re-anchors `usdgAccounted` to the lower balance (accepted, §4). An earlier revision of this file said freeze and wipe sat "behind a 24 h timelock"; only the upgrade does |
 | Stock Token issuer (RHJ / Robinhood; 13 registry roles, each held by exactly one EOA, none behind a multisig or timelock) | `adminBurn(from, amount)`, a bare `_burn` with **no pause and no blocklist modifier**, so it works even on a paused token or a blocklisted holder; registry-wide and per-token `pause()`; a per-address blocklist enforced on sender and recipient; `pauseOracle()`; `updateMultiplier`, where the multiplier **can decrease and can apply immediately** (WEEK went 2.0 → 1.0 on chain) while the price feed re-prints only on its 0.5% deviation trigger (≈11.8 h lag observed at NVDA's 2026-09-10 step); the beacon upgrader re-points the logic of all 204 Stock Tokens in one transaction; the prospectus adds seizure, and an Issuer Redemption Option that terminates the Series on **30 calendar days' notice**, after which tokens are redeemable only with KYC the vault cannot satisfy | vault NVDA destroyed (NAV and the reserve diverge: AF-05's honest NAV, deposit refusal and pro-rata haircut are the response), every NVDA-moving leg stopped (fills, `clear.write`, the redeem's NVDA leg, `completeRedeem`'s asset leg, instant redemption), the band priced on a stale per-token basis for the hours a multiplier step leads the feed, or a terminated Series the vault holds with no redemption path. Disclosed, not coded around: that is the asset |
@@ -203,28 +208,32 @@ strike at the band floor, expressed as a share of spot, minus the policy premium
 the gross of the one consideration item; there is no venue fee any more, so gross is net). The
 buyer's expected profit is the vault's expected loss, paid out through assignment and a share
 price that falls on assigned weeks. It is a bound per undetected week, not a one-off: nothing on
-chain notices a sale at the floor, so it repeats until someone halts. The honest keeper also
-prices at `max(policy floor, last fill)` (plan 5.2; the keeper is not yet ported to write on fill,
-§5), so on a thin book with no recent fill it sells at the floor too, and depositors bear the same
-gap without anyone being compromised.
+chain notices a sale at the floor, so it repeats until someone halts, and no alert is delivered
+off chain today. The honest keeper runs in vol mode (its default, and the production setting): it
+takes the strike at about 0.15 delta from Cboe's free delayed NVDA option quotes (clamped to 5% to
+11.5% above spot under the live band), then asks `max(ceil(floorUnit × 1.005), ceil(fair × 1.10))`
+per contract, capped at the strike, where `floorUnit` is the vault's premium floor per contract,
+`fair` is the quoted mid interpolated at the strike, and 1.005 is `KEEPER_PREMIUM_MARGIN_BPS=50`
+(the code default is 100). When that data is missing, stale or inconsistent it skips the week
+rather than fall back to the floor. That keeps an honest ask above its own estimate of fair value,
+but the estimate rests on delayed quotes the keeper accepts up to 4 days old, and it does nothing
+against a compromised key. Cycle 1's live listing was priced by the keeper version before vol mode.
 
-**Mitigations considered and NOT implemented (open decisions).** None of these is in the code or
-the launch plan today:
+**Mitigations considered (open decisions).** Only item 4 is implemented, and it is off-chain:
 
 1. **Admin behind a `TimelockController`**, so a `setPolicy`, a fee change or a `KEEPER_ROLE`
    grant is visible for a delay before it can be used. Today every admin action is immediate.
 2. **Higher compiled floors.** `Policy.MIN_PREMIUM_FLOOR_BPS = 10` and `MIN_OTM_FLOOR_BPS = 100`
-   are what bound the admin row. Raising them (for example towards the launch 40 and 300) caps
-   the admin's lever at the keeper's; it needs a redeploy, since they are bytecode constants.
+   are what bound the admin row. Raising them (for example towards `launchDefaults()`' 40 and 300)
+   caps the admin's lever at the keeper's; it needs a redeploy, since they are bytecode constants.
 3. **A listing start delay.** `SeaportOrderLib` refuses `startTime > now`
    (`ListingStartsInFuture`), so a listing is fillable in the block it is authorised. Requiring a
    delay would give the guardian a window to see and invalidate a floor-priced listing.
-4. **Vol-model keeper pricing.** Price asks from an implied-volatility model with the policy floor
-   as a backstop only, instead of `max(floor, last fill)`. Off-chain; it helps the honest-keeper
-   case and does nothing against a compromised key.
-5. **No deposits before the Safe handover.** Hold `depositCap` at 0 (or do not publish the vault)
-   until `HandoverAdmin.s.sol` has completed, so the one-key bootstrap row never has depositor
-   money under it.
+4. **Vol-model keeper pricing.** Implemented: vol mode, described above, is the keeper's default
+   and runs in production. Off-chain; it helps the honest-keeper case and does nothing against a
+   compromised key.
+5. **No deposits before the Safe handover.** Not adopted: deposits are open under `depositCap()` =
+   20 NVDA while the one-key admin row applies.
 
 ## 4. The 2026-09-12 adversarial review
 
@@ -293,8 +302,8 @@ external auditor has seen any of it. (Sizes at the checkpoint: `Vault` 22,854 B,
 |---|---|---|---|---|
 | 8 (F1) | Medium (PoC-confirmed) | **Shares queued while the vault is `Idle` could be trapped.** `queueRedeem` is allowed in every phase and there is no dequeue, but the queue settled only inside `rollClose`, which needs a `rollOpen` first. Anything that blocks the next write froze the queuer while holders who had not queued redeemed instantly: a halt nobody lifts, a registry lot other than 1e18, an unaccepted Valorem fee, a stale or paused oracle, or less than one lot idle. PoC (a): alice and bob deposit 10 each, alice queues 10 in `Idle`, the guardian halts, bob redeems, and alice's `completeRedeem` still reverts `EpochNotSettled(1, 1)` a year later while `rollClose` reverts `WrongPhase`. PoC (b): the sole holder deposits 0.5 and queues it all; `rollOpen(…, 1)` reverts `ContractsAboveUtilization(1, 0)` for ever | Permissionless `settleQueue()` (`nonReentrant`): reverts `WrongPhase` outside `Idle` and `NothingQueued` on an empty queue, then `_checkpointHarvest()` and `_settleQueue()`. While flat `idleAssets()` is the whole NAV, so the settlement is an instant redemption paid through `completeRedeem`; it moves no tokens, so it works while halted and under an issuer freeze | `test/unit/VaultQueue.t.sol`: `test_settleQueue_freesSharesQueuedWhileIdleUnderAHaltNobodyLifts`, `test_settleQueue_freesTheLastHolderBelowOneLot`, `test_settleQueue_paysTheEscrowsAccrualToTheQueuer`, `test_settleQueue_paysWhatAnInstantRedeemWouldHave`, `test_settleQueue_revertsOutsideIdleAndWhenNothingIsQueued`, `test_settleQueue_worksUnderAnIssuerFreeze`; handler action `settleQueue` and `test_handlerReachesTheThirdPartyBucketAndFlatSettlement` (renamed from `test_handlerReachesTranchesStaleKillsAndFlatSettlement` by the redesign) in `test/invariant/VaultInvariant.t.sol` |
 | 9 (F2) | **Restated 2026-09-13 as High and adversarial** (it was recorded as Medium, economic, passive); closed by the redesign | **Unsold calls are assigned by other writers' exercises, and an attacker can make that deterministic and total.** Valorem assigns an exercise across every writer of the option id, bucket by bucket, pro rata by what each wrote, not by what each sold, and the vault never exercised its own unsold options. The passive form: the vault writes 50 and sells 10, other writers write 50 and sell all of it; on an in-the-money expiry the vault expects 30 assigned while only 10 of its contracts earned a premium. The adversarial form (AUDIT-FINDINGS F-01, reproduced on the real Clear bytecode and on a fork of live 4663): after a rally, anyone writes the same option id into the vault's bucket 0 before the first exercise and self-exercises, taking `unsold × (spot − strike)` of depositor principal pro rata; and because the bucket walk is public (`settlementSeed` is the option key, never re-seeded), an attacker who exercises once and then writes into the fresh bucket can steer the draw and assign the vault on 100% of its unsold inventory. The same rally made `approveListing` refuse to relist and let anyone kill the live listing, so the conditions arrived together. Tranche writes bounded this at the unsold tranche and did not close it | **Write on fill (decision D1, A(ii); §0).** Nothing is written at `rollOpen`; every Seaport fill writes exactly its size inside `authorizeOrder`, so `written == sold` by construction and the vault has no unsold inventory to be assigned on. `writeMore` is removed. The original tranche fix is kept below as history: **Tranche writes.** `writeMore(uint112 n)` (`KEEPER_ROLE`, `nonReentrant`) tops up this cycle's claim through `clear.write(claimKey, n)` and reverts `WriteReturnedWrongClaim` unless the same id comes back. It shares one gate with `rollOpen` (`ValoremLib.write`): `Listed`, not halted, `block.timestamp < cycleExerciseTs` (`WriteWindowClosed`), `n != 0`, registry write window open, live cycle number equal to the snapshot, option approved, option asset/exercise asset/lot/window equal to the live cycle, Valorem fee off or accepted (approval sized collateral + fee and scrubbed to 0), oracle not paused and fresh, strike band re-checked at live spot, and `Policy.checkContracts(contractsWritten + n, idleAssets() + lockedAssets())`. `contractsWritten` accumulates; `lockedAssets()` and `contractsAssigned()` already read the claim's aggregate across buckets (confirmed on live Clear). `MockClear.write(claimId, n)` now tops up as upstream `6436c823` does. **Exposure is bounded only when the keeper writes per listing.** The keeper change that does (`rollOpen` writes the first tranche, `writeMore` the next once a listing sells through, `keeper/src/roll.ts` and `keeper/src/roll.tranche.test.ts` (leekzor/callhouse)) is uncommitted in that repository's working tree (§5) | Current regressions: `test/regression/AF01_UnsoldInventory.t.sol` (`test_unsteeredAttack_vaultAssignedOnlyWhatItSold_depositorLossZero`, `test_steeredAttack_buyerAsleep_fullAssignmentIsStillOnlyWhatWasSold`, `test_control_sleepingBuyerNoAttacker_collateralComesHome`, all on the real Clear bytecode), `invariant_vaultHoldsNoOptionTokens`, `invariant_assignedNeverExceedsSold`. Historical (deleted with `writeMore`): `test/unit/VaultTranche.t.sol` (12): `test_writeMore_topsUpTheSameClaim`, `test_writeMore_topUpIsListableAndSells`, `test_trancheCycle_partialAssignmentSettlesExactly`, `test_writeMore_sizesOnTheTotalAndCountsLateDeposits`, `test_writeMore_revertsOutsideListed`, `test_writeMore_revertsForNonKeeperZeroAndHalt`, `test_writeMore_revertsOnceExerciseCanStart`, `test_writeMore_revertsWhenTheRegistryHasMovedOn` (cycle changed; not approved), `test_writeMore_honoursTheValoremFeeSwitch`, `test_writeMore_revertsOnAPausedOrStaleOracle`, `test_writeMore_reChecksTheStrikeBandAtLiveSpot`, `test_writeMore_revertsWhenTheTotalPassesTheCap`; handler action `writeMore`; fork `test_fork_writeMoreTopsUpTheLiveClaim` against the real clearinghouse. No test demonstrates the assignment benefit itself (`MockClear` does not model multi-writer buckets) |
-| 10 (F3) | Medium (documentation; economic) | **SECURITY.md §1 and §3 said a compromised keeper "can waste a week; it cannot take a token".** It can list at exactly the premium floor to a colluding buyer: about 1.1% of written notional per week at launch policy and 50% IV. The bootstrap admin (the deployer EOA before the Safe handover, no timelock) can `setPolicy` to 1% OTM and a 0.10% floor and grant itself `KEEPER_ROLE`: about 2.2% per week. The honest keeper prices at `max(policy floor, last fill)`, so on a thin book it undersells as well | Documentation only, by decision: §1 and §3 rewritten with the bound. The mitigations (admin timelock, higher compiled floors, a listing start delay, vol-model pricing, no deposits before the handover) are listed in §3 as open decisions and are not implemented | none (no code change) |
-| 11 (F4) | Low | **`Vault.deposit` NatSpec said "a late depositor cannot be assigned against a call they were never part of writing".** False: a deposit in `Listed` is priced on a NAV that values the short call at zero, assignment losses reach every share through the share price, and since finding 9 a later tranche can be written against the new deposit directly | NatSpec corrected (0 bytes); ACCOUNTING.md §5 states the late-depositor economics. The web deposit form warns in `Listed`, more strongly when live spot is at or above `strike × (1 − minOtmBps)` (`web/components/DepositForm.tsx` (leekzor/callhouse), uncommitted) | `test_lateDepositorDuringListed_isNotWrittenAgainstButSharesTheAssignment` renamed to `test_lateDepositorDuringListed_sharesTheAssignmentThroughTheSharePrice` (`VaultAssignment.t.sol`); `test_writeMore_sizesOnTheTotalAndCountsLateDeposits` |
+| 10 (F3) | Medium (documentation; economic) | **SECURITY.md §1 and §3 said a compromised keeper "can waste a week; it cannot take a token".** It can list at exactly the premium floor to a colluding buyer: about 1.1% of written notional per week at launch policy and 50% IV. The bootstrap admin (the deployer EOA before the Safe handover, no timelock) can `setPolicy` to 1% OTM and a 0.10% floor and grant itself `KEEPER_ROLE`: about 2.2% per week. The honest keeper prices at `max(policy floor, last fill)`, so on a thin book it undersells as well | Documentation only, by decision: §1 and §3 rewritten with the bound. The mitigations (admin timelock, higher compiled floors, a listing start delay, vol-model pricing, no deposits before the handover) are listed in §3 as open decisions; as of 2026-09-15 only vol-model pricing is implemented, off-chain | none (no code change) |
+| 11 (F4) | Low | **`Vault.deposit` NatSpec said "a late depositor cannot be assigned against a call they were never part of writing".** False: a deposit in `Listed` is priced on a NAV that values the short call at zero, assignment losses reach every share through the share price, and since finding 9 a later tranche can be written against the new deposit directly | NatSpec corrected (0 bytes); ACCOUNTING.md §5 states the late-depositor economics. The web deposit form warns in `Listed`, more strongly when live spot is at or above `strike × (1 − minOtmBps)` (`web/components/DepositForm.tsx` (leekzor/callhouse)) | `test_lateDepositorDuringListed_isNotWrittenAgainstButSharesTheAssignment` renamed to `test_lateDepositorDuringListed_sharesTheAssignmentThroughTheSharePrice` (`VaultAssignment.t.sol`); historical (deleted with `writeMore`): `test_writeMore_sizesOnTheTotalAndCountsLateDeposits` |
 | 12 (F5) | Low; **removed by the redesign** (the fill gate re-prices every fill at live spot, so a stale listing is unfillable rather than snipeable, and there is no price-cut budget and no `invalidateStaleListing`; every `approveListing` spends one of three slots, cancelled or not) | **Stale fixed-price listings get sniped.** A listing lives until `cycleExerciseTs`; after a mid-week rally a buyer fills at the old premium one second before exercise opens and exercises. Repricing burnt one of three listing slots and a cancel never refunded one, so after three reprices the keeper could not relist at all, and with a dead keeper only the guardian's `invalidateAllListings` stopped it | (a) **Slots count price cuts.** `lowestListedUnitUsdg` (reset at `rollOpen`) records the lowest gross/amount authorised this cycle; the first listing, or one strictly below that price, spends a slot (`TooManyListings` when none are left) and becomes the lowest; at or above it is free. `listingsThisCycle` keeps its name for ABI stability and now counts price levels; `ListingApproved.seq` is that count, so two listings can share a `seq`. (b) **Permissionless `invalidateStaleListing()`** (`nonReentrant`): `NoLiveListing` with nothing live; a paused Stock Token oracle counts as stale; otherwise, at live spot (a stale feed reverts), it kills only when the strike is below the band floor or the gross below the premium floor for `listingAmount`, else `ListingStillValid` | `test/unit/VaultListing.t.sol`: `test_threePriceCutsPerCycleThenNoMore` (was `test_threeListingsPerCycleThenNoMore`), `test_relistAtOrAboveTheLowestPriceIsFreeEvenWithTheBudgetSpent`, `test_relistsAtOnePriceSpendOneSlot`, `test_listingBudgetResetsOnTheNextRollOpen`, `test_invalidateStaleListing_afterARallyPastTheBandFloor`, `test_invalidateStaleListing_whenTheFloorRisesAboveTheListingGross`, `test_invalidateStaleListing_whileTheOracleIsPaused`, `test_invalidateStaleListing_revertsWhileStillValidOrWithoutAPrice`, `test_invalidateStaleListing_revertsWithNoLiveListing`; `test_rollOpen_resetsTheSpentListingBudget` (`VaultRoll.t.sol`); handler action `invalidateStaleListing` |
 | 13 | Low (adversarial round, PoC-confirmed); **removed by the redesign** with `invalidateStaleListing`; `approveListing` still refuses a strike below the live band floor, and the fill gate is the line of defence | **`invalidateStaleListing` could kill a listing `approveListing` had just authorised.** The kill fired on `cycleStrikeUsdg < strikeBand(spot).min`, but `approveListing` checked only the premium floor. After a 2.3% rally (spot 220 → 225, band floor 231.75 over a 231 strike) the keeper could list, anyone could kill it in the same block, and a free same-price relist was killed again: five rounds in one block in the PoC, the vault selling nothing for the rest of the week while its written inventory stayed assignable. A competing writer of the same option id is the obvious beneficiary | `approveListing` refuses a strike below the live band floor (`StrikeBelowBand`), and both paths read the floors from one `_listingFloors`, so they cannot disagree at the same spot. Only the lower bound: after a sell-off the strike above the band ceiling is safer to sell, not riskier | Current: `test_approveListing_refusesAStrikeBelowTheLiveBandFloorButNotAboveTheCeiling` (`VaultListing.t.sol`). At the checkpoint: `test_approveListing_refusesAStrikeBelowTheLiveBandFloor`, `test_invalidateStaleListing_cannotKillWhatApproveListingJustAccepted` (deleted with `invalidateStaleListing`) |
 | 14 | Low (adversarial round, confirmed from the artifact) | **`Verify.s.sol` hard-coded five library link sites.** The fixes added `ValoremLib` call sites, so a byte-perfect deployment has seven; `VerifyVault._bytecode` would print FAIL and `run()` revert, breaking `script/rehearse-deploy.sh` and the launch verification, and training operators to ignore the check that catches swapped libraries | The expected count is read from the artifact's `linkReferences`, with at least one site required per library. `docs/DEPLOY.md` and this file updated | `test_verifyScript_acceptsAByteForByteDeployment` (`Smoke.t.sol`; also asserts swapped libraries still fail) |
@@ -316,7 +325,7 @@ audit (D14).
 
 | # | Severity | Finding | Fix | Regression tests |
 |---|---|---|---|---|
-| AF-01 (F-01) | **High** | Anyone can take the in-the-money value of the vault's unsold call inventory by writing the same Valorem option id into its bucket and self-exercising; steerable to 100% of the unsold inventory; repeatable every in-the-money week; also let a compromised keeper write to the cap and never list, exceeding the §3 bound. Restated finding 9 above | **Write on fill** (§0, decision D1 A(ii)): `rollOpen` arms and writes nothing; every Seaport fill writes exactly its size in the vault's `authorizeOrder` zone hook; `validateOrder` reverts the fill if a token stays behind; the ERC-1155 receiver accepts only mints. The vault never holds an unsold option token, so the attack has nothing to take. `writeMore`, `invalidateStaleListing`, EIP-1271 and the price-cut slots removed. Decision D16 removed the Overcall registry at the same time | `test/regression/AF01_UnsoldInventory.t.sol` (3, real Clear): `test_unsteeredAttack_vaultAssignedOnlyWhatItSold_depositorLossZero`, `test_steeredAttack_buyerAsleep_fullAssignmentIsStillOnlyWhatWasSold`, `test_control_sleepingBuyerNoAttacker_collateralComesHome`; `test/unit/VaultWriteOnFill.t.sol` (20); `test/unit/VaultRealSeaport.t.sol` (13, real Seaport 1.6 runtime, every fulfilment path); `invariant_vaultHoldsNoOptionTokens`, `invariant_assignedNeverExceedsSold`, `invariant_longSupplyIsUnexercisedCollateral` with the handler's `thirdPartyWrite`/`thirdPartyExercise`; fork `test_fork_writeOnFillAgainstLiveSeaportAndClear`, `test_fork_assignedWeekSettlesOnLiveClear` |
+| AF-01 (F-01) | **High** | Anyone can take the in-the-money value of the vault's unsold call inventory by writing the same Valorem option id into its bucket and self-exercising; steerable to 100% of the unsold inventory; repeatable every in-the-money week; also let a compromised keeper write to the cap and never list, exceeding the §3 bound. Restated finding 9 above | **Write on fill** (§0, decision D1 A(ii)): `rollOpen` arms and writes nothing; every Seaport fill writes exactly its size in the vault's `authorizeOrder` zone hook; `validateOrder` reverts the fill if a token stays behind; the ERC-1155 receiver accepts only mints. The vault never holds an unsold option token, so the attack has nothing to take. `writeMore`, `invalidateStaleListing`, EIP-1271 and the price-cut slots removed. Decision D16 removed the Overcall registry at the same time | `test/regression/AF01_UnsoldInventory.t.sol` (3, real Clear): `test_unsteeredAttack_vaultAssignedOnlyWhatItSold_depositorLossZero`, `test_steeredAttack_buyerAsleep_fullAssignmentIsStillOnlyWhatWasSold`, `test_control_sleepingBuyerNoAttacker_collateralComesHome`; `test/unit/VaultWriteOnFill.t.sol` (20); `test/unit/VaultRealSeaport.t.sol` (14, real Seaport 1.6 runtime, five of its eight fulfilment entrypoints); `invariant_vaultHoldsNoOptionTokens`, `invariant_assignedNeverExceedsSold`, `invariant_longSupplyIsUnexercisedCollateral` with the handler's `thirdPartyWrite`/`thirdPartyExercise`; fork `test_fork_writeOnFillAgainstLiveSeaportAndClear`, `test_fork_assignedWeekSettlesOnLiveClear` |
 | AF-02 (F-02) | Medium | A USDG pause or blocklist of the vault in an assigned week reverted `clear.redeem` inside `rollClose`, the only exit from Listed/Exercisable, freezing all principal and the queue for as long as it lasted. The recon widened the trigger set: Clear frozen on USDG, Clear's USDG burnt by a supply controller, and an NVDA-side blocklist of the vault (which bites in every week that is not fully assigned) | **Stranded-claim state machine** (§2; ACCOUNTING.md §5): low-level redeem with a gas-starvation guard, Idle with the claim kept, per-epoch stranded entitlements, permissionless `retryStrandedClaim`, deposits and instant redemption shut meanwhile, `rollOpen` refused, dust ≤ 1 wei per owner per generation | `test/regression/AF02_UsdgFreezeRollClose.t.sol` (9 on the mock, the same 9 on the real Clear): `test_usdgPause_assignedWeek_strandsThenRecovers`, `test_vaultFrozenOnUsdg_assignedWeek_strandsThenRecovers`, `test_clearFrozenOnUsdg_assignedWeek_strandsThenRecovers`, `test_clearUsdgBurntBySupplyController_assignedWeek_strandsUntilRefunded`, `test_vaultBlockedOnNvda_unassignedWeek_strandsThenRecovers`, `test_control_unassignedWeekClosesUnderAVaultUsdgFreeze`, `test_gasStarvedRollCloseNeverStrands`, `test_restrandInALaterGenerationWithAnUncollectedEarlierGenOwner`, `test_reQueuingWhileStrandedStagesTheClaimShareWithoutPayingIt`; `invariant_strandSharesAreConserved`, `invariant_depositGateTracksTheReserve`, `invariant_phaseSanity`, `test_handlerReachesAStrandAndRecovers`, `test_handlerReachesANvdaBlocklistStrand`; fork `test_fork_usdgFreezeStrandsTheCloseAndRetryRecoversIt` under the real USDG `ASSET_PROTECTION` role |
 | AF-03 (F-03) | Medium | `completeRedeem` paid the Stock Token and USDG legs atomically, so a USDG pause or blocklist trapped settled queuers' principal while non-queuers redeemed instantly; a queuer whose own receiver is USDG-frozen was trapped the same way | **Split payout legs**: the asset leg by `safeTransfer`, the USDG leg by a raw call that on failure leaves the USDG booked (`UsdgLegDeferred`) for a later `completeRedeem`, to the same or another receiver; a call with nothing left but a blocked USDG leg reverts `UsdgLegBlocked` | `test/regression/AF03_CompleteRedeemLegs.t.sol` (5): `test_usdgPause_paysTheNvdaLegAndDefersTheUsdgLeg`, `test_vaultFrozenOnUsdg_stillPaysQueuedPrincipal`, `test_frozenReceiver_getsTheNvdaAndCollectsUsdgElsewhere`, `test_healthyTokens_payBothLegsInOneCall`, `test_stockPause_blocksQueueUsdgBehindThePrincipal`; the handler's `completeRedeem` asserts the deferred leg stays booked in full |
 | AF-04 (F-04) | Low | Write sizing ignored Valorem's 15 bps engine fee; above ~99.85% utilisation with the fee on and accepted, the fee came out of `reservedAssets` | `MAX_UTILIZATION_CEIL_BPS` 10,000 → **9,985** (`Policy.sol`), the fee valued at spot inside the fill's premium floor, and a post-write **`ReserveBreached`** check that the balance still covers `reservedAssets` | `test/regression/AF04_FeeSizing.t.sol` (4): `test_governanceCannotSetFullUtilisation`, `test_feeStaysInsideTheFreeBalanceAtTheCeiling`, `test_reserveBreachIsCaughtAfterTheWrite`, `testFuzz_ceilingLeavesRoomForTheFee`; `test_fill_acceptedFeeRaisesTheFloorPullsTheFeeAndScrubsTheApproval` |
@@ -329,7 +338,8 @@ USDG wipe re-anchor and the split-multiplier feed discontinuity.
 
 A single-reviewer internal pass over `src/` at `79cee08` (`AUDIT-FINDINGS-2026-09-14.md` in the
 project handoff folder): no Critical, High or Medium; one Low with a proof of concept, fixed below;
-one Informational, the admin's hold on our own Clear's fee switch, now in the admin rows of §3.
+one Informational, who holds our own Clear's fee switch, now in the admin and Clear `feeTo` rows of
+§3.
 
 | # | Severity | Finding | Fix | Regression tests |
 |---|---|---|---|---|
@@ -357,20 +367,22 @@ one Informational, the admin's hold on our own Clear's fee switch, now in the ad
   (≈11.8 h after NVDA's 2026-09-10 dividend step). For those hours the band and premium floor are
   priced on a stale per-token basis. Under D16 no third-party ladder acts on the same wrong feed;
   the exposure is the keeper arming or a buyer filling inside that window, bounded by the band.
-  Accepted at the contract level; the keeper is expected to skip such windows. The frozen weekend
+  Accepted at the contract level. The keeper has no explicit skip for such a window; in vol mode it
+  refuses to price when the feed's token spot and Cboe's NVDA share price differ by more than 300
+  bps, which catches a large step and not a small one. The frozen weekend
   answer likewise predates the close by up to a few hours (`Vault.maxPriceAge` NatSpec).
 - **There is no registry any more** (decision D16). The option type is validated from the
-  clearinghouse (§0); the only third-party key left on the path is Clear's `feeTo`, bounded to the
-  opt-in fee switch, and removable by deploying our own instance. Nothing depends on Overcall's
-  API, book, fee configuration, operator or terms.
+  clearinghouse (§0). The live vault runs on our own Clear, whose `feeTo` (the opt-in fee switch)
+  is the 1-of-1 Safe `0xff14…CF61` set at its deployment, so no third-party key is left on the
+  Clear path. Nothing depends on Overcall's API, book, fee configuration, operator or terms.
 - **Upstream Valorem is dormant** (last commit 2023-11; Zellic's January 2023 findings 3.2/3.3 on
   the public, seedable bucket walk were never fixed). The Clear bytecode is immutable and has no
   admin beyond `feeTo`; the vault's design assumes exactly the assignment semantics the recon
   verified on chain (`test/unit/MockClearDiff.t.sol` keeps the mock faithful to them), and there is
   nobody to patch a Clear bug for us.
-- **Pricing discretion leaks value inside policy.** A compromised keeper, a compromised bootstrap
-  admin, or an honest keeper on a book with no fills can sell at the premium floor, below fair
-  value. §3 quantifies it and lists the mitigations that were considered and not built.
+- **Pricing discretion leaks value inside policy.** A compromised keeper or a compromised admin
+  can sell at the premium floor, below fair value, and an honest keeper whose delayed quotes
+  misstate fair value can sell below it too. §3 quantifies it and lists the mitigations considered.
 - **Valorem assigns across all writers of an option id, pro rata by amount written, and the walk
   is public** (Zellic Jan-2023 3.2/3.3 were never fixed upstream). Under write on fill the vault
   has written exactly what it sold, so the most a third-party writer and exerciser can do is assign
@@ -387,34 +399,37 @@ one Informational, the admin's hold on our own Clear's fee switch, now in the ad
 - **No upgradeability here.** A real bug means Vault v2 and a migration, communicated in
   advance. That is a deliberate choice, not an omission.
 
-## 5. Open questions being closed before launch
+## 5. Open questions, and where they stand
 
 Tracked in `tasks.md` (leekzor/callhouse) "Open questions":
 
 1. **Overcall's order book is not a venue for this vault.** Its schema requires open orders with
    zone 0 and pre-held inventory; the vault lists restricted orders with itself as zone and holds
-   no inventory. Sales go through the self-hosted fill page and any Seaport fulfil path. Closed by
-   decision D1; L-04 was dropped (D2 = b).
-2. **Keeper prices at exactly the policy floor** — an upward oracle tick between the keeper's
-   read and the vault's authorisation reverts `PremiumBelowMinimum` (or `StrikeBelowBand`, since
-   `approveListing` also re-checks the band floor). Self-heals next tick; a margin is under
-   consideration. Pricing at the floor is also the leakage in §3.
+   no inventory. The one venue is the app's cycle page, `app.stonkhouse.fun/vault/nvda/cycle`;
+   the order also fills through any Seaport fulfil path. Closed by decision D1; L-04 was dropped
+   (D2 = b).
+2. **Keeper pricing at exactly the policy floor.** Closed: the keeper adds a margin over the floor
+   (`KEEPER_PREMIUM_MARGIN_BPS`, 50 bps in production) and in vol mode asks the larger of that and
+   fair value plus 10%. A rally between the keeper's read and a fill can still make a listing
+   unfillable (`PremiumBelowFloorAtFill`, `StrikeBelowBand`) until it is repriced.
 3. **Deposit-time harvest checkpoint gas cost** — to be measured on the first live week.
-4. **The keeper, indexer and web are not yet ported to write on fill.** `rollOpen(optionId)`,
-   PARTIAL_RESTRICTED orders with the vault as zone, an empty signature, no Overcall POST, and
-   fills detected from `OrderFulfilled` (a batch that skips the vault's order still succeeds) are
-   the app-side changes; until they land the vault can be operated only by hand.
-5. **The open decisions in §3**: an admin timelock, higher compiled floors, a listing start delay,
-   vol-model pricing, and no deposits before the Safe handover.
+4. **Porting the keeper, indexer and web to write on fill.** Done: the keeper creates each week's
+   option type, arms it with `rollOpen(optionId)` and authorises `PARTIAL_RESTRICTED` listings with
+   the vault as zone and an empty signature (cycle 1 on chain since 2026-09-15), and the cycle page
+   serves that order and fills it through Seaport. No fill has happened on the live vault yet.
+5. **The open decisions in §3**: an admin timelock, higher compiled floors and a listing start
+   delay are open; vol-model pricing is implemented off-chain; deposits opened before the Safe
+   handover.
 
 ## 6. Reporting
 
 If you believe you have found a vulnerability, do not open a public issue. Send it to
 **security@stonkhouse.fun**. The same address is published, machine-readably, at
 `https://stonkhouse.fun/.well-known/security.txt` (RFC 9116) and on
-`https://stonkhouse.fun/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` from
-`lib/legal.ts` (leekzor/callhouse-site), which was set 2026-09-13; the mailbox is a Cloudflare
-Email Routing forward to the operator.
+`https://stonkhouse.fun/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` through
+`lib/legal.ts` (leekzor/callhouse-site).
 
-A bug bounty with a dedicated disclosure channel opens in mainnet week 2 (`tasks.md` (leekzor/callhouse) E-07). Until
-then the contracts are unaudited and a report is a favour, not a claim.
+There is no bug bounty. The contracts have had no external audit, and a report is a favour, not a
+claim. The live `https://stonkhouse.fun/legal` page still carries an older sentence (checked
+2026-09-15) saying a bug bounty opens in the second week after mainnet launch; no bounty programme
+exists, and reports go to security@stonkhouse.fun on the terms above.

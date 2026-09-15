@@ -1,6 +1,7 @@
 # Review scope
 
-> **Status, 2026-09-13 (branch `redesign/a2-own-strikes-2026-09-13`).** There is no external audit
+> **Status, 2026-09-13 (branch `redesign/a2-own-strikes-2026-09-13`); deployment facts updated
+> 2026-09-15.** There is no external audit
 > and none is planned (owner decision D14). This document is the scope of the INTERNAL review that
 > stands behind the contracts and the description of the code for anyone who reads it looking for
 > bugs: what is in and out, what we believe is true of the code and where, what the tests prove and
@@ -34,8 +35,9 @@ audit with fixes) first. `docs/ARCHITECTURE.md` (leekzor/callhouse) §2 has the 
 `ops/addresses.json` (leekzor/callhouse) the address book; neither has been re-read for this
 revision and both predate the redesign.
 
-Nothing is deployed to mainnet. This is a pre-deployment review of one deployable bytecode plus its
-two linked libraries.
+The vault and its two libraries are deployed on chain 4663 (Appendix), and Sourcify's copy of the
+vault's verified sources is byte-identical to `src/`. The review targets that one deployable bytecode
+plus its two linked libraries.
 
 ---
 
@@ -46,7 +48,7 @@ two linked libraries.
 1. Read the seven in-scope Solidity files in §3: one deployable contract (`Vault`), the three
    abstract bases it inherits (`Distributor`, `AdapterValorem`, `AdapterSeaport`), the two `public`
    libraries linked into it and reached by `DELEGATECALL` (`ValoremLib`, `SeaportOrderLib`), and
-   the `internal` library that holds the compiled-in caps (`Policy`). 1,397 nSLOC. The properties
+   the `internal` library that holds the compiled-in caps (`Policy`). 1,418 nSLOC. The properties
    to attack are in §5.
 2. Read the deploy path for configuration mistakes: `script/Deploy.s.sol`, `script/DeployClear.s.sol`,
    `script/Configure.s.sol`, `script/HandoverAdmin.s.sol`, `script/Verify.s.sol`, the runbook
@@ -56,20 +58,19 @@ two linked libraries.
    to audit (§4) against their verified source or bytecode. The contracts are theirs; the
    assumptions are ours.
 
-**Commit.** This document describes the tree at the "docs: redesign" commit on branch
-`redesign/a2-own-strikes-2026-09-13`, whose code is identical to `13dbd4d` ("harden: invariants,
-sizes, scripts, fork tests") except for NatSpec. `git status --porcelain` is empty there. Reproduce
+**Commit.** This document describes the tree at `0e2f6f6` on `main`. Its `src/` is unchanged
+since `bec4dbd` ("L-01: refuse deposits inside a fill"), which follows the AF-05 follow-up
+(`79cee08`), and is byte-identical to the live vault's Sourcify sources. `13dbd4d` ("harden:
+invariants, sizes, scripts, fork tests") predates both fixes and is not the deployed code. Reproduce
 every figure in §6 and §8 from the commit, not from this document.
 
 **Access.** First command after checkout: `git submodule update --init --recursive`
 (`lib/openzeppelin-contracts` and `lib/forge-std` are submodules; nothing builds without them).
 The canonical ABI, including every event and custom error, is generated from `out/` (§8 "ABIs flow
-one way"); the app repository's copies predate the redesign until its pin is bumped (SECURITY.md
-§5 item 4).
+one way").
 
 **Not asked for.** A re-audit of Valorem Clear, Seaport 1.6, USDG or the Stock Token. Gas
-optimisation. Review of the keeper, indexer or web code beyond the note in §4; they are not yet
-ported to write on fill.
+optimisation. Review of the keeper, indexer or web code beyond the note in §4.
 
 **Reporting.** `security@stonkhouse.fun` (SECURITY.md §6). The contracts are unaudited and a
 report is a favour, not a claim.
@@ -114,19 +115,19 @@ go through `queueRedeem`/`completeRedeem`. Deposits close at the cycle's exercis
 The one-sentence model (SECURITY.md §1): **no off-chain component can transfer a token out of the
 vault, but the keeper chooses the option type and the price the vault sells at.** A fully
 compromised keeper key cannot move a token, but it can arm the lowest strike the band admits and
-sell the week's calls at the policy floor to itself: about 1.1% of sold notional per week at
-launch policy and 50% implied volatility, about 2.2% for a bootstrap admin that first loosens
-policy (SECURITY.md §3). Under write on fill that is the whole bound: there is no unsold inventory
-to write to the cap and leave unlisted.
+sell the week's calls at the policy floor to itself: about 1.5% of sold notional per week at the
+live policy (0.10% premium floor) and 50% implied volatility, about 2.2% for the admin if it first
+loosens policy to the compiled floors (SECURITY.md §3). Under write on fill that is the whole bound:
+there is no unsold inventory to write to the cap and leave unlisted.
 
 | Key | Holder | Can | Cannot |
 |---|---|---|---|
-| `DEFAULT_ADMIN_ROLE` | At launch: the deployer key (bootstrap phase). After `HandoverAdmin.s.sol`: the admin Safe, 2-of-3 | `setPolicy` inside the `Policy.validate` caps; `setFeeRecipient` (non-zero); `setDepositCap` (unbounded, can close deposits); `setMaxPriceAge` in [1 hour, 7 days]; `acceptValoremFee`; `haltWrites` and `unhaltWrites`; grant/revoke `KEEPER_ROLE` and `GUARDIAN_ROLE`; grant admin to another address; renounce | Move any Stock Token or USDG (there is no admin-gated transfer in the vault); upgrade; rescue or sweep to an arbitrary address; take more than 20% of harvested premium, or any fee on strike proceeds (the exclusion is in bytecode); sell inside 1% OTM; widen staleness past 7 days; set utilisation above 99.85%. **No timelock on any admin action.** Worst case: never a token transfer, but value: `setPolicy` to the compiled floors, `grantRole(KEEPER_ROLE)` to itself, arm and sell to itself at the floor, about 2.2% of sold notional per week at 50% IV (SECURITY.md §3), plus 20% of whatever premium remains, routed to a recipient of its choosing. **The Valorem engine fee switch is not this role on the launch plan:** `DeployClear` sets `CLEAR_FEE_TO` to the admin Safe, `HandoverAdmin` never moves it, and `Verify.s.sol` requires `EXPECTED_CLEAR_FEE_TO`. After handover the same Safe holds both this role and `feeTo`, so `setFeesEnabled(true)` on Clear and `acceptValoremFee(true)` on the vault is 2-of-3 with no delay: every fill then pulls 15 bps of its notional from the vault IN NVDA on top of the collateral (`collateral × 15 / 10_000`, floor 1 wei, charged again on every top-up) into Clear's fee balance, sweepable to the Safe, and every exerciser pays 15 bps of the strike USDG the same way. Depositors are compensated only because the fill floor then adds `fee × spot / 1e18` USDG to the premium the buyer must pay (`ValoremLib.sol` L223–L231), so the net is a forced sale of 15 bps of NVDA per fill at the oracle's spot, less the 5% protocol fee on that extra premium, and a quote less competitive by the same 15 bps. With 95% of NAV sold in a week that is about 0.14% of NAV moving to the Safe in NVDA, more than the roughly 0.08% a 20% fee takes from a premium priced at the 0.40% floor: a lever on principal that the "never a token transfer" wording above does not cover, bounded by Clear's compiled 15 bps |
-| `KEEPER_ROLE` | Hot EOA run by `keeper/` (leekzor/callhouse) | `rollOpen(optionId)` (chooses which option type to arm, inside the arm gate); `approveListing` (proposes the whole Seaport order, at most three per cycle); `cancelListing`; `invalidateAllListings`; `rollClose` from `cycleExpiryTs` | Write anything itself (only a Seaport fill writes, and only through the vault's hook); hold option tokens or the claim; pay premium anywhere but the vault; list above strike, below the premium floor or with the strike below the band floor at live spot, past `cycleExerciseTs`, or beyond capacity; arm a type outside the band, with another asset, lot, or window; halt or unhalt; change any parameter; move a token. Worst case: a sale at the floor to a colluding buyer, about 1.1% of sold notional per week (SECURITY.md §3) |
-| `GUARDIAN_ROLE` | 1-of-1 key on separate hardware | `haltWrites` (blocks `rollOpen`, `approveListing` and every fill: `authorizeOrder` refuses); `cancelListing`; `invalidateAllListings` (needs no order data) | `unhaltWrites` (stop, never start); change parameters; block deposits, instant redemption, the queue (`queueRedeem`, `settleQueue`, `completeRedeem`), USDG claims, `retryStrandedClaim`, `lockBook` or `rollClose`; move a token |
+| `DEFAULT_ADMIN_ROLE` | Live: the hot deployer EOA `0xEb82…9d9b`, alone (bootstrap phase; no timelock). `HandoverAdmin.s.sol` would move it to a Safe with a threshold of at least 2; that handover is planned and not done | `setPolicy` inside the `Policy.validate` caps; `setFeeRecipient` (non-zero); `setDepositCap` (unbounded, can close deposits); `setMaxPriceAge` in [1 hour, 7 days]; `acceptValoremFee`; `haltWrites` and `unhaltWrites`; grant/revoke `KEEPER_ROLE` and `GUARDIAN_ROLE`; grant admin to another address; renounce | Move any Stock Token or USDG (there is no admin-gated transfer in the vault); upgrade; rescue or sweep to an arbitrary address; take more than 20% of harvested premium, or any fee on strike proceeds (the exclusion is in bytecode); sell inside 1% OTM; widen staleness past 7 days; set utilisation above 99.85%. **No timelock on any admin action.** Worst case: never a token transfer, but value: `setPolicy` to the compiled floors, `grantRole(KEEPER_ROLE)` to itself, arm and sell to itself at the floor, about 2.2% of sold notional per week at 50% IV (SECURITY.md §3), plus 20% of whatever premium remains, routed to a recipient of its choosing. **The Valorem engine fee switch is not this role:** the live Clear's `feeTo` is the 1-of-1 Safe `0xff14…CF61` (owner `0x7A3a…2C32`), `HandoverAdmin` never moves it, and `Verify.s.sol` requires `EXPECTED_CLEAR_FEE_TO`. With that Safe's `setFeesEnabled(true)` on Clear and this key's `acceptValoremFee(true)` on the vault, neither behind a delay, every fill pulls 15 bps of its notional from the vault IN NVDA on top of the collateral (`collateral × 15 / 10_000`, floor 1 wei, charged again on every top-up) into Clear's fee balance, sweepable by `feeTo`, and every exerciser pays 15 bps of the strike USDG the same way. Depositors are compensated only because the fill floor then adds `fee × spot / 1e18` USDG to the premium the buyer must pay (`ValoremLib.sol` L223–L231), so the net is a forced sale of 15 bps of NVDA per fill at the oracle's spot, less the 5% protocol fee on that extra premium, and a quote less competitive by the same 15 bps. With 95% of NAV sold in a week that is about 0.14% of NAV moving to `feeTo` in NVDA, more than the roughly 0.02% a 20% fee takes from a premium priced at the live 0.10% floor: a lever on principal that the "never a token transfer" wording above does not cover, bounded by Clear's compiled 15 bps |
+| `KEEPER_ROLE` | Hot EOA `0x06c1…C1d2` run by `keeper/` (leekzor/callhouse) | `rollOpen(optionId)` (chooses which option type to arm, inside the arm gate); `approveListing` (proposes the whole Seaport order, at most three per cycle); `cancelListing`; `invalidateAllListings`; `rollClose` from `cycleExpiryTs` | Write anything itself (only a Seaport fill writes, and only through the vault's hook); hold option tokens or the claim; pay premium anywhere but the vault; list above strike, below the premium floor or with the strike below the band floor at live spot, past `cycleExerciseTs`, or beyond capacity; arm a type outside the band, with another asset, lot, or window; halt or unhalt; change any parameter; move a token. Worst case: a sale at the floor to a colluding buyer, about 1.5% of sold notional per week at the live policy (SECURITY.md §3) |
+| `GUARDIAN_ROLE` | EOA `0x2974…6F39`, derived from the same mnemonic as the admin and keeper keys; it has never sent a transaction | `haltWrites` (blocks `rollOpen`, `approveListing` and every fill: `authorizeOrder` refuses); `cancelListing`; `invalidateAllListings` (needs no order data) | `unhaltWrites` (stop, never start); change parameters; block deposits, instant redemption, the queue (`queueRedeem`, `settleQueue`, `completeRedeem`), USDG claims, `retryStrandedClaim`, `lockBook` or `rollClose`; move a token |
 | Seaport 1.6 (the contract) | canonical address, no admin | call `authorizeOrder` and `validateOrder` on the vault (`NotSeaport` for anyone else); pull the option tokens the hook just minted under the one-time `setApprovalForAll` | make the vault write for any order but its own live listing (`NotLiveListing`: hash and offerer checked); leave a token behind (`InventoryLeftBehind`) |
-| Fee recipient | Fee Safe | Receive the protocol fee through the best-effort push in `rollClose` or the permissionless `sweepFee()` (both via `_tryPayFee`, Vault L1703) | Holds no role; nothing else |
-| Deployer | EOA running `Deploy.s.sol` | Fix every immutable at construction (asset, USDG, clearinghouse, Seaport, feed, conduit key); choose the one `admin` the constructor grants `DEFAULT_ADMIN_ROLE` to (Vault L441). **Launch plan: `admin` = the deployer's own address** | A wrong immutable is unfixable without a redeploy. The zone is not a parameter: it is the vault. Leaves the admin role only through `HandoverAdmin.s.sol` |
+| Fee recipient | Live: the hot admin EOA `0xEb82…9d9b` (a constructor argument; `setFeeRecipient` can change it) | Receive the protocol fee through the best-effort push in `rollClose` and `retryStrandedClaim`, or the permissionless `sweepFee()` (all via `_tryPayFee`, Vault L1703) | Nothing else through this slot (today's recipient also holds `DEFAULT_ADMIN_ROLE`, as the admin row) |
+| Deployer | EOA running `Deploy.s.sol` | Fix every immutable at construction (asset, USDG, clearinghouse, Seaport, feed, conduit key); choose the one `admin` the constructor grants `DEFAULT_ADMIN_ROLE` to (Vault L441). **Live: the deployer `0xEb82…9d9b` passed its own address as `admin`** | A wrong immutable is unfixable without a redeploy. The zone is not a parameter: it is the vault. `HandoverAdmin.s.sol` is the scripted way to move the admin role, but the admin can `grantRole`, `revokeRole` or `renounceRole` `DEFAULT_ADMIN_ROLE` directly at any time (OZ AccessControl; the vault adds no restriction) |
 | Anyone | — | `deposit`, `mint`, `redeem`, `withdraw`, `queueRedeem`, `completeRedeem`, `claimUsdg`, `claimUsdgTo`, ERC-20 transfers; `lockBook` after `cycleExerciseTs`; `rollClose` after `cycleExpiryTs + 1 hour`; `sweepFee`; `settleQueue` while `Idle` with shares queued; `retryStrandedClaim` while stranded; buying through any Seaport fulfil function; writing the same option id on Valorem and exercising | Make the vault write outside a fill of its own listing; settle a queue outside `Idle`; be assigned more than the vault sold |
 
 Third parties that hold no role but have power over the vault: the Stock Token issuer, the USDG
@@ -146,10 +147,10 @@ the verified powers; §4 below states what we assume about each.
 | `src/lib/ValoremLib.sol` | 156 | **Linked public library, DELEGATECALL.** The arm gate (`open`), the fill gate and write (`writeOnFill`), the low-level redeem with the gas guard (`tryRedeemClaim`), the spot read, the oracle-pause probe, three never-reverting position views | `open` (view), `writeOnFill`, `tryRedeemClaim` (DELEGATECALL only), `spotUsdg`, `oraclePaused`, `lockedAssets`, `claimedExerciseProceeds`, `contractsAssigned` (views) |
 | `src/lib/SeaportOrderLib.sol` | 125 | **Linked public library, DELEGATECALL.** Field-by-field validation of the keeper's `OrderComponents` (zone == vault, `PARTIAL_RESTRICTED`, one offer item, ONE consideration item), `getOrderHash`, `validate`, hash-checked `cancel` | `approve`, `cancel` (DELEGATECALL only), `toParameters` (pure) |
 | `src/Policy.sol` | 117 | Internal pure library, inlined: the hard caps, OTM band, premium floor, utilisation and count caps, fee split, oracle normalisation | None external; 11 internal pure functions and 8 constants |
-| **Total** | **1,397** | | |
+| **Total** | **1,418** | | |
 
 nSLOC is what remains after stripping every `/* … */` block (all NatSpec), `//` comments and
-blank lines; the same seven files are about 3,230 physical lines, so more than half the text is
+blank lines; the same seven files are about 3,330 physical lines, so more than half the text is
 comment. All seven files are `pragma solidity 0.8.28`. `Distributor`, `AdapterValorem` and
 `AdapterSeaport` have no bytecode of their own.
 
@@ -196,7 +197,8 @@ canonical ConduitController; feed `answer > 0`, `updatedAt > 0`, `decimals() == 
 registry preflight and no zone parameter. `script/DeployClear.s.sol` (optional) deploys our own
 `ValoremOptionsClearinghouse` from the vendored artifact under `script/artifacts/` (asserted
 identical to the test fixture by `Fixtures.t.sol`), with `CLEAR_FEE_TO` as `feeTo` (the admin Safe
-from deploy; owner decision 2026-09-14) and Overcall's URI generator by default, and asserts
+from deploy, per the owner decision of 2026-09-14; the live instance was given the 1-of-1 Safe
+`0xff14…CF61`) and Overcall's URI generator by default, and asserts
 `feeBps() == 15`, `feesEnabled() == false`, the wiring and ERC-1155 support. `Configure.s.sol`
 grants `KEEPER_ROLE` and `GUARDIAN_ROLE` from `ADMIN_PK` (refusing a key without admin) or writes a
 Safe Transaction Builder batch. `HandoverAdmin.s.sol` moves the vault admin to the Safe in two runs
@@ -259,7 +261,8 @@ claimKey != 0`), that only a failed redeem can produce.
   L752, which is `_depositRefused()`: phase Idle or Listed; in Listed `block.timestamp <
   cycleExerciseTs`; no claim with unclaimed exercise proceeds; not stranded; `balance >=
   reservedAssets`; `totalSupply() <= totalAssets() × MAX_SHARES_PER_ASSET` (1e6, the share-price
-  floor); one selector `DepositsClosed` for all six; cap checked on `totalAssets() +
+  floor); no fill of this transaction has written (`_fillArmed`); one selector `DepositsClosed` for
+  all seven; cap checked on `totalAssets() +
   assets`; `_checkpointHarvest()` before `_mint`); `redeem` L763 and `withdraw` L778 (`UseQueue`
   unless flat; burn before transfer); `queueRedeem` L808 (every phase; moves no tokens; settles a
   prior epoch into owed balances, settles the owner's USDG accrual, records the reward debt,
@@ -433,8 +436,11 @@ library's check); `_tryRedeemClaim` L138 only from `rollClose` and `retryStrande
 success. Both write storage after the external call and rely on Vault's `nonReentrant` (and, for
 the mint callback, on the receiver hook being a view).
 
-**Dependencies and assumptions about Valorem Clear** (`0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0`
-by default, or our own instance; bytecode-identical to `valorem-labs-inc/clear` @ `6436c823`, §4):
+**Dependencies and assumptions about Valorem Clear** (live: our own instance
+`0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`; `Deploy.s.sol`'s default is Overcall's
+`0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0`; the two runtimes are identical except the CBOR
+metadata hash, and Overcall's is a Sourcify `exact_match` to `valorem-labs-inc/clear` @ `6436c823`,
+§4):
 `newOptionType` is permissionless and the tuple it records is immutable; `tokenType(id)` is
 `Option` for an option id, `Claim` for a claim id, `None` otherwise; `option(id)` returns the tuple
 for an option id and the SAME tuple for a claim id of that type (hence the `tokenType` check);
@@ -449,8 +455,9 @@ optionKey`, fixed forever; `redeem(claimId)` reverts for non-owners and before e
 claim, and pushes assigned strike USDG then unassigned underlying to `msg.sender`, each leg only if
 non-zero, with no writer-side fee; `position(claimId)`/`claim(claimId)` sum over every claim index
 and reflect partial assignment live; `claim().amountExercised` is `count × 1e18`; exercise has no
-callback into the writer; `feesEnabled()`/`feeBps()`/`feeTo()` are the only admin surface
-(`onlyFeeTo`; `feeBps` is the constant 15). All of this is exercised against the real bytecode by
+callback into the writer; the only admin surface is `feeTo`'s: `setFeesEnabled`,
+`setFeeTo` (then `acceptFeeTo` by the nominee), `setTokenURIGenerator` and `sweepFees` (`onlyFeeTo`;
+`feeBps` is the constant 15). All of this is exercised against the real bytecode by
 `test/unit/MockClearDiff.t.sol`, the AF-01/AF-02 regressions and the fork suite.
 
 **Invariants to hold.** P-03, P-04, P-05, P-06, P-21, P-22, P-23, P-27, P-33, P-34 in §5, plus:
@@ -527,8 +534,10 @@ hooks** (integrations/seaport.md; the vault never calls a fulfil function). Seap
 reentrancy guard is set for the whole fill, so a buyer's `onERC1155Received` cannot reach Seaport,
 and hooks are sequential, never nested. `TSTORE`/`TLOAD` execute on 4663 (fork
 `test_fork_transientStorageIsLiveOnChain4663`). `InexactFraction` requires each amount to be
-divisible by the order size. All of this is exercised against the real 4663 runtime by
-`test/unit/VaultRealSeaport.t.sol` and `test/unit/Fixtures.t.sol`, and live by the fork suite.
+divisible by the order size. All of this except `fulfillAvailableOrders`, `matchOrders` and
+`fulfillBasicOrder_efficient_6GL6yc`, which no test calls, is exercised against the real 4663
+runtime by `test/unit/VaultRealSeaport.t.sol` and `test/unit/Fixtures.t.sol`, and against the live
+Seaport by the fork suite.
 
 **Invariants to hold.** P-16, P-31, P-32, P-33 in §5, plus: every clearing path zeroes
 `listingHash`; `listingsThisCycle` increments exactly once per authorisation, never exceeds 3, and
@@ -586,12 +595,17 @@ non-positive answer; no storage, no external calls.
 Do not re-audit the dependencies. Do check our integration assumptions about each, listed in §3
 and summarised here.
 
-**Valorem Clear** (`ValoremOptionsClearinghouse`; Overcall's instance at
-`0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0`, or one of our own from `script/DeployClear.s.sol`).
-The 4663 instance was deployed by Overcall's key (deploy tx `0xacc4c4f9…1034`, block 59,378,584,
-constructor `feeTo = 0xdAe7…0782`), is verified `exact_match` on Sourcify to
-`valorem-labs-inc/clear` @ `6436c823f560af493af119d6148fb3237037aca4` (solc 0.8.16, 200 runs,
-`london`, no via-IR), and is the artifact vendored under `test/fixtures/valorem/` and
+**Valorem Clear** (`ValoremOptionsClearinghouse`). The live vault's `clear()` is our own instance,
+`0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`, deployed by the admin
+EOA `0xEb82…9d9b` (tx `0x1685c5f1…a756c9`, block 63,467,465) with `feeTo` = the 1-of-1 Safe
+`0xff1454009F024507f3E455eb2027E98fAF4ccF61`. It is not source-verified on Sourcify or Blockscout.
+Its 16,110 B runtime equals the vendored `script/artifacts/ValoremOptionsClearinghouse.json` byte
+for byte, and equals Overcall's instance `0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0` except the
+CBOR metadata hash. Overcall's instance, `Deploy.s.sol`'s default and not used by the live vault, was
+deployed by Overcall's key (deploy tx `0xacc4c4f9…1034`, block 59,378,584, constructor `feeTo =
+0xdAe7…0782`), is verified `exact_match` on Sourcify to `valorem-labs-inc/clear` @
+`6436c823f560af493af119d6148fb3237037aca4` (solc 0.8.16, 200 runs, `london`, no via-IR); apart from
+that metadata hash, it is the artifact vendored under `test/fixtures/valorem/` and
 `script/artifacts/`. The contract is immutable: no owner, no pause, no blocklist, no proxy; `feeTo`
 holds the fee switch, `setFeeTo` (no event), the URI generator and fee sweeping. **Upstream is
 dormant** (last commit 2023-11-13): no patch path, bounty or incident response. Audits, from the
@@ -688,11 +702,12 @@ discloses it.
 
 **Keeper, indexer, web** (`keeper/`, `indexer/`, `web/` (leekzor/callhouse); the site
 (leekzor/callhouse-site)). No money authority: no key they hold can move a token, and the vault
-re-validates every field the keeper proposes. Out of scope, and **not yet ported to write on
-fill** (SECURITY.md §5 item 4): they still build `PARTIAL_OPEN` orders with two consideration
-items, POST to Overcall, and read `writeMore`/`contractsRemaining`. Until they land the vault can
-be operated only by hand. If a reviewer finds an order the vault accepts that an honest keeper
-would never build, that is a finding against the vault.
+re-validates every field the keeper proposes. Out of scope. They run the live product on write on
+fill: the keeper creates each week's option type on the Clear, arms it with `rollOpen` and
+authorises a `PARTIAL_RESTRICTED` listing with the vault as zone (cycle 1 on chain since
+2026-09-15), and the app's cycle page (`app.stonkhouse.fun/vault/nvda/cycle`) serves that order
+after checking it against `listingHash` and fills it through Seaport. If a reviewer finds an order
+the vault accepts that an honest keeper would never build, that is a finding against the vault.
 
 ---
 
@@ -777,7 +792,7 @@ Deduplicated across the per-contract records. Money paths first.
    `claimedExerciseProceeds() != 0` probe, the stranded refusal, the reserve check and the
    share-price floor (`totalSupply() > totalAssets() × 1e6` refuses: a book burnt to nothing with
    its shares outstanding is not sold at one wei a share, and the share supply stays inside the
-   1e27-scaled index arithmetic), all in `_depositRefused` (L591–L597). Try: any minting or
+   1e27-scaled index arithmetic), all in `_depositRefused` (L649–L657). Try: any minting or
    price-quoting path that bypasses it; a deposit that lands exactly at the floor and a burn or
    assignment that takes the book below it afterwards (the floor is a gate on new shares, not a
    bound on the live ratio: the queue and index maths must settle whatever the ratio does, see
@@ -903,13 +918,16 @@ Deduplicated across the per-contract records. Money paths first.
 **C. Economic and governance.**
 
 13. **Keeper discretion inside policy.** A compromised keeper can arm the lowest strike the band
-    admits, list the whole capacity at exactly the floor (0.40% of spot notional at launch) to a
-    colluding buyer whose fill writes immediately, or never roll. Our estimate (SECURITY.md §3):
-    about 1.1% of sold notional per week at 50% IV, about 2.7% at 80%; it repeats every week nobody
-    notices. Three listings per cycle bound how far the quote can be walked. Check our arithmetic,
-    and say whether `haltWrites` (which now stops fills instantly) and `invalidateAllListings` are
-    sufficient given that `SeaportOrderLib` refuses a future `startTime`, so a listing is fillable
-    in the block it is authorised. None of the mitigations in SECURITY.md §3 is implemented.
+    admits, list the whole capacity at exactly the floor (0.10% of spot notional under the live
+    policy; the admin lowered it from 0.40% on 2026-09-15) to a colluding buyer whose fill writes
+    immediately, or never roll. Our estimate (SECURITY.md §3): about 1.5% of sold notional per week
+    at 50% IV, about 3.0% at 80%; it repeats every week nobody notices, and no alert is delivered
+    off chain today. Three listings per cycle bound how far the quote can be walked. Check our
+    arithmetic, and say whether `haltWrites` (which now stops fills instantly) and
+    `invalidateAllListings` are sufficient given that `SeaportOrderLib` refuses a future
+    `startTime`, so a listing is fillable in the block it is authorised. Of the mitigations in
+    SECURITY.md §3 only vol-model keeper pricing is implemented, off-chain, and it does not
+    constrain a compromised key.
 14. **Oracle gate.** Vault L1635–L1664, ValoremLib L264–L277, Policy L236. No
     `roundId`/`answeredInRound`; staleness in days by design (4 days; the feed is dark all
     weekend and the frozen value predates the close by up to a few hours); `block.timestamp −
@@ -937,8 +955,8 @@ Deduplicated across the per-contract records. Money paths first.
     changes the floors the NEXT fill must clear); the admin can renounce and freeze governance; a
     wrong immutable is unfixable. Say whether the `Policy` caps are "cannot rug" bounds: 1% OTM, a
     0.10% weekly premium floor, 99.85% utilisation, a fee of 20% of premium. They do not bound
-    value leakage (about 2.2% of sold notional per week at the floors, SECURITY.md §3). The launch
-    plan puts that power in one deployer key until the Safe handover.
+    value leakage (about 2.2% of sold notional per week at the floors, SECURITY.md §3). Today that
+    power sits in one hot EOA, `0xEb82…9d9b`, and the Safe handover has not happened.
 17. **Valorem engine fee.** ValoremLib L224–L231, L241. Mirrors `collateral × feeBps / 10_000`
     with a floor of 1, on top of collateral, verified against the real bytecode
     (`test_fill_acceptedFeeRaisesTheFloorPullsTheFeeAndScrubsTheApproval`, `AF04_FeeSizing`);
@@ -946,10 +964,10 @@ Deduplicated across the per-contract records. Money paths first.
     The fee is a NAV loss borne by depositors and priced into the buyer's floor; the only guard is
     `acceptValoremFee`. Upstream charges it on every top-up, so a week filled in `k` pieces pays it
     `k` times on `k` smaller notionals.
-18. **Clearinghouse choice.** The vault is agnostic; the default is Overcall's instance, whose
-    `feeTo` is an unfunded EOA that is also that venue's fee recipient. Our own instance moves the
-    switch to the admin Safe from deploy. Say whether anything in the vault depends on which instance it is, and
-    whether the `DeployClear.s.sol` defaults (Overcall's URI generator) matter.
+18. **Clearinghouse choice.** The vault is agnostic. `Deploy.s.sol` defaults to Overcall's instance,
+    whose `feeTo` is an EOA that has never sent a transaction; the live vault uses our own, whose
+    `feeTo` is the 1-of-1 Safe `0xff14…CF61`. Say whether anything in the vault depends on which
+    instance it is, and whether the `DeployClear.s.sol` defaults (Overcall's URI generator) matter.
 
 **D. Observability and test fidelity.**
 
@@ -969,7 +987,7 @@ Deduplicated across the per-contract records. Money paths first.
 20. **Write on fill through the zone hooks** (P-33; B.10). The premise: Seaport 1.6 calls
     `authorizeOrder` before any transfer on every path and reverts the transaction when a status
     update fails after a successful authorise. It is exercised on the vendored 4663 runtime
-    (`VaultRealSeaport.t.sol`, 14 tests) and live (`test_fork_writeOnFillAgainstLiveSeaportAndClear`).
+    (`VaultRealSeaport.t.sol`, 14 tests) and on the fork (`test_fork_writeOnFillAgainstLiveSeaportAndClear`: the live Seaport and Overcall's live Clear, on a test-deployed vault).
     Try to find a Seaport 1.6 path, parameter or error branch where a write happens and its sale
     does not (a token stays in the vault past `validateOrder`; `validateOrder` is skipped; an
     `authorizeOrder` succeeds and Seaport then skips the order instead of reverting), or a sale
@@ -1017,8 +1035,8 @@ SECURITY.md §4.
 **Internal review, 2026-09-14** (SECURITY.md §4 "The 2026-09-14 review"): one reviewer over `src/`
 at `79cee08`; no Critical, High or Medium. L-01 (Low, a contract buyer depositing from its ERC-1155
 receive hook into the premium of its own fill) is fixed by `_depositRefused` reason 7 with
-`test/regression/L01_InFillDeposit.t.sol` and a real-Seaport case; the Informational (the admin
-Safe holding our own Clear's fee switch from deploy) is in the §2 admin row.
+`test/regression/L01_InFillDeposit.t.sol` and a real-Seaport case; the Informational (who holds our
+own Clear's fee switch) is in the §2 admin row.
 
 **Internal audit, 2026-09-13** (SECURITY.md §4 "The 2026-09-13 audit"; `AUDIT-FINDINGS-2026-09-13.md`
 in the project handoff folder): 38 agents, 20 raw findings, 5 confirmed with proofs of concept on
@@ -1040,7 +1058,7 @@ passed, 0 failed, 0 skipped`):
 | `test/unit/VaultListing.t.sol` | 53 | One negative test per `SeaportOrderLib` revert (zone, type, one consideration item, capacity, divisibility, strike ceiling, timing, counter), the three-per-cycle budget, cancel/invalidate permissions, halt and oracle gates, the band floor and premium floor at `approveListing` |
 | `test/unit/VaultRoll.t.sol` | 36 | Every arm-gate refusal (`NotAnOptionType`, asset, exercise asset, lot, `ExerciseTooSoon`, `BadCycleWindow` both ways, fee, oracle, both band bounds, `StillStranded`), `lockBook`, `rollClose` timing and permissions incl. the `claimKey == 0` close, a full OTM cycle |
 | `test/unit/VaultWriteOnFill.t.sol` | 20 | The fill gate through the mock hooks: first fill opens the claim, later fills top it up, wrong claim returned, the `cycleExerciseTs` edge, band floor after a rally, ceiling not re-checked, premium floor at live spot, sizing on the total (utilisation and cap), zero, fee on and unaccepted, accepted fee raises the floor and scrubs the approval, halt, phase, `NotSeaport`, `InventoryLeftBehind`, a foreign order naming the vault as zone, hooks never call Seaport, a buyer re-entering mid-fill, the receiver refusing donations |
-| `test/unit/VaultRealSeaport.t.sol` | 14 | Every real Seaport 1.6 fulfilment path against the vault on the vendored 4663 runtime: `fulfillOrder`, `fulfillAdvancedOrder` (first fill then top-ups), the `cycleExerciseTs` edge on real Seaport, a hook revert bubbling with nothing written, the same order twice in `fulfillAvailableAdvancedOrders` within and beyond the remainder (whole-tx revert), a hook revert skipping the vault's order, `matchAdvancedOrders`, `fulfillBasicOrder`, a hostile contract buyer, a buyer's deposit from its receive hook refused (L-01), a foreign zone order, cancel and counter bump, a full cycle on real Seaport and real Clear |
+| `test/unit/VaultRealSeaport.t.sol` | 14 | Five of Seaport 1.6's eight fulfilment entrypoints against the vault on the vendored 4663 runtime: `fulfillOrder`, `fulfillAdvancedOrder` (first fill then top-ups), the `cycleExerciseTs` edge on real Seaport, a hook revert bubbling with nothing written, the same order twice in `fulfillAvailableAdvancedOrders` within and beyond the remainder (whole-tx revert), a hook revert skipping the vault's order, `matchAdvancedOrders`, `fulfillBasicOrder`, a hostile contract buyer, a buyer's deposit from its receive hook refused (L-01), a foreign zone order, cancel and counter bump, a full cycle on real Seaport and real Clear |
 | `test/unit/VaultQueue.t.sol` | 41 | Escrow, epoch settlement, zero dust, reserves vs NAV/cap/collateral, issuer freeze, multi-epoch, fuzzed reservation bounds, `settleQueue` (both trap PoCs, escrow accrual, instant-redeem parity, donation inflation, phase and empty-queue reverts, issuer freeze) |
 | `test/unit/VaultQueueFairness.t.sol` | 4 | Per-entry escrow USDG, deposit-then-queue, a tranche indexed between entries, a fuzz over three entries around two tranches |
 | `test/unit/VaultAssignment.t.sol` | 19 | Full/partial/zero assignment, the fee base on assigned weeks, the late depositor (shares the assignment; can be written against by a later fill), queued redeemers through assigned weeks, fuzzed collateral/strike exactness |
@@ -1081,63 +1099,68 @@ by the run.
 
 **Fork tests against live chain 4663** (`FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC`,
 `test/fork/ForkLive.t.sol`, 20 tests, all passing 2026-09-13 against the public RPC on this
-branch): code presence at every address; the Seaport runtime hash equals the vendored one; token
+branch; every test deploys its own vault on Overcall's live Clear `0x9a7b…C0C0`, whose runtime
+equals ours except the metadata hash, so none touches the live vault or our Clear `0x53d7…C6`): code presence at every address; the Seaport runtime hash equals the vendored one; token
 decimals; the Valorem fee switch off; Clear is ERC-1155; anyone can create an option type and its
 seed is its key; feed liveness, age and normalisation; the vault deploys and reads spot; Seaport
 hashes our order shape; the guardian bumps the real counter; a real Stock Token deposit;
 `uiMultiplier` display-only; the oracle not paused; **a first fill and a top-up fill through the
-live Seaport and Clear** (`test_fork_writeOnFillAgainstLiveSeaportAndClear`); the arm gate
-refusing an out-of-band strike and a claim id on the live Clear; `TSTORE`/`TLOAD` live on 4663;
-**an assigned week exercised by the buyer and closed by a stranger on the live Clear** with
+live Seaport and Overcall's Clear** (`test_fork_writeOnFillAgainstLiveSeaportAndClear`); the arm gate
+refusing an out-of-band strike and a claim id on Overcall's Clear; `TSTORE`/`TLOAD` live on 4663;
+**an assigned week exercised by the buyer and closed by a stranger on Overcall's Clear** with
 assignment equal to what was sold and the strike credited fee-free
 (`test_fork_assignedWeekSettlesOnLiveClear`); **an unfilled week closing flat**; and **a stranded
 close under the real USDG `ASSET_PROTECTION` freeze of the vault, with `retryStrandedClaim`
 recovering it after the unfreeze** (`test_fork_usdgFreezeStrandsTheCloseAndRetryRecoversIt`).
 Not covered on the fork: distribution and claims beyond the close's harvest, the NVDA-side strand
-(the blocklist role is not impersonated), a multi-writer bucket on the live Clear (that is the real
-bytecode in the regression suite).
+(the blocklist role is not impersonated), a multi-writer bucket on a live Clear (that is the real
+bytecode in the regression suite), and anything on the live vault or our Clear.
 
 **Deploy rehearsal** (`docs/DEPLOY.md` "Rehearsal record"): `script/rehearse-deploy.sh` on an
-anvil fork of 4663 at block 62533535 with `--code-size-limit 98304`, both admin paths, our own
-Clear on path A and Overcall's on path B, Verify 63/69/72/71 with the negative checks. It does not
+anvil fork of 4663 at block 63380078 with `--code-size-limit 98304` (2026-09-14, after L-01 at
+`bec4dbd`), both admin paths, our own Clear with `feeTo` = the admin Safe on path A and Overcall's on
+path B, Verify 67/73/76 on path A and 71 on path B, with the negative checks. It does not
 prove the Safe{Wallet} UI, hardware signing, Sourcify verification, or anything after
 configuration.
 
 **What none of this proves.** No external review has been done and none is planned; these
 contracts are unaudited (D14). Every real-Clear and real-Seaport result is against the bytecode
 vendored from chain 4663 at one point in time, and the fork suite against the live chain at one
-block. The keeper has never driven the redesigned vault: the keeper dry run in
-`keeper/DRYRUN.md` (leekzor/callhouse) predates write on fill. Every figure in this document is
-from a local run: every GitHub Actions run on the repository's account dies `startup_failure` at
-the account level, so CI has not independently confirmed anything (README "CI").
+block. On the live vault, as of 2026-09-15, the keeper has armed cycle 1 and authorised two
+listings (one cancelled); no fill, exercise or close has happened there yet, and the keeper dry run
+in `keeper/DRYRUN.md` (leekzor/callhouse) predates write on fill. Every figure in this document is
+from a local run. CI's build job fails on `main` as of 2026-09-15 (two suites revert
+`CreateContractSizeLimit` in their test constructor under forge `stable`), so CI has not
+independently confirmed the offline suite at this commit (README "CI").
 
 ---
 
 ## 7. Known accepted risks and open questions
 
-Open questions being closed before launch (SECURITY.md §5):
+Open questions (SECURITY.md §5):
 
-1. The self-hosted fill page is the only venue; Overcall's book cannot list a restricted order
-   with the vault as zone. Closed by decision D1.
-2. **Keeper prices at exactly the policy floor.** An upward oracle tick between the keeper's read
-   and `approveListing` reverts `PremiumBelowMinimum` or `StrikeBelowBand`; a rally between
-   approval and a fill makes the listing unfillable (`PremiumBelowFloorAtFill`,
-   `StrikeBelowBand`) until repriced. Self-heals; a margin is under consideration. Pricing at the
-   floor is also the leakage in C.13.
+1. The app's cycle page is the only venue; Overcall's book cannot list a restricted order with the
+   vault as zone. Closed by decision D1.
+2. **Keeper pricing at exactly the policy floor.** Closed: the keeper adds a margin
+   (`KEEPER_PREMIUM_MARGIN_BPS`, 50 bps in production) and in vol mode asks the larger of that and
+   fair value plus 10%. A rally between approval and a fill still makes a listing unfillable
+   (`PremiumBelowFloorAtFill`, `StrikeBelowBand`) until repriced.
 3. **Deposit-time harvest checkpoint gas**, and the fill gas (~470k first fill, ~245k top-up,
    spike figures): to be measured on the first live week.
-4. **The keeper, indexer and web are not ported to write on fill** (§4). Until they land the
-   vault can be operated only by hand.
+4. **Porting the keeper, indexer and web to write on fill** (§4). Done.
 5. **Open decisions on pricing leakage** (SECURITY.md §3): an admin timelock, higher compiled
-   floors, a listing start delay, vol-model keeper pricing, no deposits before the Safe handover.
-   None is implemented.
+   floors and a listing start delay are not implemented; vol-model keeper pricing is, off-chain;
+   deposits opened before the Safe handover.
 
 Accepted by design (SECURITY.md §4 "Known and accepted"; confirm each is bounded as we claim
 rather than re-open it):
 
 - **No upgradeability, no rescue function, no timelock on the admin.** A real bug means Vault v2
-  and a migration. The admin's value lever is 20% of future premium plus `feeRecipient`; strike
-  proceeds are outside the fee base in bytecode.
+  and a migration. The admin's value levers are the protocol fee (up to 20% of any premium not yet
+  harvested, since `setPolicy` applies at the next harvest) and `feeRecipient`; `setPolicy` to the
+  compiled floors plus `grantRole(KEEPER_ROLE)` to itself (about 2.2% of sold notional per week,
+  §2); and, with the Clear's `feeTo` Safe enabling fees, `acceptValoremFee(true)` (about 0.14% of
+  NAV a week in NVDA, §2). Strike proceeds are outside the fee base in bytecode.
 - **The protocol fee is 5% of premium only.** `Harvest.feeUsdg / grossUsdg` is not the rate on an
   assigned week (ACCOUNTING.md §6).
 - **Any USDG that lands in the vault is harvest**, fee'd and distributed.
@@ -1158,7 +1181,9 @@ rather than re-open it):
   strike USDG frozen or wiped are gone for the holders they were owed to.
 - **The price feed can lag the token** at a multiplier `effectiveAt` (≈11.8 h observed), and the
   frozen weekend value predates the close by up to a few hours. For those hours the band and floor
-  are priced on a stale basis, bounded by the band; the keeper is expected to skip such windows.
+  are priced on a stale basis, bounded by the band. The keeper has no explicit skip for such a
+  window; in vol mode it refuses to price when token spot and Cboe's share price differ by more than
+  300 bps.
   The audit's plausible-unproven "split-multiplier discontinuity" reduces to this under D16.
 - **The 4663 sequencer is a single operator with compliance filtering**; force inclusion takes 4
   days and may itself be filtered; there is no uptime feed and `maxPriceAge` does not notice an
@@ -1166,9 +1191,9 @@ rather than re-open it):
 - **Upstream Valorem is dormant**, the fixed-seed bucket walk is public, and the vault is designed
   on exactly that behaviour: a third-party writer and exerciser can assign the vault fully on what
   it sold, which is the priced covered-call exposure, and on nothing more.
-- **The Clear `feeTo`** of whichever instance is used holds the fee switch, which the vault treats
-  as opt-in. Overcall's key on the default instance; ours on our own.
-- **`maxPriceAge` is days, not hours** (4 at launch, ceiling 7). No `roundId`/`answeredInRound`.
+- **The Clear `feeTo`** holds the fee switch, which the vault treats as opt-in. On the live
+  instance it is the 1-of-1 Safe `0xff14…CF61`.
+- **`maxPriceAge` is days, not hours** (4 live, ceiling 7). No `roundId`/`answeredInRound`.
 - **The Valorem engine fee is opt-in** and, once accepted, a NAV cost of 15 bps of notional per
   fill, priced into the buyer's floor.
 - **`claimUsdg`/`claimUsdgTo`, ERC-20 transfers and `validateOrder` are not `nonReentrant`**; CEI
@@ -1235,7 +1260,7 @@ Traps (README "Four things that will bite you"):
   local first; `vm.expectEmit` has the same rule.
 - **`cache/invariant`.** Foundry replays persisted counterexamples; clear the directory after
   changing behaviour.
-- **Invariant depth.** Configured inline (`forge-config` L1600–L1603) and `afterInvariant` refuses
+- **Invariant depth.** Configured inline (`forge-config` L1599–L1602) and `afterInvariant` refuses
   a run that did not reach it; do not lower it to go faster.
 - **ABIs flow one way**: `out/` → `ops/abis/Vault.json` (leekzor/callhouse) → generated copies in
   `indexer/` and `web/`; the keeper's `keeper/src/abi.ts` is hand-transcribed.
@@ -1271,9 +1296,18 @@ Findings we decline to fix are recorded in SECURITY.md §4 "Known and accepted" 
 
 | What | Address |
 |---|---|
-| Valorem Clear (`ValoremOptionsClearinghouse`), Overcall's instance, the default `CLEARINGHOUSE` | `0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0` |
-| Clear `feeTo` on that instance (EOA, unfunded) | `0xdAe7e82A2E7D566C67E87C164B05a1C560190782` |
-| Clear `tokenURIGenerator` on that instance (default for `DeployClear.s.sol`) | `0xE53cCB924d27f421a91b59087587fD866C5d64c7` |
+| Vault ("Callhouse NVDA" / `cNVDA` on chain, named before the rename), block 63,467,882 | `0x88a98931E3682137E7e4D3426f623247f4A4ecbb` |
+| SeaportOrderLib (CREATE2) | `0x6B617a0B578Ef6EDCD07774468f08b3778272D8A` |
+| ValoremLib (CREATE2) | `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d` |
+| Valorem Clear, our instance, the live vault's `clear()` (not source-verified) | `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6` |
+| Clear `feeTo` on our instance: Safe 1.4.1, 1 of 1, no modules, no guard | `0xff1454009F024507f3E455eb2027E98fAF4ccF61` |
+| Sole owner of that Safe | `0x7A3a8C3F6331f63107D5b3aEeA0515e799022C32` |
+| `DEFAULT_ADMIN_ROLE` and `feeRecipient()` (hot EOA, the deployer) | `0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b` |
+| `KEEPER_ROLE` (hot EOA) | `0x06c131cfEd73A56893f5eB52D17252856FAFC1d2` |
+| `GUARDIAN_ROLE` (EOA, same mnemonic as the admin and keeper) | `0x29741A8d283a253E8Ce10aDfd04C6507438b6F39` |
+| Valorem Clear, Overcall's instance, `Deploy.s.sol`'s default `CLEARINGHOUSE`; not used by the live vault | `0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0` |
+| Clear `feeTo` on Overcall's instance (EOA, nonce 0) | `0xdAe7e82A2E7D566C67E87C164B05a1C560190782` |
+| Clear `tokenURIGenerator` on both instances (default for `DeployClear.s.sol`) | `0xE53cCB924d27f421a91b59087587fD866C5d64c7` |
 | Seaport 1.6 | `0x0000000000000068F116a894984e2DB1123eB395` |
 | Seaport ConduitController (checked by the preflight and Verify; unused, `conduitKey == 0`) | `0x00000000F9490004C11Cef243f5400493c00Ad63` |
 | USDG (Paxos, 6 dp, UUPS facet proxy) | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
@@ -1283,12 +1317,17 @@ Findings we decline to fix are recorded in SECURITY.md §4 "Known and accepted" 
 | Chainlink sequencer uptime feed | none |
 | CREATE2 deterministic deployer (libraries) | `0x4e59b44847b379578588920cA78FbF26c0B4956C` |
 | Overcall NVDA registry `0x8E973cE1…f4EA` and registries owner `0x408adc…1CC0` | **not used** since decision D16; listed so nobody wires them back in |
-| Vault, SeaportOrderLib, ValoremLib, Admin Safe, Fee Safe, keeper, guardian | not deployed |
+
+Source verification: the vault and both libraries are a Sourcify `match` (partial, not
+`exact_match`); Blockscout shows the vault partially verified and no source for the libraries.
 
 Launch parameters (`Deploy.s.sol`, `Policy.launchDefaults()`): `minOtmBps 300`, `maxOtmBps 1200`,
 `minPremiumBps 40`, `maxUtilizationBps 9500` (ceiling 9985), `protocolFeeBps 500` (5% of premium),
 `maxContractsCap 50`, `maxPriceAge 4 days`, `depositCap 20e18`, `conduitKey bytes32(0)`, zone = the
-vault, name/symbol "Callhouse NVDA"/"cNVDA". Compiled window bounds: `MIN_LEAD 1 hours`,
+vault, name/symbol "Callhouse NVDA"/"cNVDA". The live `policy()` on 2026-09-15 differs in one field:
+`minPremiumBps` is 10, set by the admin's `setPolicy` (tx `0x97b7e529…`); the admin can change any
+field inside the §3.5 bounds, immediately. `depositCap`, `maxPriceAge` and `feeRecipient` are
+still the constructor's values. Compiled window bounds: `MIN_LEAD 1 hours`,
 `MIN_EXERCISE_WINDOW 1 days`, `MAX_CYCLE_TENOR 21 days`. Role ids: `KEEPER_ROLE =
 0xfc8737ab85eb45125971625a9ebdb75cc78e01d5c1fa80c4c6e5203f47bc4fab`, `GUARDIAN_ROLE =
 0x55435dd261a4b9b3364963f7738a7a662ad9c84396d64be3365284bb7f0a5041`.

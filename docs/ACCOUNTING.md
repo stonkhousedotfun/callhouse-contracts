@@ -193,6 +193,13 @@ Net effect: the drift costs at most a few base units of unclaimed dust to the la
 never strand principal or brick a roll. See `test_accrualDriftCostsDustAndNothingElse` and
 `test_settledRedeemerIsAlwaysPayable`.
 
+### When premium becomes claimable
+
+A fill's USDG reaches the vault's balance inside the fill, but it enters `accUsdgPerShare`, and so
+`claimableUsdg`, only when a harvest runs: the `deposit`/`mint` checkpoint, `settleQueue`,
+`rollClose` or `retryStrandedClaim`. `claimUsdg` does not harvest, and there is no public harvest
+function, so premium from a fill is not claimable until one of those runs.
+
 ### The deposit checkpoint
 
 `deposit` and `mint` call `_checkpointHarvest()` **before** minting. Without it, a premium that
@@ -205,8 +212,9 @@ Two consequences to hold in mind:
 1. A filled week can emit **more than one `Harvest` event**. The indexer must sum them per cycle,
    not treat the last one as the week's result.
 2. The protocol fee from a checkpoint accrues into `pendingFeeUsdg` rather than transferring, so
-   the checkpoint makes no external call. It is pushed once, best-effort, inside `rollClose` — and
-   if the recipient cannot receive, anyone can complete it later with `sweepFee()` (see §6).
+   the checkpoint makes no external call. It is pushed best-effort inside `rollClose` (and
+   `retryStrandedClaim`) — and if the recipient cannot receive, anyone can complete it later with
+   `sweepFee()` (see §6).
 
 The deposit gate itself closes on the cycle's exercise **timestamp**, not on the phase: after it,
 `deposit`/`mint` revert `DepositsClosed` and the previews return 0. One private predicate,
@@ -545,7 +553,7 @@ USDG to the vault, so gross and net premium are the same figure.
 
 | Fee | Rate | Mechanism | When |
 |---|---|---|---|
-| Stonkhouse | 5% of the premium (`protocolFeeBps` 500; bytecode ceiling 2000) | `pendingFeeUsdg`, pushed best-effort at `rollClose` | only when harvested premium is positive |
+| Stonkhouse | 5% of the premium (`protocolFeeBps` 500; bytecode ceiling 2000) | `pendingFeeUsdg`, pushed best-effort at `rollClose` and `retryStrandedClaim`, or by anyone through `sweepFee()`, always to `feeRecipient` (today the admin EOA) | only when harvested premium is positive |
 | Valorem engine fee (opt-in) | 15 bps of the fill's NOTIONAL in the asset, on top of the collateral, when Clear's switch is on and governance accepted it | pulled by `clear.write` inside the fill; the fill's premium floor is raised by fee × spot | only on a fill, only with the switch on |
 
 No fee on deposits. No fee on idle collateral. **An unfilled week harvests zero and is therefore
@@ -563,6 +571,10 @@ gross = usdg.balanceOf(vault) - usdgAccounted
 fee   = floor((gross - usdgFromAssignment) * protocolFeeBps / 10_000)   (saturating at 0)
 net   = gross - fee                                                    all of it to the index
 ```
+
+`protocolFeeBps` is read from `policy` when the harvest runs, not when the fill happened, so a
+`setPolicy` before the harvest changes the fee on premium already in the balance (up to the 2000 bps
+ceiling).
 
 `usdgFromAssignment` is the USDG the claim redemption actually delivered, measured in the same
 `rollClose`. The deposit checkpoint passes `0`, which is correct rather than lenient: strike
@@ -811,7 +823,7 @@ premium                  19.000000 USDG   (1.90 x 10), the one consideration ite
 
 harvest at rollClose
   gross                  19.000000
-  -> protocol fee 5%      0.950000        floor(19_000_000 * 500 / 10_000) = 950_000, to the fee Safe
+  -> protocol fee 5%      0.950000        floor(19_000_000 * 500 / 10_000) = 950_000, to feeRecipient
   -> depositors          18.050000        into accUsdgPerShare
 
 expiry out of the money
