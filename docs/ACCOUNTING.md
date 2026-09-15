@@ -2,8 +2,8 @@
 
 The subtlest part of Stonkhouse. Read this before changing anything under `src/`.
 
-> **Paths.** Paths resolve from the root of this repository, leekzor/callhouse-contracts. A path
-> followed by (leekzor/callhouse) lives in the app repository (keeper, indexer, web, ops and the
+> **Paths.** Paths resolve from the root of this repository, stonkhousedotfun/callhouse-contracts. A path
+> followed by (stonkhousedotfun/callhouse) lives in the app repository (keeper, indexer, web, ops and the
 > project-wide docs), which mounts this repository as a git submodule at `contracts/`, and
 > resolves from that repository's root.
 

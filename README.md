@@ -17,7 +17,7 @@ source-verified. The contracts are **unaudited**: there is no external audit yet
 `SECURITY.md` §4, the latest on 2026-09-14 (no Critical, High or Medium findings).
 
 This repository is the contracts, and the thing any review would target. The app (keeper,
-indexer, web, ops) lives in leekzor/callhouse and mounts this repository as a git submodule at
+indexer, web, ops) lives in stonkhousedotfun/callhouse and mounts this repository as a git submodule at
 `contracts/`.
 
 | Document | What it is |
@@ -27,10 +27,10 @@ indexer, web, ops) lives in leekzor/callhouse and mounts this repository as a gi
 | [`SECURITY.md`](SECURITY.md) | the threat model (including what a compromised keeper or admin can leak through pricing, and what each third-party key can do), the properties enforced in bytecode, the 2026-09-12 internal review and the 2026-09-13 audit findings with their fixes, reporting |
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | the contract-side runbook: bootstrap admin, optional own clearinghouse, Verify, the Safe handover, the fork rehearsal record |
 
-Paths in this repository's docs resolve from its root. A path followed by (leekzor/callhouse)
+Paths in this repository's docs resolve from its root. A path followed by (stonkhousedotfun/callhouse)
 lives in the app repository and resolves from that repository's root; a marker after a list
 applies to the whole list. For how the vault fits with the keeper, indexer and web app, see
-`docs/ARCHITECTURE.md` (leekzor/callhouse).
+`docs/ARCHITECTURE.md` (stonkhousedotfun/callhouse).
 
 ---
 
@@ -157,7 +157,7 @@ Everything runs from the repository root. The submodules are required; nothing b
 them.
 
 ```bash
-git clone --recurse-submodules git@github.com:leekzor/callhouse-contracts.git
+git clone --recurse-submodules git@github.com:stonkhousedotfun/callhouse-contracts.git
 # or, in an existing checkout:
 git submodule update --init --recursive
 
@@ -245,13 +245,13 @@ counterexamples, and a stale one surfaces as a mystery failure in an unrelated t
 
 ## After a contract change: the ABI flow
 
-ABIs flow one way: this repository's `out/` → `ops/abis/Vault.json` (leekzor/callhouse) → the
-generated copies in `indexer/` and `web/` (leekzor/callhouse). The keeper's
-`keeper/src/abi.ts` (leekzor/callhouse) is hand-transcribed, and a keeper test checks it against
-`contracts/out` (leekzor/callhouse) when the artefacts are present.
+ABIs flow one way: this repository's `out/` → `ops/abis/Vault.json` (stonkhousedotfun/callhouse) → the
+generated copies in `indexer/` and `web/` (stonkhousedotfun/callhouse). The keeper's
+`keeper/src/abi.ts` (stonkhousedotfun/callhouse) is hand-transcribed, and a keeper test checks it against
+`contracts/out` (stonkhousedotfun/callhouse) when the artefacts are present.
 
 1. Here: make the change, run the full local gate, `forge build`, commit.
-2. In leekzor/callhouse, bump the submodule pin and rebuild the artefacts there (`out/` is not
+2. In stonkhousedotfun/callhouse, bump the submodule pin and rebuild the artefacts there (`out/` is not
    committed):
 
    ```bash
@@ -265,7 +265,7 @@ generated copies in `indexer/` and `web/` (leekzor/callhouse). The keeper's
 
    `jq --indent 1` reproduces the committed file byte for byte. If the change touches
    `SeaportOrderLib` or `Policy`, refresh `ops/abis/SeaportOrderLib.json` and `ops/abis/Policy.json`
-   (leekzor/callhouse) the same way.
+   (stonkhousedotfun/callhouse) the same way.
 
 ---
 
@@ -395,5 +395,5 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 
 | Repository | What it is | Relationship |
 |---|---|---|
-| leekzor/callhouse | the app: keeper, indexer, web (app.stonkhouse.fun), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
-| leekzor/callhouse-site | the marketing landing, stonkhouse.fun | none on the code path; publishes the security contact and the unaudited disclosure |
+| stonkhousedotfun/callhouse | the app: keeper, indexer, web (app.stonkhouse.fun), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
+| stonkhousedotfun/callhouse-site | the marketing landing, stonkhouse.fun | none on the code path; publishes the security contact and the unaudited disclosure |

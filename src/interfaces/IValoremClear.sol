@@ -10,7 +10,7 @@ pragma solidity ^0.8.28;
 /// @dev PROVENANCE, AS IT APPLIES TO THIS REPOSITORY. This file is a verbatim copy of
 ///      `src/interfaces/IValoremClear.sol` from the Blockscout-verified source of Overcall's NVDA
 ///      registry on chain 4663 (`0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA`; recon R1 in
-///      leekzor/callhouse `ops/recon/`, which keeps the same file under `ops/abis/`). Overcall wrote
+///      stonkhousedotfun/callhouse `ops/recon/`, which keeps the same file under `ops/abis/`). Overcall wrote
 ///      this interface as a hand transcription of Valorem's clearinghouse at upstream commit
 ///      `6436c82` (`valorem-labs-inc/clear`, formerly valorem-core, `6436c823f560af493af119d6148fb3237037aca4`; recon
 ///      R4 recompiled that commit and matched the deployed Clear

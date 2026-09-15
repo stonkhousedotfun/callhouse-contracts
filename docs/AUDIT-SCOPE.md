@@ -21,9 +21,9 @@ construction. The Overcall registry, the venue fee item, EIP-1271, `writeMore`,
 `invalidateStaleListing` and the price-cut listing budget no longer exist. A `rollClose` whose
 Valorem redeem reverts STRANDS the claim instead of bricking the vault.
 
-> **Paths and commits.** This file lives in leekzor/callhouse-contracts and every path in it
+> **Paths and commits.** This file lives in stonkhousedotfun/callhouse-contracts and every path in it
 > resolves from that repository's root (`src/`, `test/`, `script/`, `docs/`, `lib/`,
-> `foundry.toml`). A path followed by (leekzor/callhouse) lives in the app repository (keeper,
+> `foundry.toml`). A path followed by (stonkhousedotfun/callhouse) lives in the app repository (keeper,
 > indexer, web, ops and the project-wide docs), which mounts this repository as a git submodule at
 > `contracts/`. Commit hashes are this repository's. The contracts were moved here from a monorepo
 > with `git subtree split`; nothing below cites a pre-split hash.
@@ -31,8 +31,8 @@ Valorem redeem reverts STRANDS the claim instead of bricking the vault.
 It does not repeat the architecture or the accounting. Read [ACCOUNTING.md](ACCOUNTING.md) (the
 money maths, the stranded-claim state, the thirteen invariants) and [SECURITY.md](../SECURITY.md)
 (the threat model, the properties enforced in bytecode, the 2026-09-12 review and the 2026-09-13
-audit with fixes) first. `docs/ARCHITECTURE.md` (leekzor/callhouse) §2 has the trust boundaries and
-`ops/addresses.json` (leekzor/callhouse) the address book; neither has been re-read for this
+audit with fixes) first. `docs/ARCHITECTURE.md` (stonkhousedotfun/callhouse) §2 has the trust boundaries and
+`ops/addresses.json` (stonkhousedotfun/callhouse) the address book; neither has been re-read for this
 revision and both predate the redesign.
 
 The vault and its two libraries are deployed on chain 4663 (Appendix), and Sourcify's copy of the
@@ -52,7 +52,7 @@ plus its two linked libraries.
    to attack are in §5.
 2. Read the deploy path for configuration mistakes: `script/Deploy.s.sol`, `script/DeployClear.s.sol`,
    `script/Configure.s.sol`, `script/HandoverAdmin.s.sol`, `script/Verify.s.sol`, the runbook
-   `docs/DEPLOY.md`, and the role topology in `ops/safes.md` (leekzor/callhouse; not re-read for
+   `docs/DEPLOY.md`, and the role topology in `ops/safes.md` (stonkhousedotfun/callhouse; not re-read for
    this revision).
 3. Check each integration assumption we make about the third-party contracts we do not ask anyone
    to audit (§4) against their verified source or bytecode. The contracts are theirs; the
@@ -123,7 +123,7 @@ there is no unsold inventory to write to the cap and leave unlisted.
 | Key | Holder | Can | Cannot |
 |---|---|---|---|
 | `DEFAULT_ADMIN_ROLE` | Live: the hot deployer EOA `0xEb82…9d9b`, alone (bootstrap phase; no timelock). `HandoverAdmin.s.sol` would move it to a Safe with a threshold of at least 2; that handover is planned and not done | `setPolicy` inside the `Policy.validate` caps; `setFeeRecipient` (non-zero); `setDepositCap` (unbounded, can close deposits); `setMaxPriceAge` in [1 hour, 7 days]; `acceptValoremFee`; `haltWrites` and `unhaltWrites`; grant/revoke `KEEPER_ROLE` and `GUARDIAN_ROLE`; grant admin to another address; renounce | Move any Stock Token or USDG (there is no admin-gated transfer in the vault); upgrade; rescue or sweep to an arbitrary address; take more than 20% of harvested premium, or any fee on strike proceeds (the exclusion is in bytecode); sell inside 1% OTM; widen staleness past 7 days; set utilisation above 99.85%. **No timelock on any admin action.** Worst case: never a token transfer, but value: `setPolicy` to the compiled floors, `grantRole(KEEPER_ROLE)` to itself, arm and sell to itself at the floor, about 2.2% of sold notional per week at 50% IV (SECURITY.md §3), plus 20% of whatever premium remains, routed to a recipient of its choosing. **The Valorem engine fee switch is not this role:** the live Clear's `feeTo` is the 1-of-1 Safe `0xff14…CF61` (owner `0x7A3a…2C32`), `HandoverAdmin` never moves it, and `Verify.s.sol` requires `EXPECTED_CLEAR_FEE_TO`. With that Safe's `setFeesEnabled(true)` on Clear and this key's `acceptValoremFee(true)` on the vault, neither behind a delay, every fill pulls 15 bps of its notional from the vault IN NVDA on top of the collateral (`collateral × 15 / 10_000`, floor 1 wei, charged again on every top-up) into Clear's fee balance, sweepable by `feeTo`, and every exerciser pays 15 bps of the strike USDG the same way. Depositors are compensated only because the fill floor then adds `fee × spot / 1e18` USDG to the premium the buyer must pay (`ValoremLib.sol` L223–L231), so the net is a forced sale of 15 bps of NVDA per fill at the oracle's spot, less the 5% protocol fee on that extra premium, and a quote less competitive by the same 15 bps. With 95% of NAV sold in a week that is about 0.14% of NAV moving to `feeTo` in NVDA, more than the roughly 0.02% a 20% fee takes from a premium priced at the live 0.10% floor: a lever on principal that the "never a token transfer" wording above does not cover, bounded by Clear's compiled 15 bps |
-| `KEEPER_ROLE` | Hot EOA `0x06c1…C1d2` run by `keeper/` (leekzor/callhouse) | `rollOpen(optionId)` (chooses which option type to arm, inside the arm gate); `approveListing` (proposes the whole Seaport order, at most three per cycle); `cancelListing`; `invalidateAllListings`; `rollClose` from `cycleExpiryTs` | Write anything itself (only a Seaport fill writes, and only through the vault's hook); hold option tokens or the claim; pay premium anywhere but the vault; list above strike, below the premium floor or with the strike below the band floor at live spot, past `cycleExerciseTs`, or beyond capacity; arm a type outside the band, with another asset, lot, or window; halt or unhalt; change any parameter; move a token. Worst case: a sale at the floor to a colluding buyer, about 1.5% of sold notional per week at the live policy (SECURITY.md §3) |
+| `KEEPER_ROLE` | Hot EOA `0x06c1…C1d2` run by `keeper/` (stonkhousedotfun/callhouse) | `rollOpen(optionId)` (chooses which option type to arm, inside the arm gate); `approveListing` (proposes the whole Seaport order, at most three per cycle); `cancelListing`; `invalidateAllListings`; `rollClose` from `cycleExpiryTs` | Write anything itself (only a Seaport fill writes, and only through the vault's hook); hold option tokens or the claim; pay premium anywhere but the vault; list above strike, below the premium floor or with the strike below the band floor at live spot, past `cycleExerciseTs`, or beyond capacity; arm a type outside the band, with another asset, lot, or window; halt or unhalt; change any parameter; move a token. Worst case: a sale at the floor to a colluding buyer, about 1.5% of sold notional per week at the live policy (SECURITY.md §3) |
 | `GUARDIAN_ROLE` | EOA `0x2974…6F39`, derived from the same mnemonic as the admin and keeper keys; it has never sent a transaction | `haltWrites` (blocks `rollOpen`, `approveListing` and every fill: `authorizeOrder` refuses); `cancelListing`; `invalidateAllListings` (needs no order data) | `unhaltWrites` (stop, never start); change parameters; block deposits, instant redemption, the queue (`queueRedeem`, `settleQueue`, `completeRedeem`), USDG claims, `retryStrandedClaim`, `lockBook` or `rollClose`; move a token |
 | Seaport 1.6 (the contract) | canonical address, no admin | call `authorizeOrder` and `validateOrder` on the vault (`NotSeaport` for anyone else); pull the option tokens the hook just minted under the one-time `setApprovalForAll` | make the vault write for any order but its own live listing (`NotLiveListing`: hash and offerer checked); leave a token behind (`InventoryLeftBehind`) |
 | Fee recipient | Live: the hot admin EOA `0xEb82…9d9b` (a constructor argument; `setFeeRecipient` can change it) | Receive the protocol fee through the best-effort push in `rollClose` and `retryStrandedClaim`, or the permissionless `sweepFee()` (all via `_tryPayFee`, Vault L1703) | Nothing else through this slot (today's recipient also holds `DEFAULT_ADMIN_ROLE`, as the admin row) |
@@ -700,8 +700,8 @@ discloses it.
 **OpenZeppelin Contracts v5.7.0** (`lib/openzeppelin-contracts`): `ERC20`, `AccessControl`,
 `ReentrancyGuard`, `SafeERC20`, `Math`, `IERC20`. **forge-std v1.16.2**: tests only.
 
-**Keeper, indexer, web** (`keeper/`, `indexer/`, `web/` (leekzor/callhouse); the site
-(leekzor/callhouse-site)). No money authority: no key they hold can move a token, and the vault
+**Keeper, indexer, web** (`keeper/`, `indexer/`, `web/` (stonkhousedotfun/callhouse); the site
+(stonkhousedotfun/callhouse-site)). No money authority: no key they hold can move a token, and the vault
 re-validates every field the keeper proposes. Out of scope. They run the live product on write on
 fill: the keeper creates each week's option type on the Clear, arms it with `rollOpen` and
 authorises a `PARTIAL_RESTRICTED` listing with the vault as zone (cycle 1 on chain since
@@ -1128,7 +1128,7 @@ contracts are unaudited (D14). Every real-Clear and real-Seaport result is again
 vendored from chain 4663 at one point in time, and the fork suite against the live chain at one
 block. On the live vault, as of 2026-09-15, the keeper has armed cycle 1 and authorised two
 listings (one cancelled); no fill, exercise or close has happened there yet, and the keeper dry run
-in `keeper/DRYRUN.md` (leekzor/callhouse) predates write on fill. Every figure in this document is
+in `keeper/DRYRUN.md` (stonkhousedotfun/callhouse) predates write on fill. Every figure in this document is
 from a local run. CI's build job fails on `main` as of 2026-09-15 (two suites revert
 `CreateContractSizeLimit` in their test constructor under forge `stable`), so CI has not
 independently confirmed the offline suite at this commit (README "CI").
@@ -1262,7 +1262,7 @@ Traps (README "Four things that will bite you"):
   changing behaviour.
 - **Invariant depth.** Configured inline (`forge-config` L1599–L1602) and `afterInvariant` refuses
   a run that did not reach it; do not lower it to go faster.
-- **ABIs flow one way**: `out/` → `ops/abis/Vault.json` (leekzor/callhouse) → generated copies in
+- **ABIs flow one way**: `out/` → `ops/abis/Vault.json` (stonkhousedotfun/callhouse) → generated copies in
   `indexer/` and `web/`; the keeper's `keeper/src/abi.ts` is hand-transcribed.
 
 ---

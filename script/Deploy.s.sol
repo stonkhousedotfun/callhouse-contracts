@@ -10,7 +10,7 @@ import {IChainlinkFeed} from "../src/interfaces/IChainlinkFeed.sol";
 import {ISeaport} from "../src/interfaces/ISeaport.sol";
 
 /// @notice Deploys one Callhouse vault.
-/// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/ (leekzor/callhouse)
+/// @dev Every default below was confirmed on chain 4663 by the recon pass in ops/recon/ (stonkhousedotfun/callhouse)
 ///      and the integration dossiers in projects/callhouse/integrations/. Run with:
 ///        forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --non-interactive \
 ///          --verify --verifier sourcify --chain 4663
@@ -55,7 +55,7 @@ contract DeployVault is Script {
     ///      fill. See {Vault.maxPriceAge} and integrations/chainlink.md.
     uint32 internal constant MAX_PRICE_AGE = 4 days;
 
-    /// @dev README (leekzor/callhouse) "Policy (launch)": start at 20 NVDA, not a TVL race.
+    /// @dev README (stonkhousedotfun/callhouse) "Policy (launch)": start at 20 NVDA, not a TVL race.
     uint256 internal constant LAUNCH_DEPOSIT_CAP = 20e18;
 
     function run() external returns (Vault vault) {

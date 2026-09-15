@@ -1,7 +1,7 @@
 # Deploying the vault
 
 The contract-side runbook for mainnet (chain 4663). Hosting the keeper, indexer and frontends is a
-separate runbook, `ops/deploy.md` in leekzor/callhouse. Every step here is rehearsed end to end by
+separate runbook, `ops/deploy.md` in stonkhousedotfun/callhouse. Every step here is rehearsed end to end by
 `script/rehearse-deploy.sh` on an anvil fork; the latest record is at the bottom.
 
 **The live vault was deployed on 2026-09-15 on path A** (our own Clear from A0, a bootstrap admin,
@@ -82,10 +82,10 @@ admin from block one and every admin action is a Safe transaction (path B below)
 | Item | Detail |
 |---|---|
 | Deployer key | an EOA kept offline. It is the vault admin until the handover. Fund it for about 8.4M gas (rehearsal 2026-09-13: 8,355,876 for the two libraries and the vault; 5,831,215 when the libraries already exist) plus the configure and handover transactions, and about 3.5M more if `DeployClear.s.sol` is used |
-| Admin Safe | 2 of 3, created in Safe{Wallet} on Robinhood Chain (supported; SafeL2 1.4.1 and SafeProxyFactory 1.4.1 are deployed at their canonical addresses). Owners on hardware. No modules, no guard. `ops/safes.md` §1 (leekzor/callhouse) |
-| Fee Safe | receives the protocol fee (5% of premium). Its legal owner is a counsel question, `ops/launch-legal.md` §2 item 5 (leekzor/callhouse) |
-| Guardian key | 1 of 1 on separate hardware, as `ops/safes.md` §3 (leekzor/callhouse) requires |
-| Keeper key | hot EOA used by the keeper service; it can never move funds. `ops/safes.md` §2 (leekzor/callhouse) |
+| Admin Safe | 2 of 3, created in Safe{Wallet} on Robinhood Chain (supported; SafeL2 1.4.1 and SafeProxyFactory 1.4.1 are deployed at their canonical addresses). Owners on hardware. No modules, no guard. `ops/safes.md` §1 (stonkhousedotfun/callhouse) |
+| Fee Safe | receives the protocol fee (5% of premium). Its legal owner is a counsel question, `ops/launch-legal.md` §2 item 5 (stonkhousedotfun/callhouse) |
+| Guardian key | 1 of 1 on separate hardware, as `ops/safes.md` §3 (stonkhousedotfun/callhouse) requires |
+| Keeper key | hot EOA used by the keeper service; it can never move funds. `ops/safes.md` §2 (stonkhousedotfun/callhouse) |
 | RPC | `RH_RPC`, preferably an archive endpoint |
 | Source verification | **Sourcify** (`--verifier sourcify --chain 4663`), which supports 4663 and holds exact matches for the third-party contracts already; Blockscout then imports the match with one click ("Verify & publish → via Sourcify"). Blockscout's own API sits behind a Cloudflare challenge that `forge` cannot pass, so do not use `--verifier blockscout` against it. Verify the vault AND both libraries |
 | Cycle timing (keeper) | the vault reads exercise and expiry from the option type and never the wall clock. The weekly type's exercise opens at the US close, **Friday 16:00 ET = 20:00 UTC while US daylight saving is in effect, 21:00 UTC otherwise** (DST ends 2026-11-01), or Thursday's close when Friday is a full-day NYSE holiday, and it expires 24 hours later (`expiryTs = exerciseTs + 86400`, Saturday); the arm gate accepts any window from 1 hour + 1 day out to 21 days, so both fit |
@@ -278,7 +278,7 @@ expected for a generated file and is why the decode is mandatory), sign, execute
 
 ## Hand over to the app
 
-In leekzor/callhouse:
+In stonkhousedotfun/callhouse:
 
 - `ops/addresses.json`: the vault, both libraries (add a `valoremLib` slot, it has none), both Safes,
   the guardian and keeper addresses, the deploy block, and which admin phase the vault is in.
@@ -361,4 +361,4 @@ What this rehearsal does **not** prove:
 - Hardware-wallet signing, or the Safe{Wallet} transaction service on 4663.
 - Sourcify source verification (not run on a fork; Sourcify verifies against the live chain).
 - Anything after configuration: the first `rollOpen`, a listing, a fill. The keeper dry run
-  (`keeper/DRYRUN.md` in leekzor/callhouse) covers three full cycles on a separately deployed vault.
+  (`keeper/DRYRUN.md` in stonkhousedotfun/callhouse) covers three full cycles on a separately deployed vault.
