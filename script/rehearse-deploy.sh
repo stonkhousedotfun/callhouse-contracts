@@ -10,10 +10,16 @@
 # refuse the Vault at 24,577 B and make the rehearsal fail for a reason mainnet does not have.
 #
 # PATH A — the launch plan for now (docs/DEPLOY.md "bootstrap"): the deployer key is the admin.
-#   A0  DeployClear: our own ValoremOptionsClearinghouse from the vendored artifact, feeTo = the bootstrap
-#       admin. Path A deploys the vault against THIS instance (CLEARINGHOUSE override in Deploy and Verify);
-#       path B against Overcall's default, so both deploy-time choices are rehearsed.
+#   A0  DeployClear: our own ValoremOptionsClearinghouse from the vendored artifact, feeTo = the ADMIN SAFE
+#       (owner decision 2026-09-14: the Safe holds the fee switch from deploy; HandoverAdmin never moves
+#       it). Path A deploys the vault against THIS instance (CLEARINGHOUSE override in Deploy and Verify)
+#       and every path-A Verify passes EXPECTED_CLEAR_FEE_TO; path B runs against Overcall's default, so
+#       both deploy-time choices are rehearsed.
 #   A1  Deploy with ADMIN = deployer. Verify (bootstrap, unconfigured).
+#   A1b Verify's fee-switch-holder checks have teeth, with real calls: EXPECTED_CLEAR_FEE_TO missing fails;
+#       the Safe (2 of 3) nominates the deployer and the pending nomination fails; the deployer accepts,
+#       switches the fee ON (the hazard a deployer-held feeTo is) and the wrong holder fails; the fee goes
+#       off and the Safe accepts the switch back, 2 of 3 again.
 #   A2  Configure with the deployer key. Verify (bootstrap, configured).
 #   A3  Verify has teeth: swapped library addresses must FAIL the bytecode/link checks.
 #   A4  Handover: grant the admin Safe. Renounce is REFUSED until the Safe has executed a transaction.
@@ -132,34 +138,82 @@ COMMON() { echo VAULT="$VAULT" SEAPORT_ORDER_LIB="$SEAPORT_ORDER_LIB" VALOREM_LI
 
 # ============================== PATH A: bootstrap (deployer is admin) ==============================
 
-step "A0  DeployClear.s.sol: our own ValoremOptionsClearinghouse (feeTo = the bootstrap admin)"
-env DEPLOYER_PK="$(pk deployer)" CLEAR_FEE_TO="$DEPLOYER" forge script --no-storage-caching script/DeployClear.s.sol \
+step "A0  DeployClear.s.sol: our own ValoremOptionsClearinghouse (feeTo = the admin Safe)"
+env DEPLOYER_PK="$(pk deployer)" CLEAR_FEE_TO="$SAFE_ADMIN" forge script --no-storage-caching script/DeployClear.s.sol \
   --rpc-url "$RPC" --broadcast --slow > broadcast/rehearsal-deployclear.log 2>&1 \
   || { tail -30 broadcast/rehearsal-deployclear.log; fail "DeployClear failed"; }
 OUR_CLEAR=$(grep -E "ValoremOptionsClearinghouse +0x[0-9a-fA-F]{40}" broadcast/rehearsal-deployclear.log | awk '{print $2}' | tail -1)
 [ -n "$OUR_CLEAR" ] || fail "our Clear's address not found in the DeployClear log"
 [ "$(cast codesize "$OUR_CLEAR" --rpc-url "$RPC")" -gt 0 ] || fail "no code at our Clear $OUR_CLEAR"
-[ "$(cast call "$OUR_CLEAR" "feeTo()(address)" --rpc-url "$RPC")" = "$DEPLOYER" ] || fail "our Clear's feeTo is not the deployer"
+[ "$(cast call "$OUR_CLEAR" "feeTo()(address)" --rpc-url "$RPC")" = "$SAFE_ADMIN" ] || fail "our Clear's feeTo is not the admin Safe"
 [ "$(cast call "$OUR_CLEAR" "feesEnabled()(bool)" --rpc-url "$RPC")" = false ] || fail "our Clear's fee switch is on"
 [ "$(cast call "$OUR_CLEAR" "feeBps()(uint8)" --rpc-url "$RPC")" = 15 ] || fail "our Clear's feeBps != 15"
 [ "$(cast codesize "$OUR_CLEAR" --rpc-url "$RPC")" = "$(cast codesize "$OVERCALL_CLEAR" --rpc-url "$RPC")" ] \
   || fail "our Clear's runtime size differs from Overcall's (same artifact expected)"
 echo "  our Clear $OUR_CLEAR ($(cast codesize "$OUR_CLEAR" --rpc-url "$RPC") B, same size as Overcall's $OVERCALL_CLEAR)"
 CLEARINGHOUSE=$OUR_CLEAR
+FEE_TO_EXPECT="EXPECTED_CLEAR_FEE_TO=$SAFE_ADMIN"   # every path-A Verify: our Clear's fee switch is the Safe's
 
 step "A1  Deploy.s.sol with ADMIN = deployer against OUR Clear; Verify (bootstrap, unconfigured)"
 deploy DEPLOYER_PK="$(pk deployer)" ADMIN="$DEPLOYER" SAFE_FEE="$SAFE_FEE" CLEARINGHOUSE="$CLEARINGHOUSE"
 [ "$(cast call "$VAULT" "clear()(address)" --rpc-url "$RPC")" = "$OUR_CLEAR" ] || fail "the vault is not wired to our Clear"
 [ "$(has_role "$VAULT" $ADMIN_ROLE "$DEPLOYER")" = true ] || fail "deployer is not admin"
-verify $(COMMON) DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false
+verify $(COMMON) "$FEE_TO_EXPECT" DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false
+
+step "A1b Verify's fee-switch-holder checks have teeth (real calls through the 2-of-3 admin Safe)"
+# A Safe{Wallet} Transaction Builder file with one call, executed by ExecuteSafeBatch with two owner keys.
+safe_call() { # name to calldata
+  jq -n --arg to "$2" --arg data "$3" --arg name "$1" --arg safe "$SAFE_ADMIN" \
+    '{version:"1.0", chainId:"4663", meta:{name:$name, createdFromSafeAddress:$safe},
+      transactions:[{to:$to, value:"0", data:$data, contractMethod:null, contractInputsValues:null}]}' \
+    > "broadcast/rehearsal-$1.json"
+  env BATCH="broadcast/rehearsal-$1.json" SAFE="$SAFE_ADMIN" SAFE_OWNER_PKS="$(pk owner1),$(pk owner2)" \
+    forge script --no-storage-caching script/rehearsal/ExecuteSafeBatch.s.sol --rpc-url "$RPC" --broadcast --slow 2>&1 \
+    | grep -E "REHEARSAL|Error|error" || fail "Safe call $1 did not run"
+}
+# verify_rejects <log name> <the FAIL line that must appear> <env...>: Verify must fail, on that line.
+verify_rejects() {
+  local log="broadcast/rehearsal-$1.log" want="$2"; shift 2
+  if env $(COMMON) DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false "$@" \
+    forge script --no-storage-caching script/Verify.s.sol --rpc-url "$RPC" > "$log" 2>&1; then
+    fail "Verify passed: $1"
+  fi
+  grep -E "^\s+FAIL" "$log"
+  grep -qF "FAIL  $want" "$log" || fail "Verify failed $1 for the wrong reason (wanted: $want)"
+}
+fee_to() { cast call "$OUR_CLEAR" "feeTo()(address)" --rpc-url "$RPC"; }
+verify_rejects feeto-missing "EXPECTED_CLEAR_FEE_TO is set"
+echo "  refused: EXPECTED_CLEAR_FEE_TO missing on our own Clear"
+safe_call clear-setfeeto-deployer "$OUR_CLEAR" "$(cast calldata "setFeeTo(address)" "$DEPLOYER")"
+[ "$(fee_to)" = "$SAFE_ADMIN" ] || fail "setFeeTo moved feeTo before acceptance"
+verify_rejects feeto-pending "clear pendingFeeTo is empty" "$FEE_TO_EXPECT"
+echo "  refused: a feeTo nomination (the deployer) is pending"
+cast send "$OUR_CLEAR" "acceptFeeTo()" --private-key "$(pk deployer)" --rpc-url "$RPC" >/dev/null || fail "deployer acceptFeeTo"
+[ "$(fee_to)" = "$DEPLOYER" ] || fail "feeTo is not the deployer after acceptFeeTo"
+cast send "$OUR_CLEAR" "setFeesEnabled(bool)" true --private-key "$(pk deployer)" --rpc-url "$RPC" >/dev/null \
+  || fail "a deployer-held feeTo could not switch the fee on"
+[ "$(cast call "$OUR_CLEAR" "feesEnabled()(bool)" --rpc-url "$RPC")" = true ] || fail "fee switch did not turn on"
+echo "  hazard shown: the deployer, holding feeTo, switched the Valorem fee ON with the vault not accepting it"
+verify_rejects feeto-deployer "clear feeTo == EXPECTED_CLEAR_FEE_TO (the fee switch holder)" "$FEE_TO_EXPECT"
+echo "  refused: feeTo is the deployer, not the admin Safe"
+cast send "$OUR_CLEAR" "setFeesEnabled(bool)" false --private-key "$(pk deployer)" --rpc-url "$RPC" >/dev/null || fail "fee off"
+cast send "$OUR_CLEAR" "setFeeTo(address)" "$SAFE_ADMIN" --private-key "$(pk deployer)" --rpc-url "$RPC" >/dev/null || fail "renominate Safe"
+safe_call clear-acceptfeeto "$OUR_CLEAR" "$(cast calldata "acceptFeeTo()")"
+[ "$(fee_to)" = "$SAFE_ADMIN" ] || fail "the Safe did not take feeTo back"
+[ "$(cast call "$OUR_CLEAR" "feesEnabled()(bool)" --rpc-url "$RPC")" = false ] || fail "fee switch left on"
+if cast send "$OUR_CLEAR" "setFeesEnabled(bool)" true --private-key "$(pk deployer)" --rpc-url "$RPC" >/dev/null 2>&1; then
+  fail "the deployer can still switch the fee after the Safe took feeTo back"
+fi
+verify $(COMMON) "$FEE_TO_EXPECT" DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false
+echo "  restored: the Safe holds feeTo (2-of-3 acceptFeeTo), nothing pending, the deployer's setFeesEnabled reverts"
 
 step "A2  Configure.s.sol with the deployer key; Verify (bootstrap, configured)"
 env $(COMMON) ADMIN_PK="$(pk deployer)" forge script --no-storage-caching script/Configure.s.sol --rpc-url "$RPC" --broadcast --slow 2>&1 \
   | grep -E "key admin executed|Error|error" || fail "configure (key) did not run"
-verify $(COMMON) DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap SAFE_ADMIN="$SAFE_ADMIN"
+verify $(COMMON) "$FEE_TO_EXPECT" DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap SAFE_ADMIN="$SAFE_ADMIN"
 
 step "A3  Verify has teeth: swapped library addresses must fail"
-if env $(COMMON) SEAPORT_ORDER_LIB="$VALOREM_LIB" VALOREM_LIB="$SEAPORT_ORDER_LIB" DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap \
+if env $(COMMON) "$FEE_TO_EXPECT" SEAPORT_ORDER_LIB="$VALOREM_LIB" VALOREM_LIB="$SEAPORT_ORDER_LIB" DEPLOYER="$DEPLOYER" ADMIN_PHASE=bootstrap \
   forge script --no-storage-caching script/Verify.s.sol --rpc-url "$RPC" > broadcast/rehearsal-negative.log 2>&1; then
   fail "Verify passed with swapped libraries"
 fi
@@ -188,7 +242,7 @@ env VAULT="$VAULT" SAFE_ADMIN="$SAFE_ADMIN" ADMIN_PK="$(pk deployer)" STEP=renou
   forge script --no-storage-caching script/HandoverAdmin.s.sol --rpc-url "$RPC" --broadcast --slow 2>&1 | grep -E "renounced|Error|error" \
   || fail "renounce did not run"
 [ "$(has_role "$VAULT" $ADMIN_ROLE "$DEPLOYER")" = false ] || fail "deployer still admin"
-verify $(COMMON) DEPLOYER="$DEPLOYER" ADMIN_PHASE=safe SAFE_ADMIN="$SAFE_ADMIN" \
+verify $(COMMON) "$FEE_TO_EXPECT" DEPLOYER="$DEPLOYER" ADMIN_PHASE=safe SAFE_ADMIN="$SAFE_ADMIN" \
   EXPECT_SAFE_OWNER_SET="$OWNER1,$OWNER2,$OWNER3"
 if out=$(env $(COMMON) ADMIN_PK="$(pk deployer)" forge script --no-storage-caching script/Configure.s.sol --rpc-url "$RPC" --broadcast 2>&1); then
   fail "the renounced key could still configure"
@@ -242,5 +296,5 @@ grep -q "FAIL  vault: runtime == compiled Vault" broadcast/rehearsal-tamper.log 
 echo "  byte 100 flipped 0x$orig -> 0x$flip: caught"
 
 printf '\nREHEARSAL PASSED on fork block %s\n' "$block"
-printf 'path A vault %s (bootstrap -> handed over, on our Clear %s)\npath B vault %s (Safe from block one, on Overcall'"'"'s Clear)\nadmin Safe %s  fee Safe %s\n' \
+printf 'path A vault %s (bootstrap -> handed over, on our Clear %s, feeTo = the admin Safe)\npath B vault %s (Safe from block one, on Overcall'"'"'s Clear)\nadmin Safe %s  fee Safe %s\n' \
   "$VAULT_A" "$OUR_CLEAR" "$VAULT" "$SAFE_ADMIN" "$SAFE_FEE"

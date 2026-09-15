@@ -40,7 +40,12 @@ interface ISafeView {
 ///           dependencies the zone hooks rest on: `seaport.information()` reports version 1.6 and the
 ///           canonical ConduitController, the Seaport runtime extcodehash equals the vendored 4663
 ///           runtime, Clear's `feeBps` is 15 with the switch off (or accepted), and both tokens have
-///           the decimals {Policy} assumes.
+///           the decimals {Policy} assumes. When the vault is on a clearinghouse OTHER than Overcall's
+///           (i.e. ours, from `DeployClear.s.sol`), who holds its fee switch: EXPECTED_CLEAR_FEE_TO is
+///           required, Clear's runtime must be the vendored artifact byte for byte (which pins the
+///           storage layout read next), `feeTo` must equal EXPECTED_CLEAR_FEE_TO and no `setFeeTo`
+///           nomination may be pending. The owner's decision (2026-09-14) is that the admin Safe holds
+///           it from deploy; `HandoverAdmin.s.sol` moves only the vault's role, never `feeTo`.
 ///        4. Policy, field by field, against `Policy.launchDefaults()`; deposit cap; price age;
 ///           fee recipient; share token name, symbol and decimals.
 ///        5. Roles, for the admin phase in ADMIN_PHASE:
@@ -63,6 +68,8 @@ interface ISafeView {
 ///        EXPECT_SAFE_OWNER_SET     optional comma-separated owner addresses, order free.
 ///        Address overrides as in Deploy.s.sol: ASSET, USDG, CLEARINGHOUSE, SEAPORT, PRICE_FEED,
 ///        DEPOSIT_CAP, VAULT_NAME, VAULT_SYMBOL, EXPECT_CHAIN_ID, EXPECT_SEAPORT_CODEHASH.
+///        EXPECTED_CLEAR_FEE_TO     required when CLEARINGHOUSE is not Overcall's instance: the address
+///                                  that must hold our Clear's fee switch (the admin Safe).
 contract VerifyVault is Script {
     /// @dev Safe storage: slot 0 is the singleton; guard and fallback handler live at these hashed slots.
     bytes32 internal constant SAFE_GUARD_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
@@ -81,6 +88,21 @@ contract VerifyVault is Script {
     ///      whose Seaport was compiled for another chain id.
     bytes32 internal constant SEAPORT_16_RUNTIME_HASH =
         0x95809b70c9659c30188db5fdd87103e24b1a55379af8c851fca393aba0224a00;
+
+    /// @dev Overcall's Valorem Clear, Deploy.s.sol's default. Its `feeTo` is Overcall's key, not ours, so the
+    ///      fee-switch-holder checks below apply only to any OTHER instance (ours, from DeployClear.s.sol).
+    address internal constant OVERCALL_CLEAR = 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0;
+
+    /// @dev The artifact DeployClear.s.sol deploys. It has no immutables, so a deployed instance's runtime
+    ///      equals `deployedBytecode` byte for byte, and that equality is what makes the storage read below
+    ///      a read of `pendingFeeTo` and not of something else.
+    string internal constant CLEAR_ARTIFACT = "script/artifacts/ValoremOptionsClearinghouse.json";
+
+    /// @dev Upstream `ValoremOptionsClearinghouse.sol` @ 6436c823 keeps `pendingFeeTo` private with no
+    ///      getter. Layout after solmate ERC1155 (`balanceOf` slot 0, `isApprovedForAll` slot 1) and
+    ///      `optionTypeStates` (slot 2): `pendingFeeTo` is the next address (slot 3). `setFeeTo(x)`
+    ///      writes x alone there; `acceptFeeTo()` zeroes it. `feeTo` and `feesEnabled` pack into slot 5.
+    uint256 internal constant CLEAR_PENDING_FEE_TO_SLOT = 3;
 
     struct Ref {
         uint256 length;
@@ -321,8 +343,34 @@ contract VerifyVault is Script {
         _check(c.feeBps() == 15, "clear feeBps == 15");
         _check(!c.feesEnabled() || vault.valoremFeeAccepted(), "clear fee switch off, or accepted by governance");
         _check(c.supportsInterface(0xd9b67a26), "clear is ERC-1155");
+        // Key off the vault's actual clearinghouse, not the CLEARINGHOUSE env: the owner decision is
+        // about who holds feeTo on the instance the vault settles on.
+        if (address(vault.clear()) != OVERCALL_CLEAR) _ownClearFeeSwitch(IValoremClear(address(vault.clear())));
         _check(IERC20Metadata(address(vault.asset())).decimals() == 18, "asset has 18 decimals");
         _check(IERC20Metadata(address(vault.usdg())).decimals() == 6, "usdg has 6 decimals");
+    }
+
+    /// @dev Our own clearinghouse: its `feeTo` holds the Valorem fee switch, the fee sweep and `setFeeTo`, and
+    ///      nothing in the vault or HandoverAdmin moves or checks it. A deployer-held `feeTo` survives the admin
+    ///      handover and can switch the fee on at will (every fill then refuses until the admin accepts).
+    function _ownClearFeeSwitch(IValoremClear c) internal {
+        console2.log("own clearinghouse fee switch");
+        address expected = vm.envOr("EXPECTED_CLEAR_FEE_TO", address(0));
+        if (expected == address(0)) {
+            _check(false, "EXPECTED_CLEAR_FEE_TO is set (required: the vault is not on Overcall's Clear)");
+            return;
+        }
+        _check(true, "EXPECTED_CLEAR_FEE_TO is set");
+        bytes memory want = vm.parseJsonBytes(vm.readFile(CLEAR_ARTIFACT), ".deployedBytecode.object");
+        _check(
+            keccak256(address(c).code) == keccak256(want),
+            "clear runtime == script/artifacts/ValoremOptionsClearinghouse.json (pins the storage layout)"
+        );
+        address feeTo = c.feeTo();
+        console2.log("  info  clear feeTo", feeTo);
+        _check(feeTo == expected, "clear feeTo == EXPECTED_CLEAR_FEE_TO (the fee switch holder)");
+        address pending = address(uint160(uint256(vm.load(address(c), bytes32(CLEAR_PENDING_FEE_TO_SLOT)))));
+        _check(pending == address(0), "clear pendingFeeTo is empty (no feeTo handover in flight)");
     }
 
     function _parameters(Vault vault) internal {

@@ -18,11 +18,12 @@ otherwise `SAFE_ADMIN`. **The launch plan for now is `ADMIN` = the deployer's ow
 ("bootstrap"). The deployer key then configures the vault directly, and the admin role moves to the
 2-of-3 Safe later with `script/HandoverAdmin.s.sol`.
 
-> **Warning.** Until the handover completes, whoever holds the deployer key holds every admin power: setting the
-> protocol fee up to its 20%-of-premium ceiling and its recipient, the deposit cap, the policy inside
-> its hard caps, the price age, unhalting, accepting the Valorem engine fee, and granting or revoking
-> every role (including granting itself `KEEPER_ROLE`). Keep that key offline, use it only for the
-> steps below, and schedule the handover.
+> **Warning.** Until the handover completes, whoever holds the deployer key holds every vault admin
+> power: setting the protocol fee up to its 20%-of-premium ceiling and its recipient, the deposit
+> cap, the policy inside its hard caps, the price age, unhalting, accepting the Valorem engine fee,
+> and granting or revoking every role (including granting itself `KEEPER_ROLE`). It does **not**
+> hold Clear's `feeTo` on the launch plan (that is the admin Safe from A0). Keep that key offline,
+> use it only for the steps below, and schedule the handover.
 
 The alternative, still supported and rehearsed: pass `SAFE_ADMIN` and no `ADMIN`, so the Safe is
 admin from block one and every admin action is a Safe transaction (path B below).
@@ -30,10 +31,10 @@ admin from block one and every admin action is a Safe transaction (path B below)
 | Script | What it does |
 |---|---|
 | `script/Deploy.s.sol` | preflight (asset 18 / USDG 6 decimals, Clear `feeBps == 15` and switch off and ERC-1155, Seaport 1.6 with the canonical ConduitController, feed answer and 8 decimals), then libraries + vault. The constructor takes one `Vault.Config` struct (asset, USDG, clearinghouse, Seaport, price feed, `maxPriceAge`, conduit key, admin, fee recipient, deposit cap, name, symbol): there is no registry and no zone parameter, the zone is the vault itself and is derived. Warns loudly when the admin is a plain key |
-| `script/DeployClear.s.sol` | OPTIONAL: deploys our own ValoremOptionsClearinghouse from the vendored upstream artifact (`feeTo` = our admin) and asserts `feeBps() == 15`, `feesEnabled() == false`; pass its address to Deploy as `CLEARINGHOUSE` |
+| `script/DeployClear.s.sol` | OPTIONAL: deploys our own ValoremOptionsClearinghouse from the vendored upstream artifact (`feeTo` = the admin Safe; owner decision 2026-09-14, `HandoverAdmin` never moves it) and asserts `feeBps() == 15`, `feesEnabled() == false`; pass its address to Deploy as `CLEARINGHOUSE` |
 | `script/Configure.s.sol` | grants `KEEPER_ROLE` and `GUARDIAN_ROLE`. With `ADMIN_PK` it broadcasts from that key (refuses a key without admin); without, it only writes a Safe Transaction Builder batch |
 | `script/HandoverAdmin.s.sol` | `STEP=grant` gives the admin role to the Safe and writes a harmless smoke batch; `STEP=renounce` removes the key's admin role, and refuses until the Safe has executed a transaction after the grant |
-| `script/Verify.s.sol` | read-only; 63 checks bootstrap-unconfigured, 69 bootstrap-configured, 72 safe phase with the owner set pinned, 71 without (re-derived by the 2026-09-13 rehearsal; the redesign added the zone, interface, Seaport runtime-hash, Clear fee-state and decimals checks and removed the registry and Overcall-fee ones). Reverts if any fail |
+| `script/Verify.s.sol` | read-only. Path A (our Clear): **67** bootstrap-unconfigured, **73** bootstrap-configured, **76** safe phase with the owner set pinned (four extra fee-switch-holder checks: `EXPECTED_CLEAR_FEE_TO` required, runtime pin, `feeTo`, `pendingFeeTo` empty). Path B (Overcall): **71**. Reverts if any fail. Env table below A2 |
 | `script/rehearsal/ExecuteSafeBatch.s.sol` | rehearsal only: runs a batch file through a Safe with owner keys. Refuses any node that is not anvil |
 
 ---
@@ -83,18 +84,23 @@ byte for byte either way.
 The vault settles on whichever Valorem Clear it is constructed with. The default is Overcall's
 unmodified instance; to remove that dependency entirely, deploy our own from the vendored upstream
 artifact first and pass its address to every later step as `CLEARINGHOUSE` (Deploy's preflight and
-Verify both read it):
+Verify both read it). **Owner decision 2026-09-14: `CLEAR_FEE_TO` is the admin Safe, not the
+bootstrap deployer.** `HandoverAdmin.s.sol` moves only the vault's `DEFAULT_ADMIN_ROLE`; it never
+moves Clear's `feeTo`.
 
 ```bash
-DEPLOYER_PK=... CLEAR_FEE_TO=$ADMIN \
+export SAFE_ADMIN=0x...                      # admin Safe; holds Clear's fee switch from deploy
+DEPLOYER_PK=... CLEAR_FEE_TO=$SAFE_ADMIN \
   forge script script/DeployClear.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching
 export CLEARINGHOUSE=0x...                   # from the "ValoremOptionsClearinghouse" log line
+cast call $CLEARINGHOUSE "feeTo()(address)" --rpc-url $RH_RPC
+# must equal $SAFE_ADMIN before Deploy.s.sol
 ```
 
 `feeTo` is the only power over a Clear instance (the 15 bps fee switch, the URI generator, sweeping
-fees); with `CLEAR_FEE_TO=$ADMIN` it follows the vault's admin. The script asserts `feeBps() == 15`,
-`feesEnabled() == false` and the wiring before it returns. The rehearsal runs path A on an instance
-deployed this way and path B on Overcall's, so both choices are exercised.
+fees). The script asserts `feeBps() == 15`, `feesEnabled() == false` and the wiring before it
+returns. The rehearsal runs path A on an instance deployed this way (`EXPECTED_CLEAR_FEE_TO` on
+every path-A Verify) and path B on Overcall's, so both choices are exercised.
 
 ### A1. Deploy
 
@@ -132,11 +138,18 @@ Record from `broadcast/Deploy.s.sol/4663/run-latest.json`: the vault address, bo
 ```bash
 export VAULT=0x... SEAPORT_ORDER_LIB=0x... VALOREM_LIB=0x...
 export KEEPER=0x... GUARDIAN=0x... DEPLOYER=$ADMIN
+export EXPECTED_CLEAR_FEE_TO=$SAFE_ADMIN     # required on our own Clear; omit on Overcall's
 ADMIN_PHASE=bootstrap EXPECT_KEEPER_CONFIGURED=false \
   forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
 ```
 
-Every line `ok`, ending `VERIFY PASSED` (63 checks in the rehearsal). What it covers:
+Every line `ok`, ending `VERIFY PASSED` (67 checks on path A). What it covers:
+
+Verify env (in addition to the address overrides Deploy.s.sol already documents):
+
+| Env | Required when | What it pins |
+|---|---|---|
+| `EXPECTED_CLEAR_FEE_TO` | the vault's `clear()` is not Overcall's `0x9a7b40e5…C0C0` | that address holds our Clear's fee switch (`feeTo()`), no `setFeeTo` nomination is pending (`pendingFeeTo` slot 3 is zero), and the runtime matches the vendored artifact. Missing the env is a FAIL. On Overcall's instance the check is skipped |
 
 - chain id; vault and both libraries **byte for byte** against `out/`, with only link sites (each
   checked to hold the right library; how many there are is read from the artifact's `linkReferences`,
@@ -146,7 +159,8 @@ Every line `ok`, ending `VERIFY PASSED` (63 checks in the rehearsal). What it co
   the vault itself**, the ERC-1155 approval target and the approval itself on Valorem, the Seaport
   1.6 zone interface advertised and EIP-1271 not; the dependencies: `seaport.information()` version
   1.6 and the canonical ConduitController, the Seaport runtime `extcodehash` equal to the vendored
-  4663 runtime, Clear `feeBps == 15` with the switch off or accepted, token decimals;
+  4663 runtime, Clear `feeBps == 15` with the switch off or accepted, token decimals; on our own
+  Clear, `EXPECTED_CLEAR_FEE_TO` (the admin Safe) holds `feeTo` with nothing pending;
 - policy field by field, deposit cap 20 NVDA, price age 4 days, fee recipient, share name, symbol,
   decimals;
 - roles for the phase; keeper, guardian and deployer distinct; role admins;
@@ -159,11 +173,12 @@ Every line `ok`, ending `VERIFY PASSED` (63 checks in the rehearsal). What it co
 
 ```bash
 ADMIN_PK=$DEPLOYER_PK forge script script/Configure.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching
-ADMIN_PHASE=bootstrap forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
+ADMIN_PHASE=bootstrap EXPECTED_CLEAR_FEE_TO=$SAFE_ADMIN \
+  forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
 ```
 
-`VERIFY PASSED` (69 checks in the rehearsal; exporting `SAFE_ADMIN` adds the Safe's own checks). The
-vault is now operable: the keeper can arm a cycle.
+`VERIFY PASSED` (73 checks on path A; exporting `SAFE_ADMIN` adds the Safe's own checks). The vault
+is now operable: the keeper can arm a cycle.
 
 ### A4. Hand over to the Safe (when scheduled)
 
@@ -182,13 +197,15 @@ nothing), decode it, sign with two owners, execute.
 cast calldata-decode "setMaxPriceAge(uint32)" $(jq -r '.transactions[0].data' broadcast/handover-safe-smoke-batch.json)
 ADMIN_PK=$DEPLOYER_PK STEP=renounce GRANT_NONCE=<from grant> \
   forge script script/HandoverAdmin.s.sol --rpc-url $RH_RPC --broadcast --slow --no-storage-caching
-ADMIN_PHASE=safe forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
+ADMIN_PHASE=safe EXPECTED_CLEAR_FEE_TO=$SAFE_ADMIN \
+  forge script script/Verify.s.sol --rpc-url $RH_RPC --no-storage-caching
 ```
 
 Renounce refuses until the Safe's nonce has moved past `GRANT_NONCE`, so the key is never dropped
 before the Safe has executed a transaction as admin. After it, `VERIFY PASSED` in the safe phase
-(72 checks in the rehearsal, with `EXPECT_SAFE_OWNER_SET` pinning the three owners): the Safe holds
-admin, the deployer holds nothing. From here every admin action is a Safe transaction.
+(76 checks on path A, with `EXPECT_SAFE_OWNER_SET` pinning the three owners): the Safe holds admin,
+the deployer holds nothing, and Clear's `feeTo` is still the Safe (it never moved). From here every
+admin action is a Safe transaction.
 
 ---
 
@@ -271,6 +288,27 @@ script and in the A1/B1 commands above. The earlier record (commit `6ed528f`, pr
 block 62212405, Verify 55/61/64/63) is superseded; its finding stands: without
 `--no-storage-caching`, the tamper test passed because forge served the vault's code from its fork
 cache for an unchanged block number, which is the reason for the warning above.
+
+## Rehearsal record — 2026-09-14 (feeTo = admin Safe)
+
+`script/rehearse-deploy.sh` on `anvil --fork-url https://rpc.mainnet.chain.robinhood.com --chain-id
+4663 --port 8555 --code-size-limit 98304`, fork block **63380078**, every forge call with
+`--no-storage-caching`, on `redesign/a2-own-strikes-2026-09-13` after L-01 (`bec4dbd`) plus this
+script-only change. **Passed.** `src/` and the Vault ABI were byte-identical to `bec4dbd`.
+
+| Step | Result |
+|---|---|
+| A0 DeployClear, `CLEAR_FEE_TO` = admin Safe | our Clear `0xA6Bb16048497Eb06b6314c37644A0B3Fe03a515A`, 16,110 B; `feeTo()` the admin Safe `0x6DA2…0fE11`; `feesEnabled() == false`, `feeBps() == 15` |
+| A1 deploy against our Clear; Verify | Vault `0xf04a…3c09` (25,775 B); preflight `clear feeTo` the Safe; **67 of 67** |
+| A1b Verify teeth on the fee switch | missing `EXPECTED_CLEAR_FEE_TO` FAIL; pending `setFeeTo(deployer)` FAIL; deployer `acceptFeeTo` + `setFeesEnabled(true)` FAIL on holder (and on the fee-on check); Safe `acceptFeeTo` restores, deployer's `setFeesEnabled` reverts; **67 of 67** |
+| A2 configure; Verify | **73 of 73** |
+| A3 swapped libraries | 5 FAIL (link sites, both libraries' deploy-address word and runtime) |
+| A4–A6 handover | renounce refused until the smoke batch; then **76 of 76**; a renounced-key configure refused |
+| B2 Overcall's Clear, Safe from block one | **71 of 71** (no `EXPECTED_CLEAR_FEE_TO`; Overcall's `feeTo` is unchanged) |
+| B3–B4 | executor refuses a non-anvil node; one flipped vault byte FAIL |
+
+The 2026-09-13 record above is the redesigned-contracts rehearsal; its A0 still deployed `feeTo` =
+the deployer, which this run closes.
 
 What this rehearsal does **not** prove:
 

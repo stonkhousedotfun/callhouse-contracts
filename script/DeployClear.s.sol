@@ -8,9 +8,10 @@ import {IValoremClear} from "../src/interfaces/IValoremClear.sol";
 /// @dev The vault is agnostic about which clearinghouse it settles on (decision D16): the default in
 ///      script/Deploy.s.sol is Overcall's unmodified instance at 0x9a7b40e5c1dB1Af822ef091c990b58b02C78C0C0,
 ///      whose `feeTo` key holds only the 15 bps fee switch. This script exists so that dependency can be
-///      removed entirely: deploy an instance whose `feeTo` is OUR admin, then pass its address to
-///      Deploy.s.sol as `CLEARINGHOUSE`. Run with:
-///        DEPLOYER_PK=... CLEAR_FEE_TO=<admin> forge script script/DeployClear.s.sol --rpc-url $RH_RPC --broadcast
+///      removed entirely: deploy an instance whose `feeTo` is the admin Safe (owner decision 2026-09-14;
+///      `HandoverAdmin.s.sol` never moves it), then pass its address to Deploy.s.sol as `CLEARINGHOUSE`.
+///      Run with:
+///        DEPLOYER_PK=... CLEAR_FEE_TO=<admin Safe> forge script script/DeployClear.s.sol --rpc-url $RH_RPC --broadcast
 ///
 ///      THE ARTIFACT IS UPSTREAM, NOT OURS. `script/artifacts/ValoremOptionsClearinghouse.json` is a copy of
 ///      `test/fixtures/valorem/ValoremOptionsClearinghouse.json`: valorem-labs-inc/clear @ 6436c823, solc
