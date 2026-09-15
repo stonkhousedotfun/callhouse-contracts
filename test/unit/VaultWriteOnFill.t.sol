@@ -82,7 +82,7 @@ contract ReentrantBuyer {
             if (!ok) redeemRevert = ret;
         }
         if (tryDeposit) {
-            // A deposit mid-fill is a legitimate operation; it must neither revert nor break the fill.
+            // A deposit mid-fill is refused (L-01), and the refusal must not break the fill.
             depositSucceeded = _depositOne();
         }
         return this.onERC1155Received.selector;
@@ -502,8 +502,8 @@ contract VaultWriteOnFillTest is BaseTest {
 
     /// @dev The buyer's `onERC1155Received` runs between the two hooks. Everything it can try against
     ///      the vault from there is refused (the hooks: `NotSeaport`; a donation of the tokens it just
-    ///      received: the receiver hook refuses; an instant redeem: `UseQueue`), a legitimate deposit
-    ///      goes through, and the fill completes with the post-condition intact.
+    ///      received: the receiver hook refuses; an instant redeem: `UseQueue`; a deposit:
+    ///      `DepositsClosed`, L-01), and the fill completes with the post-condition intact.
     function test_buyerReenteringTheVaultMidFillIsBlocked() public {
         (uint256 optionId, OrderComponents memory c) = _listed();
         ReentrantBuyer evil = new ReentrantBuyer(vault, IERC1155Minimal(address(clear)), seaport);
@@ -520,12 +520,14 @@ contract VaultWriteOnFillTest is BaseTest {
         assertEq(bytes4(evil.validateRevert()), Vault.NotSeaport.selector, "validateOrder refused the buyer");
         assertEq(bytes4(evil.donationRevert()), MockClear.UnsafeRecipient.selector, "the donation was refused");
         assertEq(bytes4(evil.redeemRevert()), Vault.UseQueue.selector, "no instant redeem while a call is open");
-        assertTrue(evil.depositSucceeded(), "a deposit mid-fill is legitimate and works");
+        // L-01 (AUDIT-FINDINGS-2026-09-14): a deposit from inside the receive hook would buy into the
+        // premium of the fill paying for it, so it is refused; test/regression/L01_InFillDeposit.t.sol.
+        assertFalse(evil.depositSucceeded(), "a deposit mid-fill is refused");
 
         assertEq(vault.contractsWritten(), 3, "the fill completed");
         assertEq(clear.balanceOf(address(evil), optionId), 3, "the hostile buyer still got what it paid for");
         assertEq(clear.balanceOf(address(vault), optionId), 0, "and left nothing in the vault");
-        assertEq(vault.balanceOf(address(evil)), 1e18, "its deposit minted shares at par");
+        assertEq(vault.balanceOf(address(evil)), 0, "and minted no shares");
     }
 
     /*//////////////////////////////////////////////////////////////

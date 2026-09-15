@@ -210,8 +210,10 @@ Two consequences to hold in mind:
 
 The deposit gate itself closes on the cycle's exercise **timestamp**, not on the phase: after it,
 `deposit`/`mint` revert `DepositsClosed` and the previews return 0. One private predicate,
-`_depositRefused()`, decides both the revert and the zero quote, and it has six reasons: a phase
-other than Idle or Listed, the exercise timestamp in Listed, unclaimed assignment proceeds, a claim
+`_depositRefused()`, decides both the revert and the zero quote, and it has seven reasons: a vault
+fill that has already written in the same transaction (a contract buyer depositing from its
+ERC-1155 receive hook, before its USDG has landed, would otherwise take part of that fill's premium;
+AUDIT-FINDINGS-2026-09-14 L-01), a phase other than Idle or Listed, the exercise timestamp in Listed, unclaimed assignment proceeds, a claim
 still open while Idle (stranded), `asset.balanceOf(vault) < reservedAssets`, and the share-price
 floor `totalSupply() > totalAssets() × 1e6` (§3). The reason is
 assignment — Valorem takes collateral with no callback, so NAV collapses mid-transaction while

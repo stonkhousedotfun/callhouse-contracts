@@ -112,7 +112,7 @@ forge script script/Deploy.s.sol --rpc-url $RH_RPC --broadcast --slow --no-stora
 # forge verify-contract --verifier sourcify --chain 4663 $VALOREM_LIB src/lib/ValoremLib.sol:ValoremLib
 ```
 
-`--non-interactive` is required: the Vault runtime (25,765 B) is above EIP-170's 24,576 B, and
+`--non-interactive` is required: the Vault runtime (25,775 B) is above EIP-170's 24,576 B, and
 forge's broadcast step stops at a confirmation prompt for such a contract even though
 `foundry.toml` raises `code_size_limit` to chain 4663's real 98,304 B limit for the simulation. The
 flag only suppresses that prompt; the chain accepts the contract (README "Four things that will bite

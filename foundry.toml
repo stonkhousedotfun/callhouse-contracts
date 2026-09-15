@@ -15,6 +15,11 @@ bytecode_hash = "none"
 # The only hard limit for the Vault is therefore 98,304 B; forge's 24,576 B "sizes" warnings are
 # noise on this chain. Rehearsals must start anvil with `--code-size-limit 98304` to match.
 code_size_limit = 98304
+# Run every top-level call a test makes as its own transaction, as it is on chain. Without this Foundry
+# keeps transient storage for a whole test function, and the vault's `_fillArmed` (set by the first fill
+# of a transaction, read by the deposit gate: Vault._depositRefused reason 7, AUDIT-FINDINGS-2026-09-14
+# L-01) would refuse every deposit a test makes after any fill, which no real user ever sees.
+isolate = true
 ffi = false
 fs_permissions = [
     { access = "read", path = "./out" },

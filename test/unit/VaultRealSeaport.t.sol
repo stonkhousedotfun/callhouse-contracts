@@ -15,6 +15,7 @@ import {
     AdditionalRecipient
 } from "../helpers/RealSeaportBase.sol";
 import {RealClearBase} from "../helpers/RealClearBase.sol";
+import {InFillDepositor} from "../helpers/InFillDepositor.sol";
 import {Vault} from "../../src/Vault.sol";
 import {IValoremClear} from "../../src/interfaces/IValoremClear.sol";
 import {IERC1155Minimal} from "../../src/interfaces/IERC1155Minimal.sol";
@@ -444,6 +445,33 @@ contract VaultRealSeaportTest is BaseTest, RealSeaportBase, RealClearBase {
         assertEq(vault.contractsWritten(), 3, "the fill completed");
         assertEq(clear.balanceOf(address(evil), optionId), 3);
         assertEq(clear.balanceOf(address(vault), optionId), 0, "nothing left behind");
+    }
+
+    /// @dev L-01 (AUDIT-FINDINGS-2026-09-14) on the real runtime: Seaport 1.6 moves the ERC-1155 offer item
+    ///      before the USDG consideration, so a contract buyer's receive hook runs with the fill written and
+    ///      the premium not yet in the vault. A deposit or mint from there is refused `DepositsClosed` and
+    ///      both quotes read zero; the fill completes and the buyer mints nothing. The mock-Seaport form and
+    ///      the post-fill control are test/regression/L01_InFillDeposit.t.sol.
+    function test_inFillDepositFromTheBuyersReceiveHookIsRefused() public {
+        (, OrderComponents memory c) = _listed();
+        InFillDepositor evil = new InFillDepositor(vault);
+        _fund(address(evil), 10e18, 100_000_000);
+        evil.approveAll(address(usdg), SEAPORT_16);
+        evil.approveAll(address(nvda), address(vault));
+        evil.arm(10e18);
+        uint256 usdgBefore = usdg.balanceOf(address(vault));
+
+        assertTrue(_fulfillAdvanced(address(evil), c, 3, N));
+
+        assertEq(evil.hookCalls(), 1, "the receive hook ran once, mid-fill");
+        assertEq(evil.usdgInVaultInHook(), usdgBefore, "real Seaport had not paid the premium yet");
+        assertEq(evil.maxDepositInHook(), 0, "maxDeposit quotes zero inside the fill");
+        assertEq(evil.maxMintInHook(), 0, "maxMint quotes zero inside the fill");
+        assertEq(bytes4(evil.depositRevert()), Vault.DepositsClosed.selector, "deposit refused inside the fill");
+        assertEq(bytes4(evil.mintRevert()), Vault.DepositsClosed.selector, "mint refused inside the fill");
+        assertEq(vault.contractsWritten(), 3, "the fill completed");
+        assertEq(vault.balanceOf(address(evil)), 0, "the buyer minted no shares");
+        assertGt(usdg.balanceOf(address(vault)), usdgBefore, "and paid its premium");
     }
 
     /// @dev A stranger's restricted order that names the vault as zone: Seaport calls the vault's

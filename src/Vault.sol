@@ -628,7 +628,26 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///         a share again (collateral returning, a redeemed stranded claim, or the shares
     ///         redeeming out); nothing here needs governance. A fresh vault (`totalSupply() == 0`)
     ///         is not below the floor.
+    ///      7. A FILL OF THIS TRANSACTION HAS WRITTEN (AUDIT-FINDINGS-2026-09-14 L-01). Seaport moves
+    ///         the offer item before the consideration, so a contract buyer's `onERC1155Received`
+    ///         runs after `authorizeOrder` has written its contracts and BEFORE its USDG reaches the
+    ///         vault. A deposit from inside that hook passed every other reason, its
+    ///         {_checkpointHarvest} saw no new USDG, and the shares it minted then took a pro-rata
+    ///         slice of the premium for the very fill that was paying for them (half of it, in the
+    ///         PoC, for a buyer that matched the existing book). That is the one ordering where the
+    ///         fill precedes the shares but its premium is indexed after them, which the checkpoint
+    ///         exists to rule out. `_fillArmed` is set by the first `authorizeOrder` of a transaction
+    ///         and never cleared inside it, so it is exactly "a vault write has happened in this
+    ///         transaction". THE TRADE-OFF: it is sticky for the rest of the transaction, so a
+    ///         contract that fills and then deposits in one transaction is refused too, even after its
+    ///         USDG has landed. That is the right answer rather than a side effect (the deposit would
+    ///         dilute the fill it just made, sized against the smaller book), no first-party path
+    ///         does it, and the next transaction is unaffected because transient storage is cleared
+    ///         at its end. `tload` is allowed in a view, so `maxDeposit`/`maxMint` quote zero inside
+    ///         the hook exactly as `deposit`/`mint` revert. Foundry runs a whole test function as one
+    ///         transaction unless `isolate = true` (set in foundry.toml for this reason).
     function _depositRefused() private view returns (bool) {
+        if (_fillArmed) return true;
         Phase p = phase;
         if (p != Phase.Idle && p != Phase.Listed) return true;
         if (p == Phase.Listed && block.timestamp >= cycleExerciseTs) return true;
@@ -661,7 +680,9 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      same holds for assets behind shares that were queued after a fill (decision D9, A-6:
     ///      queued shares stay in supply and exposed until settlement, exactly as at `rollOpen`).
     ///      What a late depositor does NOT get is premium indexed before their shares existed
-    ///      ({_checkpointHarvest}).
+    ///      ({_checkpointHarvest}), nor premium from a fill of the same transaction whose USDG has
+    ///      not yet landed: a deposit after any fill in the transaction is refused ({_depositRefused}
+    ///      reason 7).
     ///
     ///      This is intended, and it is why the deposit window shuts at `cycleExerciseTs`: before
     ///      that nothing can be assigned, so the NAV a late depositor pays is not yet marked down
@@ -1175,6 +1196,10 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
     ///      what it was before the FIRST write. The baseline is snapshotted once per transaction
     ///      and never zeroed: after a successful call the balance equals the baseline again, so a
     ///      second Seaport call in the same transaction inherits a still-valid one.
+    ///
+    ///      `_fillArmed` DOUBLES AS THE DEPOSIT GATE'S IN-FILL SIGNAL. Once any fill of this
+    ///      transaction has written, deposits and mints are refused until the transaction ends
+    ///      ({_depositRefused} reason 7, AUDIT-FINDINGS-2026-09-14 L-01).
     uint256 private transient _fillBaseline;
     bool private transient _fillArmed;
 
