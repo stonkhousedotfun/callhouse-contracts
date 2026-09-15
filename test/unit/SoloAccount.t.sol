@@ -222,4 +222,91 @@ contract SoloAccountTest is Test {
         a.withdraw(5e18);
         assertEq(nvda.balanceOf(alice), 10e18);
     }
+
+    function test_settleAfterSetWeek_usesPinnedExpiry() public {
+        _open(alice);
+        _week();
+        WriterAccount a = _list(alice, 1);
+        uint40 pinned = a.listedExpiryTs();
+
+        vm.prank(keeper);
+        factory.setWeek(STRIKE, uint40(block.timestamp + 10 days), uint40(block.timestamp + 11 days), ASK);
+
+        vm.warp(pinned);
+        a.settle();
+        assertEq(a.reserved(), 0);
+        assertEq(a.listedLots(), 0);
+        vm.prank(alice);
+        a.withdraw(5e18);
+    }
+
+    function test_fillAfterSetWeek_keepsPinnedStrikeAndAsk() public {
+        _open(alice);
+        _week();
+        WriterAccount a = _list(alice, 1);
+        uint256 pinnedStrike = a.listedStrikeUsdg();
+        uint256 pinnedAsk = a.listedAskUsdg();
+
+        vm.prank(keeper);
+        factory.setWeek(240_000_000, uint40(block.timestamp + 10 days), uint40(block.timestamp + 11 days), 2_000_000);
+
+        assertEq(a.listedStrikeUsdg(), pinnedStrike);
+        assertEq(a.listedAskUsdg(), pinnedAsk);
+        _fillLot(a, 0);
+        assertEq(a.contractsWritten(), 1);
+        assertEq(usdg.balanceOf(alice), SELLER);
+    }
+
+    function test_emptyAccountNotInPendingOrLive() public {
+        vm.prank(alice);
+        factory.createAccount();
+        assertEq(factory.pendingCount(), 0);
+        assertEq(factory.liveCount(), 0);
+
+        _open(bob);
+        _week();
+        _list(bob, 1);
+        assertEq(factory.pendingCount(), 0);
+        assertEq(factory.liveCount(), 1);
+        assertEq(factory.liveAt(0), address(factory.accountOf(bob)));
+    }
+
+    function test_requestWriteEnqueuesThenListDequeues() public {
+        _open(alice);
+        _week();
+        WriterAccount a = factory.accountOf(alice);
+        vm.prank(alice);
+        a.requestWrite(1);
+        assertEq(factory.pendingCount(), 1);
+        vm.prank(keeper);
+        factory.listFor(alice);
+        assertEq(factory.pendingCount(), 0);
+        assertEq(factory.liveCount(), 1);
+    }
+
+    function test_transferOwnership() public {
+        address carol = makeAddr("carol");
+        _open(alice);
+        WriterAccount a = factory.accountOf(alice);
+        vm.prank(alice);
+        a.transferOwnership(carol);
+        assertEq(a.owner(), carol);
+        assertEq(address(factory.accountOf(carol)), address(a));
+        assertEq(address(factory.accountOf(alice)), address(0));
+        vm.prank(carol);
+        a.withdraw(5e18);
+        assertEq(nvda.balanceOf(carol), 5e18);
+    }
+
+    function test_ownerCanList() public {
+        _open(alice);
+        _week();
+        WriterAccount a = factory.accountOf(alice);
+        vm.startPrank(alice);
+        a.requestWrite(1);
+        a.list();
+        vm.stopPrank();
+        assertEq(a.listedLots(), 1);
+        assertEq(factory.liveCount(), 1);
+    }
 }

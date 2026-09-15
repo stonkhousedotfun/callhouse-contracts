@@ -31,6 +31,11 @@ interface IAccountFactory {
     function maxPriceAge() external view returns (uint32);
     function writesHalted() external view returns (bool);
     function valoremFeeAccepted() external view returns (bool);
+    function notifyPending() external;
+    function notifyNotPending() external;
+    function notifyListed() external;
+    function notifySettled() external;
+    function rekey(address newOwner) external;
     function policy()
         external
         view
@@ -51,12 +56,10 @@ interface IAccountFactory {
 
 /// @title WriterAccount
 /// @notice One user's isolated covered-call account. Cloneable; immutables live on the implementation.
-/// @dev Deposit NVDA, request N lots, keeper lists N FULL 1-contract Seaport orders of this
-///      account's own option type (expiry = week.baseExpiry + index). A fill writes this user's
-///      NVDA and pays this user the premium. Unfilled lots unlock at settle. Assignment of this
-///      option type cannot hit another account.
 contract WriterAccount is ReentrancyGuardTransient, IZone {
     using SafeERC20 for IERC20;
+
+    uint256 internal constant BPS = 10_000;
 
     IAccountFactory public immutable factory;
     IERC20 public immutable asset;
@@ -78,8 +81,14 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     uint256 public claimKey;
     uint112 public contractsWritten;
 
+    uint256 public listedStrikeUsdg;
+    uint256 public listedAskUsdg;
+    uint40 public listedExerciseTs;
+    uint40 public listedExpiryTs;
+
     mapping(bytes32 => bool) public liveListing;
     uint256 public liveListingCount;
+    bytes32[] private _listingHashes;
 
     uint256 private transient _fillBaseline;
     bool private transient _fillArmed;
@@ -91,13 +100,15 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     event LotFilled(bytes32 indexed orderHash, uint256 indexed optionId, uint256 premiumUsdg);
     event Settled(uint256 nvdaReturned, uint256 strikeUsdg);
     event UsdgClaimed(address indexed to, uint256 amount);
+    event OwnershipTransferred(address indexed from, address indexed to);
 
     error NotOwner();
-    error NotKeeper();
+    error NotAuthorized();
     error NotSeaport();
     error AlreadyInitialized();
     error ImplementationLocked();
     error ZeroAmount();
+    error ZeroAddr();
     error DepositCapExceeded();
     error InsufficientIdle();
     error NoWeek();
@@ -110,7 +121,6 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     error BadLot();
     error InventoryLeftBehind(uint256 got, uint256 expected);
     error TooEarly();
-    error NoOpenClaim();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -135,21 +145,28 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         conduitKey = conduitKey_;
     }
 
-    /// @dev Called once on the implementation so it cannot be used as an account.
     function lockImplementation() external {
-        if (msg.sender != address(factory)) revert NotKeeper();
+        if (msg.sender != address(factory)) revert NotAuthorized();
         if (initialized) revert AlreadyInitialized();
         initialized = true;
     }
 
     function initialize(address owner_, uint32 index_) external {
         if (initialized) revert AlreadyInitialized();
-        if (msg.sender != address(factory)) revert NotKeeper();
+        if (msg.sender != address(factory)) revert NotAuthorized();
         if (owner_ == address(0) || index_ == 0) revert ImplementationLocked();
         initialized = true;
         owner = owner_;
         index = index_;
         IERC1155Minimal(address(clear)).setApprovalForAll(address(seaport), true);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddr();
+        address old = owner;
+        factory.rekey(newOwner);
+        owner = newOwner;
+        emit OwnershipTransferred(old, newOwner);
     }
 
     function deposit(uint256 assets) external onlyOwner nonReentrant {
@@ -160,8 +177,6 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         emit Deposited(owner, assets);
     }
 
-    /// @notice NVDA not reserved for unfilled listings. Locked Valorem collateral is already gone
-    ///         from the balance, so this is the amount the owner can take home right now.
     function idleAssets() public view returns (uint256) {
         uint256 bal = asset.balanceOf(address(this));
         return bal > reserved ? bal - reserved : 0;
@@ -174,20 +189,21 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         emit Withdrawn(owner, assets);
     }
 
-    /// @notice How many 1-NVDA lots to write this week. 0 means do not list.
     function requestWrite(uint64 lots) external onlyOwner {
         if (listedLots != 0) revert AlreadyListed();
         if (lots > asset.balanceOf(address(this)) / Policy.LOT) revert InsufficientIdle();
         requestedLots = lots;
+        if (lots == 0) factory.notifyNotPending();
+        else factory.notifyPending();
         emit WriteRequested(lots);
     }
 
-    /// @notice Keeper-only. Creates this account's option type and validates `requestedLots`
-    ///         FULL 1-contract Seaport orders. Premium (minus fee) pays `owner` on fill.
+    /// @notice Owner or keeper. Pins this week's terms so a later `setWeek` cannot move them.
     function list() external nonReentrant {
-        if (msg.sender != address(factory) && !factory.hasRole(factory.KEEPER_ROLE(), msg.sender)) {
-            revert NotKeeper();
-        }
+        if (
+            msg.sender != owner && msg.sender != address(factory)
+                && !factory.hasRole(factory.KEEPER_ROLE(), msg.sender)
+        ) revert NotAuthorized();
         if (factory.writesHalted()) revert WritesAreHalted();
         if (listedLots != 0) revert AlreadyListed();
         if (optionId != 0) revert StillOpen();
@@ -197,12 +213,25 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
 
         uint64 lots = requestedLots;
         if (lots == 0) revert NothingToList();
-        if (uint256(lots) * Policy.LOT > asset.balanceOf(address(this))) revert InsufficientIdle();
+
+        uint256 need = uint256(lots) * Policy.LOT;
+        if (clear.feesEnabled()) {
+            uint256 fee = (need * uint256(clear.feeBps())) / BPS;
+            if (fee == 0) fee = lots;
+            need += fee;
+        }
+        if (need > asset.balanceOf(address(this))) revert InsufficientIdle();
 
         (,,,,, uint64 cap) = factory.policy();
         if (lots > cap) revert TooManyLots();
 
         uint40 expiryTs = uint40(uint256(baseExpiryTs) + index);
+        listedWeekId = weekId;
+        listedStrikeUsdg = strikeUsdg;
+        listedAskUsdg = askUsdg;
+        listedExerciseTs = exerciseTs;
+        listedExpiryTs = expiryTs;
+
         optionId = _ensureOptionType(strikeUsdg, exerciseTs, expiryTs);
         ValoremLib.open(
             clear,
@@ -219,18 +248,19 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
 
         reserved = uint256(lots) * Policy.LOT;
         listedLots = lots;
-        listedWeekId = weekId;
         liveListingCount = lots;
 
         for (uint256 i; i < lots; i++) {
             OrderComponents memory c = lotOrder(i);
             bytes32 h = seaport.getOrderHash(c);
             liveListing[h] = true;
+            _listingHashes.push(h);
             Order[] memory orders = new Order[](1);
             orders[0] = Order({parameters: _toParameters(c), signature: ""});
             if (!seaport.validate(orders)) revert BadLot();
         }
 
+        factory.notifyListed();
         emit LotsListed(weekId, optionId, lots, askUsdg);
     }
 
@@ -239,6 +269,9 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         if (!liveListing[zp.orderHash] || zp.offerer != address(this)) revert NotLiveListing(zp.orderHash);
         if (factory.writesHalted()) revert WritesAreHalted();
         if (zp.offer.length != 1 || zp.offer[0].amount != 1) revert BadLot();
+        if (zp.offer[0].token != address(clear) || zp.offer[0].identifier != optionId) revert BadLot();
+        if (zp.consideration.length == 0 || zp.consideration[0].token != address(usdg)) revert BadLot();
+        if (zp.consideration[0].recipient != owner) revert BadLot();
 
         uint256 id = optionId;
         if (!_fillArmed) {
@@ -248,28 +281,30 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
 
         uint256 gross;
         for (uint256 i; i < zp.consideration.length; i++) {
+            if (zp.consideration[i].token != address(usdg)) revert BadLot();
             gross += zp.consideration[i].amount;
         }
+        if (gross != listedAskUsdg) revert BadLot();
 
         liveListing[zp.orderHash] = false;
         liveListingCount -= 1;
         reserved -= Policy.LOT;
 
         PolicyParams memory p = _policy();
-        (uint256 key, uint256 collateral) = ValoremLib.writeOnFill(
+        (uint256 key,) = ValoremLib.writeOnFill(
             clear,
             ValoremLib.Fill({
                 feed: priceFeed,
                 asset: asset,
                 optionId: id,
                 claimId: claimKey,
-                strikeUsdg: _strike(),
-                sizingAssets: type(uint128).max,
+                strikeUsdg: listedStrikeUsdg,
+                sizingAssets: _sizingAssets(listedLots, p),
                 reserved: reserved,
                 grossUsdg: gross,
                 written: contractsWritten,
                 n: 1,
-                cycleExerciseTs: _exerciseTs(),
+                cycleExerciseTs: listedExerciseTs,
                 maxPriceAge: factory.maxPriceAge(),
                 feeAccepted: factory.valoremFeeAccepted()
             }),
@@ -277,7 +312,6 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         );
         claimKey = key;
         contractsWritten += 1;
-        collateral; // locked in Valorem; recorded via contractsWritten
 
         emit LotFilled(zp.orderHash, id, gross);
         return IZone.authorizeOrder.selector;
@@ -291,21 +325,22 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         return IZone.validateOrder.selector;
     }
 
-    /// @notice After expiry: kill leftover listings, redeem the claim if anything sold, release reserve.
     function settle() external nonReentrant {
-        uint40 expiry = _expiryTs();
-        if (expiry == 0 || block.timestamp < expiry) revert TooEarly();
+        if (listedExpiryTs == 0 || block.timestamp < listedExpiryTs) revert TooEarly();
 
-        if (liveListingCount != 0) {
+        uint256 n = _listingHashes.length;
+        if (n != 0) {
             seaport.incrementCounter();
-            liveListingCount = 0;
+            for (uint256 i; i < n; i++) {
+                liveListing[_listingHashes[i]] = false;
+            }
+            delete _listingHashes;
         }
+        liveListingCount = 0;
         reserved = 0;
         requestedLots = 0;
         listedLots = 0;
 
-        uint256 nvdaBefore = asset.balanceOf(address(this));
-        uint256 usdgBefore = usdg.balanceOf(address(this));
         uint256 nvdaIn;
         uint256 usdgIn;
         if (claimKey != 0) {
@@ -322,8 +357,13 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
             optionId = 0;
             contractsWritten = 0;
         }
-        nvdaBefore;
-        usdgBefore;
+        listedStrikeUsdg = 0;
+        listedAskUsdg = 0;
+        listedExerciseTs = 0;
+        listedExpiryTs = 0;
+        listedWeekId = 0;
+
+        factory.notifySettled();
         emit Settled(nvdaIn, usdgIn);
     }
 
@@ -334,11 +374,10 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         emit UsdgClaimed(owner, amount);
     }
 
-    /// @notice The 1-lot FULL_RESTRICTED order at `salt` (0 .. listedLots-1).
     function lotOrder(uint256 salt) public view returns (OrderComponents memory c) {
-        (,,,, uint256 askUsdg) = factory.week();
+        uint256 askUsdg = listedAskUsdg;
         (,,,, uint16 feeBps,) = factory.policy();
-        uint256 fee = (askUsdg * feeBps) / 10_000;
+        uint256 fee = (askUsdg * feeBps) / BPS;
         uint256 seller = askUsdg - fee;
 
         OfferItem[] memory offer = new OfferItem[](1);
@@ -378,7 +417,7 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
             consideration: consid,
             orderType: OrderType.FULL_RESTRICTED,
             startTime: 0,
-            endTime: _exerciseTs(),
+            endTime: listedExerciseTs,
             zoneHash: bytes32(0),
             salt: salt,
             conduitKey: conduitKey,
@@ -406,6 +445,13 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         return asset.balanceOf(address(this)) + locked;
     }
 
+    /// @dev Large enough that Policy utilization allows `lots` contracts, small enough to be real.
+    function _sizingAssets(uint64 lots, PolicyParams memory p) internal pure returns (uint256) {
+        uint256 notional = uint256(lots) * Policy.LOT;
+        if (p.maxUtilizationBps == 0 || p.maxUtilizationBps >= BPS) return notional;
+        return notional * BPS / p.maxUtilizationBps + Policy.LOT;
+    }
+
     function _ensureOptionType(uint256 strikeUsdg, uint40 exerciseTs, uint40 expiryTs) internal returns (uint256 id) {
         id = uint256(
             uint160(
@@ -429,20 +475,6 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     function _policy() internal view returns (PolicyParams memory p) {
         (p.minOtmBps, p.maxOtmBps, p.minPremiumBps, p.maxUtilizationBps, p.protocolFeeBps, p.maxContractsCap) =
             factory.policy();
-    }
-
-    function _strike() internal view returns (uint256 strikeUsdg) {
-        (, strikeUsdg,,,) = factory.week();
-    }
-
-    function _exerciseTs() internal view returns (uint40 exerciseTs) {
-        (,, exerciseTs,,) = factory.week();
-    }
-
-    function _expiryTs() internal view returns (uint40) {
-        (,,, uint40 baseExpiryTs,) = factory.week();
-        if (baseExpiryTs == 0 || index == 0) return 0;
-        return uint40(uint256(baseExpiryTs) + index);
     }
 
     function _toParameters(OrderComponents memory c) internal pure returns (OrderParameters memory p) {

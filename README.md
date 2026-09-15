@@ -9,7 +9,7 @@ per user. The user deposits NVDA, requests N lots, and the keeper lists N full S
 of 1 contract on that account's own Valorem option type. A fill writes that user's NVDA and pays
 that user. Unfilled lots return at settle.
 
-Factory on chain 4663: `0x7850Ae4ac03b651263cE78EC5FcED11b0d0e05A7`.
+Factory on chain 4663: `0xc4A5Cd0DE91CaB7F5Ebe2114bc63Fbb43E642BBb`.
 Clear: `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`. App venue: `app.stonkhouse.fun/book`.
 `docs/DEPLOY.md` "Live deployment" lists every address, who holds each key and what is
 source-verified. The contracts are **unaudited**: there is no external audit yet. One is pending

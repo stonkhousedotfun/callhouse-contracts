@@ -12,18 +12,13 @@ import {IChainlinkFeed} from "../interfaces/IChainlinkFeed.sol";
 import {WriterAccount, IAccountFactory} from "./Account.sol";
 
 /// @title AccountFactory
-/// @notice Deploys isolated per-user covered-call accounts. No pooled vault, no shares.
-/// @dev Each account holds that user's NVDA, writes only that user's lots, and has its own
-///      Valorem option type (unique expiry offset) so assignment cannot hit anyone else.
-///      The keeper publishes one week's terms; `listFor` posts 1-lot FULL_RESTRICTED Seaport
-///      orders from that account. The live pooled {Vault} is a different product.
+/// @notice Deploys isolated per-user covered-call accounts.
+/// @dev Keeper and the book iterate `pending` / `live` only — never every account ever created.
 contract AccountFactory is AccessControl {
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
 
-    /// @notice Shared implementation. Clones delegatecall into it; immutables live here.
     WriterAccount public immutable implementation;
-
     IERC20 public immutable asset;
     IERC20 public immutable usdg;
     IValoremClear public immutable clear;
@@ -49,10 +44,18 @@ contract AccountFactory is AccessControl {
     Week public week;
 
     mapping(address => WriterAccount) public accountOf;
-    WriterAccount[] public accounts;
     uint32 public nextIndex;
 
+    /// @dev Clones waiting for `list()`. Swap-remove. Not every created account.
+    address[] private _pending;
+    mapping(address => uint256) private _pendingPos;
+
+    /// @dev Clones with live listings this week. Swap-remove. What the book iterates.
+    address[] private _live;
+    mapping(address => uint256) private _livePos;
+
     event AccountCreated(address indexed owner, WriterAccount indexed account, uint32 index);
+    event AccountRekeyed(address indexed from, address indexed to, WriterAccount indexed account);
     event WeekSet(uint32 indexed id, uint256 strikeUsdg, uint40 exerciseTs, uint40 baseExpiryTs, uint256 askUsdg);
     event WritesHalted(bool halted);
     event PolicySet();
@@ -64,6 +67,8 @@ contract AccountFactory is AccessControl {
     error NoAccount();
     error BadWeek();
     error AskAboveStrike(uint256 ask, uint256 strike);
+    error NotAccount();
+    error Occupied();
 
     constructor(
         IERC20 asset_,
@@ -109,16 +114,29 @@ contract AccountFactory is AccessControl {
         account = WriterAccount(payable(Clones.clone(address(implementation))));
         account.initialize(msg.sender, index);
         accountOf[msg.sender] = account;
-        accounts.push(account);
         emit AccountCreated(msg.sender, account, index);
     }
 
     function accountCount() external view returns (uint256) {
-        return accounts.length;
+        return nextIndex;
     }
 
-    /// @notice Publish this week's terms. Every listed account uses this strike and window;
-    ///         each account's option type uniquifies `baseExpiryTs` by its index.
+    function pendingCount() external view returns (uint256) {
+        return _pending.length;
+    }
+
+    function pendingAt(uint256 i) external view returns (address) {
+        return _pending[i];
+    }
+
+    function liveCount() external view returns (uint256) {
+        return _live.length;
+    }
+
+    function liveAt(uint256 i) external view returns (address) {
+        return _live[i];
+    }
+
     function setWeek(uint256 strikeUsdg, uint40 exerciseTs, uint40 baseExpiryTs, uint256 askUsdg)
         external
         onlyRole(KEEPER_ROLE)
@@ -137,19 +155,42 @@ contract AccountFactory is AccessControl {
         emit WeekSet(week.id, strikeUsdg, exerciseTs, baseExpiryTs, askUsdg);
     }
 
-    /// @notice Post this owner's requested 1-lot orders for the live week.
     function listFor(address owner) external onlyRole(KEEPER_ROLE) {
         WriterAccount account = accountOf[owner];
         if (address(account) == address(0)) revert NoAccount();
         account.list();
     }
 
-    function listMany(address[] calldata owners) external onlyRole(KEEPER_ROLE) {
-        for (uint256 i; i < owners.length; i++) {
-            WriterAccount account = accountOf[owners[i]];
-            if (address(account) == address(0)) revert NoAccount();
-            account.list();
-        }
+    function notifyPending() external {
+        _onlyClone();
+        _enqueue(_pending, _pendingPos, msg.sender);
+    }
+
+    function notifyNotPending() external {
+        _onlyClone();
+        _dequeue(_pending, _pendingPos, msg.sender);
+    }
+
+    function notifyListed() external {
+        _onlyClone();
+        _dequeue(_pending, _pendingPos, msg.sender);
+        _enqueue(_live, _livePos, msg.sender);
+    }
+
+    function notifySettled() external {
+        _onlyClone();
+        _dequeue(_pending, _pendingPos, msg.sender);
+        _dequeue(_live, _livePos, msg.sender);
+    }
+
+    function rekey(address newOwner) external {
+        if (newOwner == address(0)) revert ZeroAddr();
+        address oldOwner = WriterAccount(payable(msg.sender)).owner();
+        if (address(accountOf[oldOwner]) != msg.sender) revert NotAccount();
+        if (address(accountOf[newOwner]) != address(0)) revert Occupied();
+        delete accountOf[oldOwner];
+        accountOf[newOwner] = WriterAccount(payable(msg.sender));
+        emit AccountRekeyed(oldOwner, newOwner, WriterAccount(payable(msg.sender)));
     }
 
     function setWritesHalted(bool halted) external onlyRole(GUARDIAN_ROLE) {
@@ -180,5 +221,29 @@ contract AccountFactory is AccessControl {
 
     function setMaxPriceAge(uint32 age) external onlyRole(DEFAULT_ADMIN_ROLE) {
         maxPriceAge = age;
+    }
+
+    function _onlyClone() internal view {
+        address owner_ = WriterAccount(payable(msg.sender)).owner();
+        if (address(accountOf[owner_]) != msg.sender) revert NotAccount();
+    }
+
+    function _enqueue(address[] storage arr, mapping(address => uint256) storage pos, address account) internal {
+        if (pos[account] != 0) return;
+        arr.push(account);
+        pos[account] = arr.length;
+    }
+
+    function _dequeue(address[] storage arr, mapping(address => uint256) storage pos, address account) internal {
+        uint256 i = pos[account];
+        if (i == 0) return;
+        uint256 last = arr.length;
+        if (i != last) {
+            address moved = arr[last - 1];
+            arr[i - 1] = moved;
+            pos[moved] = i;
+        }
+        arr.pop();
+        pos[account] = 0;
     }
 }
