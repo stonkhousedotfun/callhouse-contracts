@@ -53,7 +53,7 @@ Bounding it (a cap on unsold inventory) was rejected in favour of closing it:
   `test/regression/`, one file per finding, each asserting the FIXED behaviour on the real Valorem
   bytecode where the loss lived in Valorem's bucket engine.
 
-**What stands behind this, and what does not (decision D14).** There is no external audit. The
+**What stands behind this, and what does not (decision D14).** There is no external audit yet; one is pending (owner, 2026-09-15, reversing D14). The
 contracts are unaudited. Behind them are the internal reviews in §4 (the latest, 2026-09-14, found
 no Critical, High or Medium) and the test suite:
 `forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (405 tests;

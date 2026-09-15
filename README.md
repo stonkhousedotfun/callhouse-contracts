@@ -19,8 +19,8 @@ The vault is live on chain 4663 at `0x88a98931E3682137E7e4D3426f623247f4A4ecbb` 
 2026-09-15; its on-chain name "Callhouse NVDA" and symbol `cNVDA` date from before the rename), and
 it settles on our own Valorem Clear, `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`.
 `docs/DEPLOY.md` "Live deployment" lists every address, who holds each key and what is
-source-verified. The contracts are **unaudited**: there is no external audit (owner decision
-2026-09-13). What stands behind them is the test suite described below and the internal reviews in
+source-verified. The contracts are **unaudited**: there is no external audit yet. One is pending
+(owner, 2026-09-15; decision D14 of 2026-09-13 had ruled one out). What stands behind them is the test suite described below and the internal reviews in
 `SECURITY.md` §4, the latest on 2026-09-14 (no Critical, High or Medium findings).
 
 This repository is the contracts, and the thing any review would target. The app (keeper,
@@ -200,7 +200,7 @@ and the gate is the four commands above run locally:
 them with `set -o pipefail` when piping: a piped failure that hides behind `tee` is a passed gate
 that did not pass.
 
-There is no external audit (owner decision D14, 2026-09-13) and no separate security gauntlet.
+There is no external audit yet and no separate security gauntlet. An external audit is pending (owner, 2026-09-15; it reverses decision D14 of 2026-09-13).
 The contracts are unaudited. What stands behind them is the gate above: 405 tests including the
 five audit proofs of concept re-asserted as fixed behaviour on the real Valorem bytecode, the
 real Seaport 1.6 runtime driven through five of its eight fulfilment entrypoints, a 64 × 600 stateful campaign with a

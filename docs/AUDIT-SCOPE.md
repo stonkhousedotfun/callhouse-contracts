@@ -2,7 +2,7 @@
 
 > **Status, 2026-09-13 (branch `redesign/a2-own-strikes-2026-09-13`); deployment facts updated
 > 2026-09-15.** There is no external audit
-> and none is planned (owner decision D14). This document is the scope of the INTERNAL review that
+> yet. One is pending (owner, 2026-09-15; decision D14 had ruled it out). This document is the scope of the INTERNAL review that
 > stands behind the contracts and the description of the code for anyone who reads it looking for
 > bugs: what is in and out, what we believe is true of the code and where, what the tests prove and
 > do not, and where we think the code is weakest. It was rewritten for the 2026-09-13 redesign
@@ -1123,7 +1123,7 @@ path B, Verify 67/73/76 on path A and 71 on path B, with the negative checks. It
 prove the Safe{Wallet} UI, hardware signing, Sourcify verification, or anything after
 configuration.
 
-**What none of this proves.** No external review has been done and none is planned; these
+**What none of this proves.** No external review has been done yet (one is pending); these
 contracts are unaudited (D14). Every real-Clear and real-Seaport result is against the bytecode
 vendored from chain 4663 at one point in time, and the fork suite against the live chain at one
 block. On the live vault, as of 2026-09-15, the keeper has armed cycle 1 and authorised two
