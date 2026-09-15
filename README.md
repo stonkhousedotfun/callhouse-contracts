@@ -1,6 +1,8 @@
 # callhouse-contracts
 
-The Callhouse vault. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
+Renamed from Callhouse (callhouse.finance) to Stonkhouse (stonkhouse.fun) on 2026-09-15. Repo, package, service, env and on-chain names still say callhouse.
+
+The Stonkhouse vault. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
 
 One non-upgradeable vault on Robinhood Chain (chain id 4663) that runs a weekly covered call on
 the NVDA Stock Token: depositors put in NVDA and receive `cNVDA` shares, the keeper ARMS an
@@ -338,5 +340,5 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 
 | Repository | What it is | Relationship |
 |---|---|---|
-| leekzor/callhouse | the app: keeper, indexer, web (app.callhouse.finance), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
-| leekzor/callhouse-site | the marketing landing, callhouse.finance | none on the code path; publishes the security contact and the unaudited disclosure |
+| leekzor/callhouse | the app: keeper, indexer, web (app.stonkhouse.fun), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
+| leekzor/callhouse-site | the marketing landing, stonkhouse.fun | none on the code path; publishes the security contact and the unaudited disclosure |

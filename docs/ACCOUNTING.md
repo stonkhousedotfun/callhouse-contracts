@@ -1,6 +1,6 @@
 # Accounting
 
-The subtlest part of Callhouse. Read this before changing anything under `src/`.
+The subtlest part of Stonkhouse. Read this before changing anything under `src/`.
 
 > **Paths.** Paths resolve from the root of this repository, leekzor/callhouse-contracts. A path
 > followed by (leekzor/callhouse) lives in the app repository (keeper, indexer, web, ops and the
@@ -545,7 +545,7 @@ USDG to the vault, so gross and net premium are the same figure.
 
 | Fee | Rate | Mechanism | When |
 |---|---|---|---|
-| Callhouse | 5% of the premium (`protocolFeeBps` 500; bytecode ceiling 2000) | `pendingFeeUsdg`, pushed best-effort at `rollClose` | only when harvested premium is positive |
+| Stonkhouse | 5% of the premium (`protocolFeeBps` 500; bytecode ceiling 2000) | `pendingFeeUsdg`, pushed best-effort at `rollClose` | only when harvested premium is positive |
 | Valorem engine fee (opt-in) | 15 bps of the fill's NOTIONAL in the asset, on top of the collateral, when Clear's switch is on and governance accepted it | pulled by `clear.write` inside the fill; the fill's premium floor is raised by fee × spot | only on a fill, only with the switch on |
 
 No fee on deposits. No fee on idle collateral. **An unfilled week harvests zero and is therefore

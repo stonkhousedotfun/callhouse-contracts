@@ -71,14 +71,14 @@ one way"); the app repository's copies predate the redesign until its pin is bum
 optimisation. Review of the keeper, indexer or web code beyond the note in §4; they are not yet
 ported to write on fill.
 
-**Reporting.** `security@callhouse.finance` (SECURITY.md §6). The contracts are unaudited and a
+**Reporting.** `security@stonkhouse.fun` (SECURITY.md §6). The contracts are unaudited and a
 report is a favour, not a claim.
 
 ---
 
 ## 2. System overview and trust model
 
-Callhouse is one non-upgradeable vault on Robinhood Chain (chain id 4663) running a weekly
+Stonkhouse is one non-upgradeable vault on Robinhood Chain (chain id 4663) running a weekly
 covered-call strategy on one Robinhood Chain Stock Token, NVDA
 (`0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC`, 18 decimals, non-rebasing). Depositors put in the
 Stock Token and receive 18-decimal ERC-20 shares (`cNVDA`). Once a week the keeper creates an
@@ -1244,7 +1244,7 @@ Traps (README "Four things that will bite you"):
 
 ## 9. Reporting a finding
 
-Send it to `security@callhouse.finance` (SECURITY.md §6), with: title, severity, location
+Send it to `security@stonkhouse.fun` (SECURITY.md §6), with: title, severity, location
 (`file:line` at the commit in §1), description, impact in money terms, a proof of concept (a forge
 test on the `BaseTest` fixture in `test/Base.t.sol`, or on `RealClearBase`/`RealSeaportBase` where
 the mock would not show it), and a recommendation.

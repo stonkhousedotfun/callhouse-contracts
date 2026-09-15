@@ -410,9 +410,9 @@ Tracked in `tasks.md` (leekzor/callhouse) "Open questions":
 ## 6. Reporting
 
 If you believe you have found a vulnerability, do not open a public issue. Send it to
-**security@callhouse.finance**. The same address is published, machine-readably, at
-`https://callhouse.finance/.well-known/security.txt` (RFC 9116) and on
-`https://callhouse.finance/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` from
+**security@stonkhouse.fun**. The same address is published, machine-readably, at
+`https://stonkhouse.fun/.well-known/security.txt` (RFC 9116) and on
+`https://stonkhouse.fun/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` from
 `lib/legal.ts` (leekzor/callhouse-site), which was set 2026-09-13; the mailbox is a Cloudflare
 Email Routing forward to the operator.
 
