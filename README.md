@@ -2,22 +2,15 @@
 
 Renamed from Callhouse (callhouse.finance) to Stonkhouse (stonkhouse.fun) on 2026-09-15. Repo, package, service, env and on-chain names still say callhouse.
 
-The Stonkhouse vault. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
+Stonkhouse contracts. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
 
-One non-upgradeable vault on Robinhood Chain (chain id 4663) that runs a weekly covered call on
-the NVDA Stock Token: depositors put in NVDA and receive `cNVDA` shares, the keeper ARMS an
-out-of-the-money Valorem Clear option type each week and lists it on Seaport 1.6 with the vault as
-the order's zone, and every fill of that listing WRITES exactly the filled contracts into Valorem
-inside Seaport's `authorizeOrder` hook (**write on fill**: the vault never holds an unsold option
-token, so `written == sold` by construction). The USDG premium accrues to holders through a
-per-share index. The protocol fee is 5% of premium only; strike proceeds from an assignment are
-credited to holders fee-free. Overcall's registry, order book and venue fee belonged to the earlier
-design and are not used: the vault validates the option type from the clearinghouse itself, and its
-one venue is the app's cycle page, `app.stonkhouse.fun/vault/nvda/cycle`.
+Live product is isolated 1-NVDA accounts (`src/solo/`): `AccountFactory` clones a `WriterAccount`
+per user. The user deposits NVDA, requests N lots, and the keeper lists N full Seaport 1.6 orders
+of 1 contract on that account's own Valorem option type. A fill writes that user's NVDA and pays
+that user. Unfilled lots return at settle.
 
-The vault is live on chain 4663 at `0x88a98931E3682137E7e4D3426f623247f4A4ecbb` (deployed
-2026-09-15; its on-chain name "Callhouse NVDA" and symbol `cNVDA` date from before the rename), and
-it settles on our own Valorem Clear, `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`.
+Factory on chain 4663: `0x7850Ae4ac03b651263cE78EC5FcED11b0d0e05A7`.
+Clear: `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`. App venue: `app.stonkhouse.fun/book`.
 `docs/DEPLOY.md` "Live deployment" lists every address, who holds each key and what is
 source-verified. The contracts are **unaudited**: there is no external audit yet. One is pending
 (owner, 2026-09-15; decision D14 of 2026-09-13 had ruled one out). What stands behind them is the test suite described below and the internal reviews in
