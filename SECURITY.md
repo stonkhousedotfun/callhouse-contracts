@@ -401,7 +401,7 @@ one Informational, who holds our own Clear's fee switch, now in the admin and Cl
 
 ## 5. Open questions, and where they stand
 
-Tracked in `tasks.md` (leekzor/callhouse) "Open questions":
+Open questions, and where they stand:
 
 1. **Overcall's order book is not a venue for this vault.** Its schema requires open orders with
    zone 0 and pre-held inventory; the vault lists restricted orders with itself as zone and holds
