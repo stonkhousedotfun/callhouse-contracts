@@ -1,0 +1,11 @@
+rules:
+  - id: no-tx-origin-in-v2-source
+    languages: [solidity]
+    severity: ERROR
+    message: Do not authorize v2 contract actions with tx.origin; use an explicit caller or role check.
+    pattern: tx.origin
+  - id: no-selfdestruct-in-v2-source
+    languages: [solidity]
+    severity: ERROR
+    message: Do not add selfdestruct to v2 contract source.
+    pattern: selfdestruct(...)

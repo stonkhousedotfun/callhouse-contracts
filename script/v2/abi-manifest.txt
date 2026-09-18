@@ -1,0 +1,37 @@
+# v2 ABI manifest: every contract and interface whose ABI script/v2/export-abis.sh publishes to
+# ../callhouse/ops/abis/v2/<Name>.json (from out/<Name>.sol/<Name>.json). One name per line; # starts a comment.
+#
+# The indexer, web and keeper generators turn ops/abis/v2 into typed modules, and export-abis.sh --check fails on a
+# JSON file there that is not listed here, so this list IS the v2 ABI surface. Later tasks append their concrete
+# contracts (Clearinghouse, OrderBook, SettlementOracle, ExpiryCalendar, ChainlinkFeedSource, ...) as they land;
+# a name whose artifact is missing makes the export fail rather than publish a partial set.
+
+# Published interfaces for INTERFACE_VERSION 7; changes require coordinated ABI regeneration.
+IClearinghouse
+IOrderBook
+ISettlementOracle
+IExpiryCalendar
+IPriceSource
+IKeeperRewards
+IAutoRoller
+IPayoutAdapter
+IMakerRegistry
+IRewardsDistributor
+
+# Shared custom errors. The interfaces declare none; decoders merge these error fragments into every v2 ABI.
+V2Errors
+
+# Concrete contracts. Each replaces its interface in the generated modules (clearinghouse.ts stays clearinghouseAbi).
+ExpiryCalendar
+ChainlinkFeedSource
+UniV3TwapSource
+KeeperRewards
+SettlementOracle
+Clearinghouse
+DataStreamsSource
+OrderBook
+UniV3PayoutAdapter
+AutoRoller
+MakerVault
+MakerRegistry
+RewardsDistributor

@@ -1,0 +1,55 @@
+{
+  "source": "@openzeppelin/merkle-tree StandardMerkleTree.of, default sortLeaves",
+  "types": ["uint256", "uint256", "address", "uint256"],
+  "epoch": 2958,
+  "root": "0xbaf77ffed3c63b4f37de4ac3510116b613e912df932c670f6ddba5bc78da6cb8",
+  "total": "1750001",
+  "entries": [
+    {
+      "index": 0,
+      "account": "0x1111111111111111111111111111111111111111",
+      "amount": "700000",
+      "proof": [
+        "0xf801414971d32da630fd429d3b8247da95fb1ab5ceb81b4aeaae6102a49460de",
+        "0x0803174878d1aff982af65f1bdd80931f0e18b933275ba4af3d397859e7f4abc"
+      ]
+    },
+    {
+      "index": 1,
+      "account": "0x2222222222222222222222222222222222222222",
+      "amount": "700000",
+      "proof": [
+        "0xa3acbb9aef9512be909d85dcbe75489879aaca2ece2d6eae6c4389df9795fd3b",
+        "0x0803174878d1aff982af65f1bdd80931f0e18b933275ba4af3d397859e7f4abc"
+      ]
+    },
+    {
+      "index": 2,
+      "account": "0x3333333333333333333333333333333333333333",
+      "amount": "350000",
+      "proof": [
+        "0x4547267389e73c0fd1c5ac41ce841f27cadb17c8b938ed5938620ccd005fede7",
+        "0xd8c1cf52431e9d67e7c0744645883094dcd73e2d6e9641aba456cd49f9d20f0e"
+      ]
+    },
+    {
+      "index": 3,
+      "account": "0x4444444444444444444444444444444444444444",
+      "amount": "1",
+      "proof": [
+        "0x81a20586ddf8bcd71449a5746cbd7523c177559e1a7ebdfa1c4ed7d778ffaf6a",
+        "0xd8c1cf52431e9d67e7c0744645883094dcd73e2d6e9641aba456cd49f9d20f0e"
+      ]
+    }
+  ],
+  "tampered": {
+    "index": 0,
+    "account": "0x1111111111111111111111111111111111111111",
+    "amount": "700001",
+    "proof": [
+      "0xf801414971d32da630fd429d3b8247da95fb1ab5ceb81b4aeaae6102a49460de",
+      "0x0803174878d1aff982af65f1bdd80931f0e18b933275ba4af3d397859e7f4abc"
+    ],
+    "verifies": false
+  }
+}

@@ -33,10 +33,15 @@ fs_permissions = [
     { access = "read", path = "./script/artifacts" },
     # script/Configure.s.sol writes the Safe Transaction Builder batch here (gitignored)
     { access = "read-write", path = "./broadcast" },
+    # script/v2/EmitSeriesIds.s.sol writes series-ids.json (committed, the id vectors seriesId.ts is tested
+    # against) and test/v2/InterfaceIds.t.sol reads it back
+    { access = "read-write", path = "./test/v2/fixtures" },
 ]
 
 [profile.fork]
-match_path = "test/fork/*"
+# Both fork suites: v1's test/fork/ and v2's test/v2/fork/. `match_path` takes ONE glob, so the two directories
+# are a brace alternation; `FOUNDRY_PROFILE=fork forge test --list` shows the suites it selects.
+match_path = "test/{fork,v2/fork}/*"
 
 [profile.ci]
 verbosity = 3
