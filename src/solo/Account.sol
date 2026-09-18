@@ -201,8 +201,7 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     /// @notice Owner or keeper. Pins this week's terms so a later `setWeek` cannot move them.
     function list() external nonReentrant {
         if (
-            msg.sender != owner && msg.sender != address(factory)
-                && !factory.hasRole(factory.KEEPER_ROLE(), msg.sender)
+            msg.sender != owner && msg.sender != address(factory) && !factory.hasRole(factory.KEEPER_ROLE(), msg.sender)
         ) revert NotAuthorized();
         if (factory.writesHalted()) revert WritesAreHalted();
         if (listedLots != 0) revert AlreadyListed();

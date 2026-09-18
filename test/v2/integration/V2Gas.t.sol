@@ -236,7 +236,8 @@ contract V2GasTest is V2IntegrationBase {
         vm.warp(E + 60);
         vm.prank(keeper);
         oracle.snapshot(address(nvda), E);
-        _log("snapshot, pool records (+ SNAPSHOT bounty)", _gas(), 190_000);
+        // Includes the independent tick-price factor loop used by the TWAP source.
+        _log("snapshot, pool records (+ SNAPSHOT bounty)", _gas(), 195_000);
         vm.prank(keeper);
         oracle.snapshot(address(nvda), E);
         _log("snapshot, repeat (nothing new)", _gas(), 60_000);
