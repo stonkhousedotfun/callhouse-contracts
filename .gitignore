@@ -1,8 +1,21 @@
+# Foundry build, fork, and broadcast/rehearsal records (kept locally as evidence).
 out/
 cache/
 broadcast/
-.env
-.env.*
+
+# Local credentials; .env.example is a public template when present.
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mnemonic
+*.secret
+*.log
+
 lcov.info
 coverage/
 .DS_Store
