@@ -29,12 +29,19 @@ and the 2026-09-13 second pass found and what was done about it, kept as written
   2026-09-15 note in [§0](#0-the-2026-09-13-redesign-write-on-fill-no-registry) that an external audit
   was pending, and it is what [the v1 record's D14](#4-the-2026-09-12-adversarial-review) now reads
   against.
-- **No v8 contract is deployed anywhere.** Every v8 `--broadcast` is owner-gated. The **v7** set is
-  live on chain 4663 — thirteen contracts at `v2.deployBlock` 65780341, deployed 2026-09-18 from commit
-  `1b087550cfc92fd1878e5f1c0feaabaa91dc415f` and pinned in `script/artifacts/v2-4663/manifest.json`
-  ([docs/DEPLOY-V2.md](docs/DEPLOY-V2.md), "Pinned deployed runtimes") — and v8 is a full redeploy
-  beside it, after which v7 is frozen and run off like v1 (owner decisions V3-D1 and V3-D8). Nothing on
-  this page describes code that is running on chain today.
+- **The v8 set is deployed on chain 4663.** It was deployed on 2026-09-22 from commit
+  `aeab59779b994ddad97df5b10c9b2383defab0b0`, whose `src/` tree is identical to this commit's, at the
+  registry's `v2.deployBlock` 69512673. `Clearinghouse` is `0x1A67948175DFf13426F0d61bfB483579D2ff2EeE`
+  and `createPaused()` reads `false`. The launch set is NVDA and SPCX; the other markets in the app
+  registry are not part of it. **So this page describes code that is running on chain today.**
+  Two qualifications, both measured rather than planned:
+  `script/artifacts/v2-4663/manifest.json` has **not** been re-pinned — it still records the v7 set at
+  `v2.deployBlock` 65780341 from `1b087550cfc92fd1878e5f1c0feaabaa91dc415f`
+  ([docs/DEPLOY-V2.md](docs/DEPLOY-V2.md), "Pinned deployed runtimes") — so the pinned-runtime check
+  does not yet cover a v8 address. And the **v7** set is still live beside v8 and has **not** been
+  frozen: its `Clearinghouse` `0x22dEf851cD1a3B04Ad7d232bE786d76E6944d424` still returns
+  `createPaused() == false`. Freezing it and running it off is owner decisions V3-D1 and V3-D8, and
+  has not happened.
 - **No bug bounty** ([§6](#6-reporting)). V3-D33 puts a follow-up review and a bug bounty at $1 M TVL.
 - **The v8 migration is half landed in this tree, and this page says where.** `OrderBook` still carries
   v7's `onlyRole(DEFAULT_ADMIN_ROLE)` on all five of its setters

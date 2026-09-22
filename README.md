@@ -6,7 +6,7 @@ Stonkhouse contracts. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
 
 Two generations of contracts live here:
 
-- **v2** (`src/v2/`, integration branch `v2`, not deployed): one `Clearinghouse` for every market
+- **v2** (`src/v2/`, integration branch `v2`, deployed on chain 4663 at INTERFACE_VERSION 8): one `Clearinghouse` for every market
   with fungible ERC-1155 long and short tokens of shared series, an on-chain `OrderBook`, a
   `SettlementOracle` that settles on a 30-minute TWAP with a fallback chain (every constant with its test:
   [`docs/V2-ARCHITECTURE.md` §2.4](docs/V2-ARCHITECTURE.md#24-values-no-role-can-change)), automatic payout, and the
@@ -339,10 +339,14 @@ generated copies in `indexer/` and `web/` (stonkhousedotfun/callhouse). The keep
 
 ## Deploying
 
-**v2** is not deployed. The production deploy, configure and verify scripts are not on `v2` yet, and
-the mainnet deploy is owner-gated. `script/v2/DevDeploy.s.sol` deploys the core set on a local anvil
-fork of 4663 for the devnet only (`ops/devnet/up.sh` (stonkhousedotfun/callhouse)); it refuses any other
-node.
+**v2 is deployed on chain 4663** at INTERFACE_VERSION 8, on 2026-09-22, from commit
+`aeab59779b994ddad97df5b10c9b2383defab0b0` — `src/` identical to this commit — at the app registry's
+`v2.deployBlock` 69512673. `Clearinghouse` is `0x1A67948175DFf13426F0d61bfB483579D2ff2EeE`; the launch
+set is NVDA and SPCX. The deploy, configure and verify scripts are `script/v2/` (`DeployV8`,
+`RegisterMarkets`, `VerifyV2`); every further mainnet `--broadcast` remains owner-gated.
+`script/artifacts/v2-4663/manifest.json` still pins the **v7** runtimes and has not been re-pinned for
+v8. `script/v2/DevDeploy.s.sol` deploys the core set on a local anvil fork of 4663 for the devnet only
+(`ops/devnet/up.sh` (stonkhousedotfun/callhouse)); it refuses any other node.
 
 **v1:** `SeaportOrderLib` and `ValoremLib` are `public` libraries and must be deployed and linked before
 the vault. Foundry does this automatically during `forge script`; to link manually pass
