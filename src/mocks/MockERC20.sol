@@ -64,6 +64,11 @@ contract MockERC20 is ERC20 {
 
     /// @notice The live `decreaseSupplyFromAddress`: a supply controller burns from ANY address with
     ///         no allowance. Reverts `AddressFrozen` when the target is frozen; works while paused.
+    /// @notice ERC-20 burn of the caller's own balance. Used by V4BuybackExecutor.execute.
+    function burn(uint256 amount) external {
+        _burn(msg.sender, amount);
+    }
+
     function burnFrom(address from, uint256 amount) external {
         if (!isSupplyController[msg.sender]) revert NotSupplyController(msg.sender);
         if (_frozen[from]) revert AddressFrozen();

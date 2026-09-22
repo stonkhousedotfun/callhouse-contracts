@@ -295,7 +295,7 @@ contract ClearinghouseSettleTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory cfg = _cfg(address(oracle));
         cfg.exerciseFeeBps = V2Constants.EXERCISE_FEE_CEIL_BPS;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
         uint256 later = _call(K_220, FRI_2026_09_18);
         _write(alice, later, 10, bob);
 
@@ -314,7 +314,7 @@ contract ClearinghouseSettleTest is ClearinghouseTestBase {
         MockSettlementOracle other = new MockSettlementOracle();
         other.setSettlement(address(nvda), FRI_2026_09_18, V2Types.SettlementStatus.Finalized, 999e6);
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), _cfg(address(other)));
+        _reconfigure(ch, address(nvda), _cfg(address(other)));
 
         _settle(callId, 250e6);
         assertEq(ch.series(callId).settlementPrice, 250e6, "read from the pinned oracle");
@@ -348,7 +348,7 @@ contract ClearinghouseSettleTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory off = _cfg(address(oracle));
         off.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), off);
+        _reconfigure(ch, address(nvda), off);
         _settle(callId, 250e6);
     }
 

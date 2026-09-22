@@ -439,7 +439,7 @@ Token leg with `safeTransfer` and then attempts the USDG leg with a raw call. `o
 `completeRedeem` (to the same or another receiver) collects it. A call with nothing left but a
 blocked USDG leg reverts `UsdgLegBlocked(usdgOwed)` rather than pretending nothing was queued. A
 Stock Token pause still reverts the whole call: there is nothing to pay principal with, and the USDG
-waits behind it (AUDIT-SCOPE §5 A.2).
+waits behind it (AUDIT-SCOPE-V1.md §5 A.2).
 
 **The reserve is haircut pro rata when it is unbacked (AUDIT-FINDINGS F-05).** `reservedAssets` is a
 claim on the idle balance, senior to live shares (§1). The issuer's `adminBurn` can take the balance

@@ -53,8 +53,14 @@ library V2Constants {
     /// @dev createSeries: now + MIN_SERIES_LEAD <= expiry.
     uint40 internal constant MIN_SERIES_LEAD = 1 hours;
     /// @dev OrderBook.setFeeParams schedules new fee parameters; they take effect once block.timestamp >= the
-    ///      scheduling call's timestamp + FEE_CHANGE_DELAY.
-    uint40 internal constant FEE_CHANGE_DELAY = 24 hours;
+    ///      scheduling call's timestamp + FEE_CHANGE_DELAY. INTERFACE_VERSION 8 raised this from 24 h to 48 h
+    ///      (owner decision V3-D13). It is the window makers and takers see ON CHAIN; the AccessManager's own 48 h
+    ///      FEE_MANAGER execution delay is what the Admin Safe waits BEFORE the change is even scheduled, so a fee
+    ///      change is visible for 48 h and then takes another 48 h to bite.
+    uint40 internal constant FEE_CHANGE_DELAY = 48 hours;
+    /// @dev Least time between two FeeSplitter buybacks (INTERFACE_VERSION 8). Compiled, not configurable: it exists
+    ///      so 50-USDG buys cannot be stacked into one sandwichable block. uint40 like every other time offset here.
+    uint40 internal constant BUYBACK_COOLDOWN = 5 minutes;
     /// @dev The period the collateral rent of {Clearinghouse.mint} is quoted per: a series' mintFeePpm is millionths
     ///      of the locked collateral per this much REMAINING life, charged pro rata over the time left to expiry and
     ///      refunded pro rata by {Clearinghouse.close} (INTERFACE_VERSION 7). uint40 like `expiry`, so
@@ -93,6 +99,48 @@ library V2Constants {
     uint32 internal constant MINT_FEE_CEIL_PPM = 5_000;
 
     /*//////////////////////////////////////////////////////////////
+              FEE DISCOUNT SEAM (INTERFACE_VERSION 8, design §7)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Largest taker-fee discount an IFeeDiscount module can ever grant: 50 % of the taker fee. A larger answer
+    ///      is clamped to this, so a compromised or buggy module cannot zero the taker fee. uint16 bps like every
+    ///      other bps ceiling, so it compares with the module's uint16 answer without a cast.
+    uint16 internal constant MAX_DISCOUNT_BPS = 5_000;
+    /// @dev Gas forwarded to the discount module's `discountBps` staticcall, ONCE per take. Same pattern and budget
+    ///      as the OrderBook's REBATE_READ_GAS: a module answering from one mapping slot fits, and a read that needs
+    ///      more (or reverts, or returns short) counts as no discount.
+    uint256 internal constant DISCOUNT_READ_GAS = 30_000;
+
+    /*//////////////////////////////////////////////////////////////
+             JUST-IN-TIME FUNDING (INTERFACE_VERSION 8, design §8.2)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Gas forwarded to each IFundingSource.fund call in the OrderBook's pre-fund stage. Enough for a venue
+    ///      withdrawal plus a Clearinghouse deposit; a source that needs more simply delivers nothing and its orders
+    ///      are skipped, exactly as an under-collateralised AskWrite is today.
+    uint256 internal constant FUNDING_GAS = 400_000;
+    /// @dev Gas forwarded to IFundingSource.fundable in quoteTake, per (maker, asset) staticcall. A revert, an
+    ///      out-of-gas or short return data counts as 0, which quotes the maker at its real free balance.
+    uint256 internal constant FUNDABLE_READ_GAS = 50_000;
+    /// @dev Most makers one take will fund. Bounds the pre-fund stage's gas; funded makers beyond this are planned
+    ///      WITHOUT funding rather than skipped, so a big take still fills on real balances.
+    uint256 internal constant MAX_FUNDED_MAKERS_PER_TAKE = 4;
+
+    /*//////////////////////////////////////////////////////////////
+               FLYWHEEL (INTERFACE_VERSION 8, design §6)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Compiled ceiling of FeeSplitter's CONFIGURED per-call buyback cap: 1,000 USDG (owner answer Q7). The
+    ///      launch value is 50 USDG. The `C3-602` fork spike measured total loss 2.01 % at 1 USDG, 2.20 % at 50 and
+    ///      5.60 % at 1,000, so this is the point past which a single buy stops being a price-taker. There is no
+    ///      daily cap, by the same owner decision; BUYBACK_COOLDOWN is what stops stacking.
+    uint256 internal constant BUYBACK_CAP_CEIL = 1_000_000_000;
+    /// @dev Largest hook fee V4BuybackExecutor will trade through, bps of the swap. The pinned STONKHOUSE pool's hook
+    ///      charges 100 bps plus a 100 bps creator tax, frozen at its registration; a pool reporting more than this
+    ///      is not the venue the executor was pinned against, so a buy refuses rather than trying to price it.
+    uint16 internal constant MAX_HOOK_FEE_BPS = 300;
+
+    /*//////////////////////////////////////////////////////////////
                           PRICE SOURCES (ADR-05)
     //////////////////////////////////////////////////////////////*/
 
@@ -108,8 +156,19 @@ library V2Constants {
     uint256 internal constant MIN_POOL_OBSERVATION_CARDINALITY = uint256(SETTLEMENT_WINDOW) + SNAPSHOT_GRACE + 1;
 
     /*//////////////////////////////////////////////////////////////
-                               ROLES (ADR-09)
+                     ROLES (ADR-09) -- v7 ONLY, BEING REMOVED
     //////////////////////////////////////////////////////////////*/
+
+    /// INTERFACE_VERSION 8 REPLACES THIS WHOLE BLOCK. Roles are no longer per-contract `bytes32` AccessControl ids:
+    /// one OpenZeppelin `AccessManager` maps `(target, selector) -> uint64 role` and enforces a per-member execution
+    /// delay. The v8 ids and delays are `src/v2/access/V8Roles.sol` and `script/v2/roles.v8.json`.
+    ///
+    /// The four constants below still exist ONLY because the targets have not migrated to `Managed` yet: each of
+    /// `C8-01` (ExpiryCalendar, MakerRegistry), `C8-02` (Clearinghouse), `C8-03` (OrderBook), `C8-04` (oracle stack,
+    /// KeeperRewards) and `C8-05` (AutoRoller, MakerVault, RewardsDistributor) deletes its own uses, and the LAST of
+    /// them deletes these four declarations and the `test_constants_roles` pin with them. Nothing v8 reads them; no
+    /// new code may use them.
+    // v8-stub: C8-01..C8-05 -- delete with the last AccessControl target.
 
     /// @dev OpenZeppelin AccessControl's admin role (0x00): markets, fee params, fee recipient, pointers for NEW
     ///      series, KeeperRewards funding, adminResolve.
@@ -139,4 +198,10 @@ library V2Constants {
     /// @dev AutoRoller.cancelStale withdrew a tracked ask the spot had reached, with at least minRollUnits left
     ///      (INTERFACE_VERSION 7). 0x7bf1982cc047ace888325e61ec5f1e6f173a1d0d7f3d38fc1a42c4776bd35d2b.
     bytes32 internal constant ACTION_CANCEL_STALE = keccak256("CANCEL_STALE");
+    /// @dev FeeSplitter.distribute converted or split a non-zero amount (INTERFACE_VERSION 8). KeeperRewards accepts
+    ///      any action id and holds no cooldown logic, so the two flywheel actions need no KeeperRewards code at all:
+    ///      they are ids and nothing else, and the cooldowns live in the splitter and the executor.
+    bytes32 internal constant ACTION_DISTRIBUTE = keccak256("DISTRIBUTE");
+    /// @dev FeeSplitter.buyback bought back and burned (INTERFACE_VERSION 8).
+    bytes32 internal constant ACTION_BUYBACK = keccak256("BUYBACK");
 }

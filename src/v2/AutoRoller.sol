@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {Managed} from "./access/Managed.sol";
 import {IAutoRoller} from "./interfaces/IAutoRoller.sol";
 import {IClearinghouse} from "./interfaces/IClearinghouse.sol";
 import {IExpiryCalendar} from "./interfaces/IExpiryCalendar.sol";
@@ -56,6 +57,17 @@ import {OptionMath} from "./lib/OptionMath.sol";
 ///      collateral, and none of them re-rolls inside the period: a rally costs the writer the rest of the period's
 ///      premium and leaves it holding the stock.
 ///
+///      WHICH ORACLE JUDGES A SERIES THAT EXISTS (T-310). `createSeries` pins the market's oracle of the moment into
+///      the series (`Series.oracle`) and {Clearinghouse.settle} settles it on that one, so a CONFIG_ADMIN
+///      `setMarketOracle` only ever reaches series created after it. Every check this contract makes on a series that
+///      already exists therefore reads the SERIES' PINNED ORACLE, resolved in one place ({_pinned}): {cancelStale}'s
+///      trigger, {reprice}'s InTheMoney test and band, and {roll}'s out-of-the-money check when the series it plans
+///      was created earlier by someone else. Only the plan itself (spot, strike, price) reads the market's current
+///      oracle, because a series the roll creates is pinned to exactly that oracle. Reading
+///      `clearinghouse.market(underlying).oracle` for an existing series would judge it against a price it never
+///      settles on: whenever the two oracles disagree, that either keeps an in-the-money ask resting and repriceable
+///      or withdraws one that is still out of the money.
+///
 ///      WHAT A CALLER CAN AND CANNOT CHOOSE. strike, price and expiry are functions of the strategy, the market's
 ///      strikeTick and the oracle's spot at the moment of the call; size is the writer's free collateral (capped by
 ///      maxUnits). A caller chooses only WHEN inside a regular session to call, which moves the result only as far as
@@ -71,7 +83,8 @@ import {OptionMath} from "./lib/OptionMath.sol";
 ///      RETURN VALUE VS REVERT. {roll} returns false for "nothing to do now", which a keeper loop hits routinely: the
 ///      period is already rolled, the previous series is not settled yet, outside the regular session, inside the first
 ///      {ROLL_OPEN_GRACE} of a session on a spot observed before the session opened, spot not fresh
-///      (SettlementOracle.trySpot not ok), no expiry found, or nothing to write. It reverts for states only the writer,
+///      (SettlementOracle.trySpot not ok), no expiry found, nothing to write, or a planned series that already exists
+///      on another oracle which does not have it fresh and out of the money. It reverts for states only the writer,
 ///      the admin or the guardian can change: a missing approval (NotAuthorized), a disabled or mint-paused market
 ///      (MarketDisabled, MintPaused), book trading or series creation paused (TradingPaused, CreatePaused), or a writer
 ///      who opted out of third-party redemption and revoked the roller (ThirdPartyRedeemDisabled). A keeper simulates
@@ -84,11 +97,22 @@ import {OptionMath} from "./lib/OptionMath.sol";
 ///      ROLL bounty is paid by KeeperRewards straight to the caller, only for a roll that places at least
 ///      {minRollUnits} (architecture §3.7), through a raw call that cannot revert the roll.
 ///
-///      TRUST (ADR-09). DEFAULT_ADMIN_ROLE sets the bounty payer and {minRollUnits} and grants PRICER_ROLE. PRICER_ROLE
-///      can only replace a smart-pricing writer's live ask at a price inside the writer's own [minAskBps, maxAskBps]
-///      band of spot, keeping its size and expiry. No role can roll a writer into anything the strategy does not say,
-///      or touch collateral. Calls only in v2.0.
-contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
+///      TRUST (ADR-09, INTERFACE_VERSION 8). The roller is {Managed}: it holds no role table of its own and grants
+///      nothing. One `AccessManager` maps (this contract, selector) to a role id, per `script/v2/roles.v8.json`:
+///      `setKeeperRewards` is CONFIG_ADMIN (24 h), `setMinRollUnits` is LISTING (1 h) and {reprice} is PRICER (0).
+///      PRICER can only replace a smart-pricing writer's live ask at a price inside the writer's own
+///      [minAskBps, maxAskBps] band of spot -- never below MIN_ASK_BPS of spot, and never more than
+///      MAX_REPRICE_DROP_BPS below the ask it replaces in one call (SEC-13) -- keeping its size and expiry. No role
+///      can roll a writer into anything the strategy does not say, or touch collateral. {setStrategy}, {stop}, {roll}
+///      and {cancelStale} carry no role at all: the first two are the writer's own, the last two are permissionless
+///      keeper calls. Calls only in v2.0.
+contract AutoRoller is IAutoRoller, Managed, ReentrancyGuardTransient {
+    /// @notice {reprice} asked for `proposed` against a live ask at `current`, below the lowest price one call may
+    ///         reach, `floor = current x (BPS - MAX_REPRICE_DROP_BPS) / BPS`, rounded up to the price tick.
+    /// @dev Declared here rather than in `V2Errors` / `IAutoRoller` (both outside T-OP-063's fence); moving it is a
+    ///      one-line follow-up that does not change its selector.
+    error RepriceDropExceeded(uint128 current, uint128 proposed, uint256 floor);
+
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
@@ -96,8 +120,22 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     /// @notice Strategy bounds, bps of spot: strike distance above spot and ask price (architecture §3.8).
     uint16 public constant MIN_OTM_BPS = 100;
     uint16 public constant MAX_OTM_BPS = 2500;
-    uint16 public constant MIN_ASK_BPS = 5;
+    /// @dev SEC-13, owner ruling 2026-09-22 (T-OP-063): the compiled floor under every ask, including the floor of a
+    ///      smart-pricing writer's [minAskBps, maxAskBps] band. Was 5 (0.05 % of spot), which let a leaked 0-delay
+    ///      PRICER key reprice a live ask to a twentieth of a percent of spot in one call for any writer who never
+    ///      raised `minAskBps` -- premium gone, principal safe. 50 (0.5 %) is the coordinator's number and the owner
+    ///      may retune it; it is a compiled floor rather than a per-writer default because the finding is the key,
+    ///      not the writer. Consumers that pin the value: `script/v2/VerifyV8.s.sol`, `V2DocsNumbersTest`.
+    uint16 public constant MIN_ASK_BPS = 50;
     uint16 public constant MAX_ASK_BPS = 1000;
+    /// @notice The most a single {reprice} may LOWER an ask, bps of the ask it replaces: the new price must be at least
+    ///         `(BPS - MAX_REPRICE_DROP_BPS) / BPS` of the current one. Raising is not bounded.
+    /// @dev SEC-13, owner ruling 2026-09-22 (T-OP-063). With the band alone a leaked PRICER key reaches a writer's
+    ///      floor in ONE call; with this cap it takes several, each a `Repriced` event the monitor pages on (ops/
+    ///      alerts.md §V62: `v2_mon_reprice_floorward` and `v2_mon_reprice_foreign_sender` error, `v2_mon_repriced`
+    ///      warn; T-OP-090), so the key can be revoked (OPS_ADMIN, delay 0) before the ask is at the floor. 2_500 (a
+    ///      quarter per call) is the coordinator's number; the owner may retune it. NOT a cooldown: a key can wait.
+    uint16 public constant MAX_REPRICE_DROP_BPS = 2_500;
 
     /// @notice Shortest time from a roll to the expiry it writes, seconds. A daily roll keeps at least 1.5 h of
     ///         trading before the mint cutoff (expiry - SETTLEMENT_WINDOW); a weekly roll on the weekly's own day
@@ -113,9 +151,12 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     ///      a 13:00 early close.
     uint40 public constant ROLL_OPEN_GRACE = 30 minutes;
 
-    /// @notice {minRollUnits} at deploy: one whole share, 0.01-share units.
+    /// @notice {minRollUnits} at deploy, and the lowest value {setMinRollUnits} accepts: one whole share, 0.01-share
+    ///         units.
     /// @dev The ROLL bounty is sized near gas cost; paying it for dust rolls would make one-unit strategies worth
-    ///      farming.
+    ///      farming. A floor, not only a default: every successful roll places at least one unit, so a threshold of
+    ///      0 or 1 would pay every roll and erase the guard. Stopping ROLL or CANCEL_STALE payments is done at the
+    ///      payer instead: KeeperRewards.setBounty(action, 0), setCaller(roller, false), or {setKeeperRewards}(0).
     uint64 public constant DEFAULT_MIN_ROLL_UNITS = 100;
 
     /*//////////////////////////////////////////////////////////////
@@ -162,9 +203,9 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice DEFAULT_ADMIN_ROLE set the ROLL bounty payer (address(0) disables the bounty).
+    /// @notice CONFIG_ADMIN set the ROLL bounty payer (address(0) disables the bounty).
     event KeeperRewardsSet(address indexed keeperRewards);
-    /// @notice DEFAULT_ADMIN_ROLE set the ROLL bounty threshold, 0.01-share units.
+    /// @notice LISTING set the ROLL bounty threshold, 0.01-share units.
     event MinRollUnitsSet(uint256 units);
 
     /*//////////////////////////////////////////////////////////////
@@ -172,15 +213,14 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     //////////////////////////////////////////////////////////////*/
 
     /// @param orderBook_ The OrderBook; its `clearinghouse()` becomes {clearinghouse}, so the two can never disagree.
-    /// @param admin Receives DEFAULT_ADMIN_ROLE (NotAuthorized when zero). It grants PRICER_ROLE with grantRole.
-    constructor(IOrderBook orderBook_, address admin) {
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
+    /// @param authority_ The `AccessManager` that gates the three privileged selectors (`NoSource` when it has no
+    ///        code). INTERFACE_VERSION 8: no role is granted here and none is held here.
+    constructor(IOrderBook orderBook_, address authority_) Managed(authority_) {
         IClearinghouse ch = IClearinghouse(orderBook_.clearinghouse());
         orderBook = orderBook_;
         clearinghouse = ch;
         usdg = ch.usdg();
         minRollUnits = DEFAULT_MIN_ROLL_UNITS;
-        _grantRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
         emit MinRollUnitsSet(DEFAULT_MIN_ROLL_UNITS);
     }
 
@@ -258,7 +298,10 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     ///      (2) ROLL. With an active strategy and no position: inside the regular session, past the open grace or on a
     ///      reading observed in session that day, with a fresh spot, an expiry `nextExpiry(now + minLead, weekly)`, and
     ///      at least one unit of free collateral NET OF RENT, create the series and place
-    ///      `placeFor(writer, longId, AskWrite, price, units, 0)` (valid until the mint cutoff). Emits {Rolled}; pays
+    ///      `placeFor(writer, longId, AskWrite, price, units, 0)` (valid until the mint cutoff). The plan reads the
+    ///      market's current oracle; when the planned series already exists on a different oracle (created before a
+    ///      `setMarketOracle`), that pinned oracle must also have a fresh spot short of the strike, or the roll waits
+    ///      (T-310), so the ask is out of the money on the price it settles on. Emits {Rolled}; pays
     ///      the ROLL bounty when units >= minRollUnits. Size is `free / (UNIT + rent per unit)` (INTERFACE_VERSION 7),
     ///      so a writer who deposits exactly N shares writes `N x 100 - 1` units unless the deposit carries rent
     ///      headroom, and the whole ask can always fill.
@@ -305,17 +348,24 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     ///
     ///      GATE, in this order, each of them a plain `return false` so a keeper loop can call it blindly: a tracked
     ///      ask (`orderId != 0`), the position's own expiry still ahead, the order live (not cancelled, not fully
-    ///      filled, not past its validUntil), a fresh spot ({_trySpot} ok: source 0 answered, the observation is
-    ///      within the market's spotMaxAge, the issuer's oracle is not paused and the price is non-zero) and that spot
-    ///      at or past the strike ({_overtaken}, no margin).
+    ///      filled, not past its validUntil), a fresh spot FROM THE SERIES' PINNED ORACLE ({_pinned}, then {_trySpot}
+    ///      ok: source 0 answered, the observation is within that oracle's spotMaxAge for the underlying, the issuer's
+    ///      oracle is not paused and the price is non-zero) and that spot at or past the strike ({_overtaken}, no
+    ///      margin).
+    ///
+    ///      THE PINNED ORACLE, NOT THE MARKET'S (T-310): the series settles on the oracle `createSeries` pinned into
+    ///      it, so that is the price that decides whether the ask is in the money. After a `setMarketOracle` the
+    ///      market's current oracle is one this series never settles on, and it is not read here at all.
     ///
     ///      FRESHNESS IS {_trySpot} AND NOTHING MORE, deliberately. Source 0's `updatedAt` never goes backwards, so
     ///      any reading that triggers was observed after the roll placed the ask; a session-only bound would refuse to
-    ///      cancel overnight and at weekends, when the book still trades. A reading older than the market's spotMaxAge
-    ///      is not ok and does not count.
+    ///      cancel overnight and at weekends, when the book still trades. A reading older than the pinned oracle's
+    ///      spotMaxAge is not ok and does not count.
     ///
     ///      NO MARGIN, and placement can never trigger it: a roll places at `strike >= ceil(spot x (1 + otmBps))` with
-    ///      otmBps at least {MIN_OTM_BPS}, so a freshly placed ask is always strictly out of the money.
+    ///      otmBps at least {MIN_OTM_BPS}, and when the series it lands on is pinned to another oracle it places only
+    ///      while that oracle's spot is short of the strike too, so a freshly placed ask is always strictly out of the
+    ///      money on the oracle read here.
     ///
     ///      EFFECTS BEFORE THE INTERACTION: `orderId` is cleared before the book is called. The cancel is a DIRECT
     ///      call, not a try/catch: a writer who revoked the roller as delegate makes this revert NotAuthorized (the
@@ -329,7 +379,7 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     ///
     ///      PAUSES: this runs under the trading, mint and create pauses and on a disabled market, because
     ///      OrderBook.cancel is never pausable and withdrawing an ask only ever reduces risk. It returns false while
-    ///      the market's oracle is paused or reverting. It moves no collateral and no USDG but the bounty.
+    ///      the series' pinned oracle is paused or reverting. It moves no collateral and no USDG but the bounty.
     function cancelStale(address writer, address underlying) external nonReentrant returns (bool) {
         Position storage pos = _positions[writer][underlying];
         uint256 orderId = pos.orderId;
@@ -340,8 +390,8 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
         if (o.cancelled || remaining == 0 || block.timestamp >= o.validUntil) return false;
 
         uint256 longId = pos.longId;
-        V2Types.Series memory s = clearinghouse.series(longId);
-        (bool ok, uint256 spotPrice, uint256 updatedAt) = _trySpot(clearinghouse.market(underlying).oracle, underlying);
+        (V2Types.Series memory s, address pinnedOracle) = _pinned(longId);
+        (bool ok, uint256 spotPrice, uint256 updatedAt) = _trySpot(pinnedOracle, underlying);
         if (!ok || !_overtaken(s.isPut, s.strike, spotPrice)) return false;
 
         pos.orderId = 0;
@@ -354,31 +404,48 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IAutoRoller
-    /// @dev Checks in order: PRICER_ROLE, strategy active with smartPricing (both NotAuthorized), a tracked ask
-    ///      (OrderNotLive(0)), spot from the market's oracle (`spot`: NoSource / StaleSpot), the band
-    ///      `minAskBps x spot <= newPrice x BPS <= maxAskBps x spot` (BadPrice, inclusive, exact). The book then
-    ///      replaces the ask with the same remaining units and validUntil (OrderNotLive when it is filled, cancelled or
-    ///      past its cutoff; BadPrice off the PRICE_TICK grid; TradingPaused; NotAuthorized once the writer revoked the
-    ///      delegate).
+    /// @dev Checks in order: PRICER through the manager, strategy active with smartPricing (both NotAuthorized), a
+    ///      tracked ask (OrderNotLive(0)), spot from the series' pinned oracle ({_pinned}; `spot`: NoSource /
+    ///      StaleSpot), the band `minAskBps x spot <= newPrice x BPS <= maxAskBps x spot` (BadPrice, inclusive,
+    ///      exact), then SEC-13's per-call drop cap against the live ask's own price:
+    ///      `newPrice x BPS >= o.price x (BPS - MAX_REPRICE_DROP_BPS)` (RepriceDropExceeded, inclusive; a raise is
+    ///      never bounded). The book then replaces the ask with the same remaining units and validUntil (OrderNotLive
+    ///      when it is filled, cancelled or past its cutoff; BadPrice off the PRICE_TICK grid; TradingPaused;
+    ///      NotAuthorized once the writer revoked the delegate).
+    ///      THE CAP READS THE ORDER, NOT THE STRATEGY. The band is the writer's; the cap is relative to whatever the
+    ///      ask is NOW, so reaching a band floor from the initial ask takes `ceil(log(floor/ask) / log(0.75))` calls
+    ///      -- for the default 150 -> 50 bps that is four -- each of them an event.
     ///      INTERFACE_VERSION 7: InTheMoney sits between the spot read and the band (v7 design §4.5.2). The band is
     ///      `newPrice <= maxAskBps` of spot, at most 10 %, so once the spot has reached the strike every price the band
     ///      allows is below intrinsic value; repricing there would only make the loss cheaper to take. The ask is
     ///      withdrawn instead, with {cancelStale}, which anyone may call.
-    function reprice(address writer, address underlying, uint128 newPrice) external nonReentrant {
-        if (!hasRole(V2Constants.PRICER_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    ///      THE PINNED ORACLE, NOT THE MARKET'S (T-310), for both the InTheMoney test and the band: they judge an ask on
+    ///      an existing series, which settles on the oracle `createSeries` pinned into it. It is the same spot
+    ///      {cancelStale} reads, so the two can never disagree about whether an ask is in the money.
+    function reprice(address writer, address underlying, uint128 newPrice) external nonReentrant restricted {
         V2Types.Strategy memory s = _strategies[writer][underlying];
         if (!s.active || !s.smartPricing) revert V2Errors.NotAuthorized();
         Position storage pos = _positions[writer][underlying];
         uint256 oldOrderId = pos.orderId;
         if (oldOrderId == 0) revert V2Errors.OrderNotLive(0);
 
-        (uint256 spotPrice,) = ISettlementOracle(clearinghouse.market(underlying).oracle).spot(underlying);
-        V2Types.Series memory series = clearinghouse.series(pos.longId);
+        (V2Types.Series memory series, address pinnedOracle) = _pinned(pos.longId);
+        (uint256 spotPrice,) = ISettlementOracle(pinnedOracle).spot(underlying);
         if (_overtaken(series.isPut, series.strike, spotPrice)) revert V2Errors.InTheMoney();
         uint256 scaled = uint256(newPrice) * V2Constants.BPS;
         if (scaled < spotPrice * s.minAskBps || scaled > spotPrice * s.maxAskBps) revert V2Errors.BadPrice();
 
         V2Types.Order memory o = orderBook.getOrders(_single(oldOrderId))[0];
+        if (uint256(newPrice) * V2Constants.BPS < uint256(o.price) * (V2Constants.BPS - MAX_REPRICE_DROP_BPS)) {
+            revert RepriceDropExceeded(
+                o.price,
+                newPrice,
+                OptionMath.roundUpToTick(
+                    Math.ceilDiv(uint256(o.price) * (V2Constants.BPS - MAX_REPRICE_DROP_BPS), V2Constants.BPS),
+                    V2Constants.PRICE_TICK
+                )
+            );
+        }
         uint256 newOrderId = orderBook.replace(oldOrderId, newPrice, o.units - o.filled);
         pos.orderId = SafeCast.toUint64(newOrderId);
         emit Repriced(writer, underlying, oldOrderId, newOrderId, newPrice);
@@ -388,17 +455,18 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
                                  ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Sets the ROLL bounty payer. DEFAULT_ADMIN_ROLE. This contract must be registered there as a caller.
+    /// @notice Sets the ROLL bounty payer. CONFIG_ADMIN (24 h). This contract must be registered there as a caller.
     /// @param rewards KeeperRewards contract (NoSource when non-zero without code), or address(0) to pay nothing.
-    function setKeeperRewards(address rewards) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setKeeperRewards(address rewards) external nonReentrant restricted {
         if (rewards != address(0) && rewards.code.length == 0) revert V2Errors.NoSource();
         keeperRewards = IKeeperRewards(rewards);
         emit KeeperRewardsSet(rewards);
     }
 
-    /// @notice Sets the ROLL bounty threshold. DEFAULT_ADMIN_ROLE.
-    /// @param units 0.01-share units a roll must place to pay the bounty.
-    function setMinRollUnits(uint64 units) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    /// @notice Sets the ROLL bounty threshold. LISTING (1 h).
+    /// @param units 0.01-share units a roll must place to pay the bounty (BadUnits below DEFAULT_MIN_ROLL_UNITS).
+    function setMinRollUnits(uint64 units) external nonReentrant restricted {
+        if (units < DEFAULT_MIN_ROLL_UNITS) revert V2Errors.BadUnits();
         minRollUnits = units;
         emit MinRollUnitsSet(units);
     }
@@ -424,20 +492,17 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
         return (pos.longId, pos.orderId, pos.expiry);
     }
 
-    /// @notice ERC-165: IAutoRoller, IAccessControl, IERC165.
-    function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
-        return interfaceId == type(IAutoRoller).interfaceId || super.supportsInterface(interfaceId);
+    /// @notice ERC-165: IAutoRoller and IERC165 only.
+    /// @dev INTERFACE_VERSION 8: {Managed} declares no `supportsInterface`, so the roller no longer reports
+    ///      `type(IAccessControl).interfaceId`. That is deliberate -- roles are not on this target any more, and a
+    ///      consumer that feature-detected AccessControl to find the admin must read the manager instead.
+    function supportsInterface(bytes4 interfaceId) public pure returns (bool) {
+        return interfaceId == type(IAutoRoller).interfaceId || interfaceId == type(IERC165).interfaceId;
     }
 
     /*//////////////////////////////////////////////////////////////
                                 INTERNALS
     //////////////////////////////////////////////////////////////*/
-
-    /// @dev Every role check reverts with the shared v2 error, so the one error ABI consumers merge decodes it. Covers
-    ///      grantRole / revokeRole as well.
-    function _checkRole(bytes32 role, address account) internal view override {
-        if (!hasRole(role, account)) revert V2Errors.NotAuthorized();
-    }
 
     /// @dev Step 1 of {roll} for an expired position. False (and nothing changed here) while the writer holds shorts of
     ///      a series that is not settled. Settle is called first because its result decides everything else; after it
@@ -460,8 +525,9 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
     }
 
     /// @dev What a roll would write now, or due = false for every "not now" condition (see {roll}). Reads only the
-    ///      strategy, the market, the calendar, the oracle, the series (when it already exists) and the writer's free
-    ///      collateral, and stays a view: a roll never creates a series and then finds nothing to write.
+    ///      strategy, the market, the calendar, the market's oracle, the series and its pinned oracle (when it already
+    ///      exists) and the writer's free collateral, and stays a view: a roll never creates a series and then finds
+    ///      nothing to write.
     function _plan(address writer, address underlying, V2Types.Strategy memory s, V2Types.MarketConfig memory m)
         private
         view
@@ -512,7 +578,23 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
         // casting to 'uint128' is safe: bounded by type(uint128).max just above
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 longId = V2Ids.longIdOf(underlying, false, uint128(strike), p.expiry);
-        uint256 feePerUnit = clearinghouse.seriesExists(longId)
+        bool exists = clearinghouse.seriesExists(longId);
+
+        // A SERIES SOMEONE CREATED EARLIER MAY SETTLE ON ANOTHER ORACLE (T-310). `createSeries` returns an existing id
+        // as it is, pinned to whatever oracle the market had when it was created; a `setMarketOracle` since then means
+        // the strike above was planned on a price this series never settles on. The ask must be out of the money on
+        // the price it DOES settle on, so the pinned oracle must also have a fresh spot short of the strike, or the
+        // roll waits. Without this the roll could rest an ask that is already in the money for its own settlement,
+        // and {cancelStale}, which reads the pinned oracle, could withdraw what the roll had just placed.
+        if (exists) {
+            (, address pinnedOracle) = _pinned(longId);
+            if (pinnedOracle != m.oracle) {
+                (bool pinnedOk, uint256 pinnedSpot,) = _trySpot(pinnedOracle, underlying);
+                if (!pinnedOk || _overtaken(false, strike, pinnedSpot)) return (false, p);
+            }
+        }
+
+        uint256 feePerUnit = exists
             ? clearinghouse.mintFee(longId, 1)
             : OptionMath.mintFee(V2Constants.UNIT, m.mintFeePpm, p.expiry - nowTs);
         uint256 units = clearinghouse.free(writer, underlying) / (V2Constants.UNIT + feePerUnit);
@@ -524,6 +606,18 @@ contract AutoRoller is IAutoRoller, AccessControl, ReentrancyGuardTransient {
         // forge-lint: disable-next-line(unsafe-typecast)
         (p.strike, p.price, p.units) = (uint128(strike), uint128(price), uint64(units));
         return (true, p);
+    }
+
+    /// @dev THE ONE PLACE THE ORACLE OF A SERIES THAT EXISTS IS RESOLVED (T-310): the series, and the oracle
+    ///      `createSeries` pinned into it, which is the oracle {Clearinghouse.settle} settles it on. {cancelStale},
+    ///      {reprice} and {_plan} (for a series created earlier) all resolve it here, so "which price judges this ask"
+    ///      has one answer and a later change cannot fix one call site and leave another behind.
+    ///      NEVER `clearinghouse.market(underlying).oracle` for a series that exists: `setMarketOracle` moves the
+    ///      market's pointer and leaves every series created before it on the old oracle (Clearinghouse
+    ///      `_requireSettlementOracle` NatSpec), so the market's current oracle may be one this series never settles on.
+    function _pinned(uint256 longId) private view returns (V2Types.Series memory s, address oracle) {
+        s = clearinghouse.series(longId);
+        oracle = s.oracle;
     }
 
     /// @dev A non-reverting {ISettlementOracle.trySpot}: ok only when the oracle answered, said ok (source 0 is ok,

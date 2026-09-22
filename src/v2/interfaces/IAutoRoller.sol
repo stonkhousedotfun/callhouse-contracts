@@ -59,14 +59,14 @@ interface IAutoRoller {
     function cancelStale(address writer, address underlying) external returns (bool cancelled);
 
     /// @notice Replaces the writer's live ask at `newPrice`.
-    /// @dev PRICER_ROLE only (NotAuthorized), and only when the strategy has smartPricing == true and `newPrice` is
+    /// @dev PRICER lane only, no delay (NotAuthorized), and only when the strategy has smartPricing == true and `newPrice` is
     ///      within [minAskBps, maxAskBps] of spot (BadPrice). INTERFACE_VERSION 7: reverts InTheMoney when the spot
     ///      has reached the series' strike (the {cancelStale} test), checked after the spot read and before the band,
     ///      so a rallied ask is withdrawn rather than repriced below intrinsic.
     /// @param writer Strategy owner.
     /// @param underlying 18-dp Stock Token.
     /// @param newPrice USDG base units (6 dp) per whole share, % 100 == 0.
-    function reprice(address writer, address underlying, uint128 newPrice) external; // PRICER_ROLE
+    function reprice(address writer, address underlying, uint128 newPrice) external; // PRICER lane
 
     /// @notice Strategy of (writer, underlying); all zero when never set.
     /// @param writer Strategy owner.
@@ -100,7 +100,7 @@ interface IAutoRoller {
         uint128 price,
         uint64 units
     );
-    /// @notice PRICER_ROLE replaced the writer's ask. price: USDG 6 dp per share.
+    /// @notice The PRICER lane replaced the writer's ask. price: USDG 6 dp per share.
     event Repriced(
         address indexed writer, address indexed underlying, uint256 oldOrderId, uint256 newOrderId, uint128 price
     );

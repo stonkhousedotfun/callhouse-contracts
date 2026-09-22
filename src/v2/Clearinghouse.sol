@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {ERC1155Supply} from "@openzeppelin/contracts/token/ERC1155/extensions/ERC1155Supply.sol";
@@ -22,6 +21,7 @@ import {V2Errors} from "./interfaces/V2Errors.sol";
 import {V2Ids} from "./interfaces/V2Ids.sol";
 import {V2Types} from "./interfaces/V2Types.sol";
 import {OptionMath} from "./lib/OptionMath.sol";
+import {Managed} from "./access/Managed.sol";
 
 /// @title Clearinghouse
 /// @notice The v2 options clearinghouse: one ERC-1155 for every market (ADR-01, ADR-02, architecture §3.5). Writers
@@ -31,7 +31,12 @@ import {OptionMath} from "./lib/OptionMath.sol";
 ///      share. Ledger, locked and fee amounts are base units of the asset they are keyed by. A call locks UNIT = 1e16
 ///      underlying base units per unit; a put locks strike / 100 USDG base units per unit.
 ///
-///      COLLATERAL RENT IS THE WRITER FEE (INTERFACE_VERSION 7, c05). {mint} charges the writer rent on the collateral
+///      COLLATERAL RENT IS A REGISTERED DIAL AND v8 LAUNCHES IT AT ZERO ON EVERY MARKET (c05). It is not removed:
+///      the whole path below is compiled and live and `mintFeePpm` is per market, but a non-zero rate is REFUSED AT
+///      REGISTRATION unless an operator sets the allow-rent flag (RegisterMarkets.s.sol `preflightMarket` and
+///      VerifyV8.s.sol `_market`, both `ppm == 0 || rentAllowed(...)`); the shipped registry sets it false. That is a
+///      deploy-time gate, not a contract invariant: `setMarketFees` can still raise the rate on chain later, on the
+///      MARKET_FEE_MANAGER lane's 72 h delay. When it IS non-zero: {mint} charges the writer rent on the collateral
 ///      the pair locks, for the time left to expiry, at the series' pinned `mintFeePpm`; {close} pays back the part
 ///      that was not used; {settle} accrues what a series still holds to `accruedFees`. The fee is charged wherever a
 ///      mint comes from, so it cannot be avoided by minting outside the book, and it is a per-asset liability of this
@@ -46,11 +51,12 @@ import {OptionMath} from "./lib/OptionMath.sol";
 ///      supplies are equal at settlement (both are only minted and burned in pairs before it), redeeming every holder
 ///      pays out `locked` to the base unit, whatever order the redemptions come in.
 ///
-///      TRUST MODEL (ADR-09). DEFAULT_ADMIN_ROLE registers and configures markets and sets pointers (calendar, fee
-///      recipient, payout adapter, keeper rewards) and the metadata base URI. GUARDIAN_ROLE pauses series creation and
-///      mints. Nothing an admin or guardian can do moves, freezes or seizes collateral or tokens: close, redeem,
-///      withdraw, settle and ERC-1155 transfers have no pause, and a series pins its oracle and exercise fee at creation,
-///      and has the oracle pin the settlement configuration of its expiry ({createSeries}).
+///      TRUST MODEL (ADR-09, INTERFACE_VERSION 8). Roles live on one AccessManager, not here. LISTING registers and
+///      lists markets; MARKET_FEE_MANAGER moves fee dials; CONFIG_ADMIN moves oracle/calendar/adapter/minter pointers;
+///      TREASURY_ADMIN moves the fee recipient; GUARDIAN pauses series creation and mints. Nothing those roles can do
+///      moves, freezes or seizes collateral or tokens: close, redeem, withdraw, settle and ERC-1155 transfers have no
+///      pause, and a series pins its oracle and exercise fee at creation, and has the oracle pin the settlement
+///      configuration of its expiry ({createSeries}).
 ///      The payout adapter is the one pointer that touches payouts, and the Clearinghouse verifies what it delivers
 ///      (see {convertPayout}), so a bad adapter can cost a holder at most min(maxPayoutSlippageBps + MAX_ROUTE_FEE_BPS,
 ///      MAX_PAYOUT_SLIPPAGE_CEIL_BPS) of one payout ({_conversionFloor}).
@@ -65,7 +71,7 @@ import {OptionMath} from "./lib/OptionMath.sol";
 ///      runs the ERC-1155 acceptance callbacks only after all three. No path here emits TransferBatch; only a caller's
 ///      own safeBatchTransferFrom does. The `operator` of a TransferSingle is the frame's msg.sender: the keeper for a
 ///      direct {redeem}, this contract for a redemption inside {redeemBatch}.
-contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, ReentrancyGuardTransient {
+contract Clearinghouse is IClearinghouse, ERC1155Supply, Managed, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -84,10 +90,20 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     ///      from one storage slot; an adapter that needs more reads as a zero route fee (the tighter floor).
     uint256 private constant ROUTE_FEE_READ_GAS = 30_000;
 
-    /// @dev Gas forwarded to the series oracle's trySpot read ({_floorPrice}). On a fork of 4663, cold, the real
-    ///      SettlementOracle needed under 60k with the Chainlink source first and under 120k with the pool TWAP
-    ///      source first; a read that needs more counts as no spot.
-    uint256 private constant SPOT_READ_GAS = 150_000;
+    /// @dev Gas forwarded to the series oracle's trySpot read ({_floorPrice}); a read that needs more counts as no
+    ///      spot. SIZED BY MEASUREMENT, NOT BY REASONING (T-OP-080). The first value, 150_000, was measured when
+    ///      `trySpot` read ONE source (under 60k Chainlink-first, under 120k pool-first, cold, on a 4663 fork).
+    ///      T-OP-061 made an old Chainlink print -- the state every launch redemption after the close is in -- ALSO
+    ///      read the pool source's `latest`, and that two-source read measured within 1 % of the old cap. Re-measured
+    ///      COLD (every account cooled first) on a fork of 4663 at block 69266235, contracts `b77280a5`, from
+    ///      `V2ForkTest.test_fork_spotReadGas_*`, caller-side delta / callee frame (`vm.lastCallGas`):
+    ///        - young print, one source read ................ 61_100 / 58_054
+    ///        - single-source market, old print ............. 61_117 / 58_071
+    ///        - old print, pool agrees (the launch state) ... 154_388 / 151_341
+    ///        - old print, pool disagrees ................... 154_400 / 151_353
+    ///      Rule: max measured x 1.5, rounded up to 10_000: 154_400 x 1.5 = 231_600 -> 240_000. The cap stays -- it
+    ///      is the bounded-trust guard, not a budget; only its size follows the read it guards.
+    uint256 private constant SPOT_READ_GAS = 240_000;
 
     /// @dev How long after expiry a redemption by a third party may still convert on the settlement price alone when
     ///      no ok spot can be read. Inside the grace "no ok spot" means the market's own spotMaxAge has passed with
@@ -114,7 +130,8 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     ///         total is capped there too, INTERFACE_VERSION 6). Packed with {payoutAdapter}: redeem reads both in one
     ///         slot.
     uint16 public maxPayoutSlippageBps;
-    /// @notice GUARDIAN_ROLE switch: true blocks {createSeries} for new ids in every market.
+    /// @notice GUARDIAN lane switch ({setCreatePaused}, no delay): true blocks {createSeries} for new ids in every
+    ///         market.
     bool public createPaused;
 
     /// @notice Bounty payer for SETTLE and REDEEM; address(0) pays nothing.
@@ -159,32 +176,52 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
 
     mapping(address account => Prefs) private _prefs;
 
+    /// @inheritdoc IClearinghouse
+    /// @dev INTERFACE_VERSION 8. Declared AFTER `_series`, like every other v8 addition, so the slot the tests pin
+    ///      (`SERIES_SLOT = 12`) and every slot the v7 monitor reads keep their positions.
+    mapping(address minter => bool) public isMinter;
+
+    /// @inheritdoc IClearinghouse
+    /// @dev INTERFACE_VERSION 8. Copied into every market at {registerMarket}; zero makes registration revert
+    ///      `NoSource`. Packed with the two default fee dials below: registration reads all three in one slot.
+    address public defaultOracle;
+    /// @dev INTERFACE_VERSION 8. Default MarketConfig.exerciseFeeBps of a newly registered market.
+    uint16 private _defaultExerciseFeeBps;
+    /// @dev INTERFACE_VERSION 8. Default MarketConfig.mintFeePpm of a newly registered market; 0 at launch on every
+    ///      market (owner decision V3-D18: no writer rent, the dial stays).
+    uint32 private _defaultMintFeePpm;
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice DEFAULT_ADMIN_ROLE pointed NEW series at `calendar` (existing series keep their expiry).
+    /// @notice The CONFIG_ADMIN lane pointed NEW series at `calendar` (existing series keep their expiry).
     event CalendarSet(address indexed calendar);
-    /// @notice DEFAULT_ADMIN_ROLE set the bounty payer (address(0) disables bounties).
+    /// @notice The CONFIG_ADMIN lane set the bounty payer (address(0) disables bounties).
     event KeeperRewardsSet(address indexed keeperRewards);
-    /// @notice DEFAULT_ADMIN_ROLE set the REDEEM and SETTLE bounty threshold, USDG base units of value.
+    /// @notice The LISTING lane set the REDEEM and SETTLE bounty threshold, USDG base units of value.
     event MinRedeemPayoutSet(uint256 amount);
-    /// @notice DEFAULT_ADMIN_ROLE set the ERC-1155 metadata base URI.
+    /// @notice The LISTING lane set the ERC-1155 metadata base URI.
     event BaseUriSet(string baseUri);
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @param admin Receives DEFAULT_ADMIN_ROLE. It grants GUARDIAN_ROLE with grantRole.
+    /// @param authority_ AccessManager that gates every `restricted` setter. Code-less reverts `NoSource`.
     /// @param usdg_ USDG: must be a contract reporting 6 decimals (UnsupportedAsset).
     /// @param calendar_ IExpiryCalendar for new series: must be a contract (BadExpiry).
-    /// @param feeRecipient_ Receiver of swept exercise fees, non-zero (NotAuthorized).
+    /// @param feeRecipient_ Receiver of swept exercise fees, non-zero (NotAuthorized). At v8 deploy this is the
+    ///        FeeSplitter; the constructor does not type-check it.
     /// @param baseUri_ ERC-1155 metadata base; {uri} appends the decimal token id.
-    constructor(address admin, address usdg_, address calendar_, address feeRecipient_, string memory baseUri_)
+    constructor(address authority_, address usdg_, address calendar_, address feeRecipient_, string memory baseUri_)
         ERC1155("")
+        Managed(authority_)
     {
-        if (admin == address(0) || feeRecipient_ == address(0)) revert V2Errors.NotAuthorized();
+        // Same refusal as {setFeeRecipient} (SEC-22): the field has one meaning, so it gets one rule. Reaching
+        // this with the contract's own address takes a CREATE2 preimage, but an asymmetric guard is the kind a
+        // later reader trusts in the wrong direction.
+        if (feeRecipient_ == address(0) || feeRecipient_ == address(this)) revert V2Errors.NotAuthorized();
         (bool ok, uint256 dec) = _decimalsOf(usdg_);
         if (!ok || dec != 6) revert V2Errors.UnsupportedAsset();
         if (calendar_.code.length == 0) revert V2Errors.BadExpiry();
@@ -193,7 +230,6 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
         feeRecipient = feeRecipient_;
         minRedeemPayout = DEFAULT_MIN_REDEEM_PAYOUT;
         _baseUri = baseUri_;
-        _grantRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
         emit CalendarSet(calendar_);
         emit FeeRecipientSet(feeRecipient_);
         emit MinRedeemPayoutSet(DEFAULT_MIN_REDEEM_PAYOUT);
@@ -201,96 +237,203 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     }
 
     /*//////////////////////////////////////////////////////////////
-                           MARKETS (ADMIN)
+               MARKETS, INTERFACE_VERSION 8 (03-INTERFACES §2.1)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Registers `underlying` as a market with `cfg`. DEFAULT_ADMIN_ROLE.
-    /// @dev Reverts UnsupportedAsset when the market is already registered (use {setMarketConfig}) or the token does
-    ///      not report 18 decimals; BadStrike unless strikeTick is a non-zero multiple of PRICE_TICK (a zero tick would
-    ///      make every strike check divide by zero); CeilingExceeded above EXERCISE_FEE_CEIL_BPS; NoSource when the
-    ///      oracle is not a contract (series pinned to it could never settle). `cfg.mintPaused` is taken as given.
-    /// @param underlying 18-dp Stock Token.
-    /// @param cfg Market configuration; strikeTick in USDG base units (6 dp) per share, exerciseFeeBps in bps.
-    function registerMarket(address underlying, V2Types.MarketConfig calldata cfg)
-        external
-        nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
-    {
+    /// @inheritdoc IClearinghouse
+    /// @dev THE ONLY TOKEN CHECK IS `decimals() == 18`; NOTHING HERE PROVES THE TOKEN TRANSFERS EXACTLY. Every outflow
+    ///      ({withdraw}, a redemption's transfer, {sweepFees}) books exactly `amount`, and only {deposit} and
+    ///      {convertPayout} measure a balance, so invariant I2' holds for a market only while a transfer of its
+    ///      underlying debits this contract exactly the amount sent and its balance never moves on its own. A fee the
+    ///      RECIPIENT absorbs does not break it: the debit here is still `amount`. A token that charges the SENDER on
+    ///      top, rebases down, or lets its issuer burn from this address does, and the shortfall is then paid out of
+    ///      other holders' collateral of that token. That is a LISTING trust assumption, not an enforced one. The
+    ///      contract cannot probe at registration: it holds none of the token yet ({deposit} refuses it until now),
+    ///      and on the delayed LISTING lane the caller may be the AccessManager itself (`execute`), which holds
+    ///      nothing either. No probe here could see a later rebase, wipe or upgrade of an issuer proxy anyway. The
+    ///      gate is off chain: script/v2/RegisterMarkets.s.sol `probeTransfers` simulates a deposit and a withdrawal
+    ///      on a fork before it sends anything and refuses a token that does not move exactly the amount. A LISTING
+    ///      call made outside that script skips it. ClearinghouseMarkets.t.sol pins both halves of this paragraph.
+    function registerMarket(address underlying, uint64 strikeTick, bool enabled) external nonReentrant restricted {
         if (_markets[underlying].strikeTick != 0) revert V2Errors.UnsupportedAsset();
         (bool ok, uint256 dec) = _decimalsOf(underlying);
         if (!ok || dec != 18) revert V2Errors.UnsupportedAsset();
-        _checkConfig(cfg);
+        V2Types.MarketConfig memory cfg = V2Types.MarketConfig({
+            enabled: enabled,
+            mintPaused: false, // a v8 market always registers unpaused; only the guardian pauses
+            strikeTick: strikeTick,
+            exerciseFeeBps: _defaultExerciseFeeBps,
+            oracle: defaultOracle,
+            mintFeePpm: _defaultMintFeePpm
+        });
+        _checkConfigMemory(cfg);
         _markets[underlying] = cfg;
         emit MarketRegistered(underlying, cfg);
     }
 
-    /// @notice Replaces a registered market's configuration, except its guardian-owned mintPaused. DEFAULT_ADMIN_ROLE.
-    /// @dev Same bounds as {registerMarket}; UnsupportedAsset when not registered. `enabled` gates creation and mints
-    ///      only; strikeTick, exerciseFeeBps, mintFeePpm and oracle apply to series created afterwards (existing
-    ///      series pinned theirs). mintPaused is kept so an admin config push cannot silently lift a guardian pause;
-    ///      the event carries the stored value.
-    /// @param underlying Registered underlying.
-    /// @param cfg New configuration (its mintPaused is ignored).
-    function setMarketConfig(address underlying, V2Types.MarketConfig calldata cfg)
+    /// @inheritdoc IClearinghouse
+    function setMarketListing(address underlying, bool enabled, uint64 strikeTick) external nonReentrant restricted {
+        V2Types.MarketConfig storage m = _registered(underlying);
+        if (strikeTick == 0 || strikeTick % V2Constants.PRICE_TICK != 0) revert V2Errors.BadStrike();
+        m.enabled = enabled;
+        m.strikeTick = strikeTick;
+        emit MarketConfigSet(underlying, m);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setMarketFees(address underlying, uint16 exerciseFeeBps, uint32 mintFeePpm)
         external
         nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
+        restricted
     {
-        V2Types.MarketConfig storage m = _markets[underlying];
-        if (m.strikeTick == 0) revert V2Errors.UnsupportedAsset();
-        _checkConfig(cfg);
-        bool paused = m.mintPaused;
-        m.enabled = cfg.enabled;
-        m.strikeTick = cfg.strikeTick;
-        m.exerciseFeeBps = cfg.exerciseFeeBps;
-        m.oracle = cfg.oracle;
-        m.mintFeePpm = cfg.mintFeePpm;
-        m.mintPaused = paused;
+        V2Types.MarketConfig storage m = _registered(underlying);
+        _checkFees(exerciseFeeBps, mintFeePpm);
+        m.exerciseFeeBps = exerciseFeeBps;
+        m.mintFeePpm = mintFeePpm;
         emit MarketConfigSet(underlying, m);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setMarketOracle(address underlying, address oracle) external nonReentrant restricted {
+        V2Types.MarketConfig storage m = _registered(underlying);
+        _requireSettlementOracle(oracle);
+        m.oracle = oracle;
+        emit MarketConfigSet(underlying, m);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setDefaultMarketFees(uint16 exerciseFeeBps, uint32 mintFeePpm) external nonReentrant restricted {
+        _checkFees(exerciseFeeBps, mintFeePpm);
+        _defaultExerciseFeeBps = exerciseFeeBps;
+        _defaultMintFeePpm = mintFeePpm;
+        emit DefaultMarketFeesSet(exerciseFeeBps, mintFeePpm);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setDefaultOracle(address oracle) external nonReentrant restricted {
+        _requireSettlementOracle(oracle);
+        defaultOracle = oracle;
+        emit DefaultOracleSet(oracle);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setMinter(address minter, bool allowed) external nonReentrant restricted {
+        isMinter[minter] = allowed;
+        emit MinterSet(minter, allowed);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function defaultMarketFees() external view returns (uint16 exerciseFeeBps, uint32 mintFeePpm) {
+        return (_defaultExerciseFeeBps, _defaultMintFeePpm);
+    }
+
+    /// @dev The market row of a REGISTERED underlying (`UnsupportedAsset` otherwise). Shared by the three per-market
+    ///      v8 setters, each of which writes only its own fields and never touches the guardian's `mintPaused`.
+    function _registered(address underlying) private view returns (V2Types.MarketConfig storage m) {
+        m = _markets[underlying];
+        if (m.strikeTick == 0) revert V2Errors.UnsupportedAsset();
+    }
+
+    /// @dev The fee half of {_checkConfig}, shared by the per-market and the default fee setters.
+    function _checkFees(uint16 exerciseFeeBps, uint32 mintFeePpm) private pure {
+        if (exerciseFeeBps > V2Constants.EXERCISE_FEE_CEIL_BPS) revert V2Errors.CeilingExceeded();
+        if (mintFeePpm > V2Constants.MINT_FEE_CEIL_PPM) revert V2Errors.CeilingExceeded();
+    }
+
+    /// @dev {_checkConfig} over a memory tuple, for the composed configuration {registerMarket} stores. Identical
+    ///      bounds, identical errors, identical order.
+    function _checkConfigMemory(V2Types.MarketConfig memory cfg) private view {
+        if (cfg.strikeTick == 0 || cfg.strikeTick % V2Constants.PRICE_TICK != 0) revert V2Errors.BadStrike();
+        _checkFees(cfg.exerciseFeeBps, cfg.mintFeePpm);
+        _requireSettlementOracle(cfg.oracle);
+    }
+
+    /// @dev THE ONLY IN-CONTRACT BOUND ON "THIS ADDRESS IS THE SETTLEMENT ORACLE", and it is worth being exact
+    ///      about what it does and does not buy (SEC-07).
+    ///
+    ///      WHAT IT CATCHES: a pointer that is not an oracle at all -- the zero address, an EOA, a token, the
+    ///      book, a Safe, a mistyped address that happens to hold code. `code.length` alone caught only the
+    ///      first two of those. The probe additionally requires the candidate to ANSWER the oracle's own
+    ///      surface with a sane value, which no unrelated contract does by accident.
+    ///
+    ///      WHAT IT DOES NOT CATCH, stated plainly because the row this comes from is really about this case:
+    ///      A CONTRACT THAT IMPLEMENTS {ISettlementOracle} AND LIES. A compromised CONFIG_ADMIN can still point
+    ///      a market at a hostile oracle that answers every call correctly and returns attacker-chosen
+    ///      settlement prices. No check inside this contract can distinguish that from the real oracle --
+    ///      the published address is not knowable here, there is no registry to consult, and
+    ///      {SettlementOracle} implements no ERC-165, so an `interfaceId` check would fail closed against
+    ///      the REAL oracle and make this setter uncallable. The controls that actually bound that case are
+    ///      external and deliberate: the AccessManager's 24 h delay on the role, guardian cancellation
+    ///      within it, and series-level pinning (`createSeries` copies `m.oracle` into the series and
+    ///      {settle} reads `s.oracle`), which confines any switch to series created AFTER it.
+    ///
+    ///      THE PROBE IS A STATICCALL AND FAILS CLOSED. `SETTLEMENT_WINDOW` is a constant on the real oracle
+    ///      and on the doubles that stand in for one: {MockSettlementOracle}, `BookOracleStub`
+    ///      (test/v2/unit/OrderBookBase.t.sol) and `RevertingOracle` (test/v2/invariant/V2Invariant.t.sol).
+    ///      It is NOT on every double in this repo, and two kinds deliberately lack it. The negative doubles
+    ///      exist to pin this probe's failing half: `NotAnOracle` answers nothing and `ZeroWindowOracle`
+    ///      answers zero (both test/v2/unit/ClearinghouseMarkets.t.sol). And doubles that are not settlement
+    ///      oracles at all never declare it -- `MockSpot` in test/v2/unit/FeeSplitter.t.sol and
+    ///      test/v2/unit/Hedger.t.sol, {MockMorphoOracle} -- which is correct, because none of them is ever
+    ///      handed to this setter. So a candidate that reverts, returns nothing, returns zero, or is not a
+    ///      contract is refused with the same `NoSource` these setters already used.
+    function _requireSettlementOracle(address oracle) private view {
+        if (oracle.code.length == 0) revert V2Errors.NoSource();
+        try ISettlementOracle(oracle).SETTLEMENT_WINDOW() returns (uint32 window) {
+            if (window == 0) revert V2Errors.NoSource();
+        } catch {
+            revert V2Errors.NoSource();
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
                             PAUSES (GUARDIAN)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Pauses or resumes {mint} for one market. GUARDIAN_ROLE. New risk only: close and redeem are unaffected.
+    /// @notice Pauses or resumes {mint} for one market. GUARDIAN lane, no delay. New risk only: close and redeem are
+    ///         unaffected.
     /// @param underlying Registered underlying (UnsupportedAsset otherwise).
     /// @param paused True to pause.
-    function setMintPaused(address underlying, bool paused) external nonReentrant onlyRole(V2Constants.GUARDIAN_ROLE) {
+    function setMintPaused(address underlying, bool paused) external nonReentrant restricted {
         V2Types.MarketConfig storage m = _markets[underlying];
         if (m.strikeTick == 0) revert V2Errors.UnsupportedAsset();
         m.mintPaused = paused;
         emit MintPausedSet(underlying, paused);
     }
 
-    /// @notice Pauses or resumes {createSeries} for new ids in every market. GUARDIAN_ROLE.
+    /// @notice Pauses or resumes {createSeries} for new ids in every market. GUARDIAN lane, no delay.
     /// @param paused True to pause.
-    function setCreatePaused(bool paused) external nonReentrant onlyRole(V2Constants.GUARDIAN_ROLE) {
+    function setCreatePaused(bool paused) external nonReentrant restricted {
         createPaused = paused;
         emit CreatePausedSet(paused);
     }
 
     /*//////////////////////////////////////////////////////////////
-                           POINTERS (ADMIN)
+            POINTERS (CONFIG_ADMIN, TREASURY_ADMIN, LISTING)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Points NEW series at another calendar. DEFAULT_ADMIN_ROLE.
+    /// @notice Points NEW series at another calendar. CONFIG_ADMIN lane, 24 h delay.
     /// @param calendar_ IExpiryCalendar contract (BadExpiry when it has no code).
-    function setCalendar(address calendar_) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setCalendar(address calendar_) external nonReentrant restricted {
         if (calendar_.code.length == 0) revert V2Errors.BadExpiry();
         calendar = calendar_;
         emit CalendarSet(calendar_);
     }
 
-    /// @notice Sets the receiver of swept exercise fees. DEFAULT_ADMIN_ROLE.
-    /// @param recipient Non-zero address (NotAuthorized).
-    function setFeeRecipient(address recipient) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
-        if (recipient == address(0)) revert V2Errors.NotAuthorized();
+    /// @notice Sets the receiver of swept exercise fees. TREASURY_ADMIN lane, 24 h delay.
+    /// @dev SEC-22. THIS CONTRACT IS REFUSED AS WELL AS ZERO. {sweepFees} zeroes `accruedFees[asset]` and then
+    ///      transfers to the recipient; with the recipient set here, that transfer is a self-transfer that moves
+    ///      nothing, so one sweep strands every accrued fee permanently -- the tokens stay in the contract with
+    ///      nothing left to claim them, and invariant I2' silently flips from balance == sum of claims to
+    ///      balance > sum of claims. Zero fails loudly on the next sweep; this one fails SILENTLY, which is worse.
+    /// @param recipient Non-zero, and not this contract (NotAuthorized).
+    function setFeeRecipient(address recipient) external nonReentrant restricted {
+        if (recipient == address(0) || recipient == address(this)) revert V2Errors.NotAuthorized();
         feeRecipient = recipient;
         emit FeeRecipientSet(recipient);
     }
 
-    /// @notice Sets the PayoutAdapter and the conversion slippage bound. DEFAULT_ADMIN_ROLE.
+    /// @notice Sets the PayoutAdapter and the conversion slippage bound. CONFIG_ADMIN lane, 24 h delay.
     /// @dev CeilingExceeded above MAX_PAYOUT_SLIPPAGE_CEIL_BPS. address(0) turns conversion off (every ITM call long is
     ///      paid in kind). An adapter is not trusted with more than one payout at a time: see {convertPayout}. The
     ///      bound is measured above each route's pool fee: a conversion floor is value at the floor price (the
@@ -299,36 +442,33 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     /// @param adapter IPayoutAdapter, or address(0).
     /// @param maxSlippageBps Largest accepted shortfall below value at the floor price beyond the route's pool fee,
     ///        bps.
-    function setPayoutAdapter(address adapter, uint16 maxSlippageBps)
-        external
-        nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
-    {
+    function setPayoutAdapter(address adapter, uint16 maxSlippageBps) external nonReentrant restricted {
         if (maxSlippageBps > V2Constants.MAX_PAYOUT_SLIPPAGE_CEIL_BPS) revert V2Errors.CeilingExceeded();
         payoutAdapter = adapter;
         maxPayoutSlippageBps = maxSlippageBps;
         emit PayoutAdapterSet(adapter, maxSlippageBps);
     }
 
-    /// @notice Sets the bounty payer. DEFAULT_ADMIN_ROLE. This contract must be registered there as a caller.
+    /// @notice Sets the bounty payer. CONFIG_ADMIN lane, 24 h delay. This contract must be registered there as a
+    ///         caller.
     /// @param rewards KeeperRewards contract (NoSource when non-zero without code), or address(0) to pay nothing.
-    function setKeeperRewards(address rewards) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setKeeperRewards(address rewards) external nonReentrant restricted {
         if (rewards != address(0) && rewards.code.length == 0) revert V2Errors.NoSource();
         keeperRewards = IKeeperRewards(rewards);
         emit KeeperRewardsSet(rewards);
     }
 
-    /// @notice Sets the REDEEM and SETTLE bounty threshold. DEFAULT_ADMIN_ROLE.
+    /// @notice Sets the REDEEM and SETTLE bounty threshold. LISTING lane, 1 h delay.
     /// @param amount USDG base units of value at the settlement price: of the payout for REDEEM, of the series'
     ///        collateral for SETTLE.
-    function setMinRedeemPayout(uint96 amount) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setMinRedeemPayout(uint96 amount) external nonReentrant restricted {
         minRedeemPayout = amount;
         emit MinRedeemPayoutSet(amount);
     }
 
-    /// @notice Sets the ERC-1155 metadata base URI. DEFAULT_ADMIN_ROLE.
+    /// @notice Sets the ERC-1155 metadata base URI. LISTING lane, 1 h delay.
     /// @param baseUri_ Base; {uri} returns it followed by the decimal token id.
-    function setBaseUri(string calldata baseUri_) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setBaseUri(string calldata baseUri_) external nonReentrant restricted {
         _baseUri = baseUri_;
         emit BaseUriSet(baseUri_);
     }
@@ -403,7 +543,14 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     /// @inheritdoc IClearinghouse
     /// @dev Credits the measured balance delta, so a token that delivers less than `amount` credits what arrived. An
     ///      asset is supported iff it is USDG or a registered underlying, including one whose market is disabled.
+    /// @dev SEC-49. `to` MAY NOT BE THIS CONTRACT. The ledger is withdrawn by `msg.sender` only ({withdraw}), and
+    ///      this contract never calls {withdraw} on itself, so a credit to `free[address(this)]` can never be spent
+    ///      by anyone: it is bricked dust that also overstates the ledger against the balance. Refusing it costs a
+    ///      caller nothing -- there is no reason to credit the house -- and it is the only recovery path there is,
+    ///      because there is none after the fact. NOT DECLARED ON {IClearinghouse.deposit}, whose NatSpec is
+    ///      outside this task's scope_paths; the interface currently under-describes this guard.
     function deposit(address asset, uint256 amount, address to) external nonReentrant {
+        if (to == address(this)) revert V2Errors.NotAuthorized();
         if (asset != usdg && _markets[asset].strikeTick == 0) revert V2Errors.UnsupportedAsset();
         IERC20 token = IERC20(asset);
         uint256 before = token.balanceOf(address(this));
@@ -464,12 +611,16 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     ///      `ceil(collateral x series.mintFeePpm x (expiry - now) / (PPM x MINT_FEE_PERIOD))` out of the SAME free
     ///      ledger balance, and the series holds it in `mintFeesHeld` until {close} refunds it pro rata or {settle}
     ///      accrues it. The base contains nothing the writer chooses except size and tenor and no fill price, so every
-    ///      route to a mint -- a direct mint, an AskWrite the book fills, a `writeToSell`, an AutoRoller or MakerVault
-    ///      ask -- pays exactly the same for the same units in the same block. Rent never touches the LOCKED
+    ///      route to a mint pays exactly the same for the same units in the same block. Mint is gated by the
+    ///      {setMinter} allowlist (`isMinter`, checked first below), so which routes exist is a deployment fact, not
+    ///      something this contract fixes: the allowlist is set by script/v2/DeployV8.s.sol (`setMinter` in its
+    ///      wiring). With only the book allowlisted, every mint happens inside a fill -- an AskWrite hit or a
+    ///      `writeToSell`, including AutoRoller and MakerVault asks. Rent never touches the LOCKED
     ///      collateral, so {locked}, the settlement identity and every payout are as they were in v6. The cutoff check
     ///      above guarantees `expiry - block.timestamp > SETTLEMENT_WINDOW`, so the subtraction cannot underflow and
     ///      the rent of a live mint is never 0 while the rate is not.
     function mint(uint256 longId, uint64 units, address writer, address longTo) external nonReentrant {
+        if (!isMinter[msg.sender]) revert V2Errors.NotMinter();
         if (msg.sender != writer && !isOperator[writer][msg.sender]) revert V2Errors.NotAuthorized();
         V2Types.Series storage s = _series[longId];
         address underlying = s.underlying;
@@ -879,25 +1030,15 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
         return string.concat(_baseUri, Strings.toString(id));
     }
 
-    /// @notice ERC-165: IClearinghouse, IERC1155, IERC1155MetadataURI, IAccessControl, IERC165.
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(ERC1155, AccessControl, IERC165)
-        returns (bool)
-    {
+    /// @notice ERC-165: IClearinghouse, IERC1155, IERC1155MetadataURI, IERC165. No IAccessControl: roles are on the
+    ///         manager, not this target.
+    function supportsInterface(bytes4 interfaceId) public view override(ERC1155, IERC165) returns (bool) {
         return interfaceId == type(IClearinghouse).interfaceId || super.supportsInterface(interfaceId);
     }
 
     /*//////////////////////////////////////////////////////////////
                                 INTERNALS
     //////////////////////////////////////////////////////////////*/
-
-    /// @dev Every role check reverts with the shared v2 error, so the one error ABI consumers merge decodes it. Covers
-    ///      grantRole / revokeRole as well.
-    function _checkRole(bytes32 role, address account) internal view override {
-        if (!hasRole(role, account)) revert V2Errors.NotAuthorized();
-    }
 
     /// @dev The redemption of one holder's whole balance (capped at type(uint64).max units per call, the width of the
     ///      Redeemed log; a larger balance simply needs a second call). Authorisation is the caller's job.
@@ -990,12 +1131,17 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     ///          VERSION 7 dropped the extra one-hour bound this used to apply on top (owner sign-off c01,
     ///          DECISIONS-2026-09-17 §7): the real feed cadence rarely prints within an hour, so the hour made
     ///          automated redemptions pay in kind, and the market's spotMaxAge is the age the oracle itself settles
-    ///          and quotes on. The price error a stale-but-ok reading admits is bounded by the feed's own deviation
-    ///          threshold, and the floor is never below the settlement price;
+    ///          and quotes on. NO TIGHT BOUND holds on the price error a stale-but-ok reading admits: the feed's
+    ///          deviation threshold is the condition under which it prints, not a limit on when that print lands on
+    ///          chain, and nothing here waits for it, so for up to spotMaxAge the floor can trail the market by
+    ///          whatever move the oracle has not yet seen (SEC-10, docs/V8-ACCEPTED-RISKS.md). The floor is never
+    ///          below the settlement price, which guards the holder against a lower price only;
     ///        - without one, the settlement price when the caller is the holder or its operator (nobody else can
     ///          sandwich the holder's own call) or it is still within STALE_SPOT_GRACE of expiry (source 0 printed
-    ///          nothing since the window began, so the market has not left the settlement price by more than the
-    ///          source's own deviation), and otherwise 0: a later third-party redemption pays in kind.
+    ///          nothing since the window began, which does NOT bound the market's move from the settlement price:
+    ///          the print the deviation threshold triggers can land after the grace ends, so a third party converts
+    ///          at the settlement price and keeps the unseen move, an accepted risk, SEC-10 in
+    ///          docs/V8-ACCEPTED-RISKS.md), and otherwise 0: a later third-party redemption pays in kind.
     ///      BOUNDED TRUST, as for the route fee: trySpot is a raw staticcall capped at SPOT_READ_GAS, and a revert, short
     ///      return data, a malformed answer or running out of gas count as no spot, so the oracle can neither revert a
     ///      redemption nor cost it more than the cap. A spot above uint128 is clamped to it, like a settlement price.
@@ -1078,14 +1224,6 @@ contract Clearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reentran
     function _known(uint256 longId) private view returns (V2Types.Series storage s) {
         s = _series[longId];
         if (s.underlying == address(0)) revert V2Errors.UnknownSeries();
-    }
-
-    /// @dev Same bounds for registration and config changes.
-    function _checkConfig(V2Types.MarketConfig calldata cfg) private view {
-        if (cfg.strikeTick == 0 || cfg.strikeTick % V2Constants.PRICE_TICK != 0) revert V2Errors.BadStrike();
-        if (cfg.exerciseFeeBps > V2Constants.EXERCISE_FEE_CEIL_BPS) revert V2Errors.CeilingExceeded();
-        if (cfg.mintFeePpm > V2Constants.MINT_FEE_CEIL_PPM) revert V2Errors.CeilingExceeded();
-        if (cfg.oracle.code.length == 0) revert V2Errors.NoSource();
     }
 
     /// @dev `decimals()` of `token` without reverting: ok = false for a code-less address, a revert or short return

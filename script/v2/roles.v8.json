@@ -1,0 +1,300 @@
+{
+  "interfaceVersion": 8,
+  "roles": {
+    "ADMIN": 0,
+    "FEE_MANAGER": 1,
+    "MARKET_FEE_MANAGER": 2,
+    "CONFIG_ADMIN": 3,
+    "TREASURY_ADMIN": 4,
+    "LISTING": 5,
+    "OPS_ADMIN": 6,
+    "GUARDIAN": 7,
+    "PRICER": 8,
+    "QUOTER": 9,
+    "BUYBACK": 10
+  },
+  "delaysS": {
+    "ADMIN": 172800,
+    "FEE_MANAGER": 172800,
+    "MARKET_FEE_MANAGER": 259200,
+    "CONFIG_ADMIN": 86400,
+    "TREASURY_ADMIN": 86400,
+    "LISTING": 3600,
+    "OPS_ADMIN": 0,
+    "GUARDIAN": 0,
+    "PRICER": 0,
+    "QUOTER": 0,
+    "BUYBACK": 0
+  },
+  "roleAdmin": {
+    "GUARDIAN": "OPS_ADMIN",
+    "PRICER": "OPS_ADMIN",
+    "QUOTER": "OPS_ADMIN",
+    "BUYBACK": "OPS_ADMIN"
+  },
+  "roleGuardian": {
+    "FEE_MANAGER": "GUARDIAN",
+    "MARKET_FEE_MANAGER": "GUARDIAN",
+    "CONFIG_ADMIN": "GUARDIAN",
+    "TREASURY_ADMIN": "GUARDIAN",
+    "LISTING": "GUARDIAN"
+  },
+  "holders": {
+    "adminSafe": [
+      "ADMIN",
+      "FEE_MANAGER",
+      "MARKET_FEE_MANAGER",
+      "CONFIG_ADMIN",
+      "TREASURY_ADMIN",
+      "LISTING",
+      "OPS_ADMIN",
+      "GUARDIAN",
+      "QUOTER"
+    ],
+    "guardianKey": [
+      "GUARDIAN"
+    ],
+    "pricerKey": [
+      "PRICER"
+    ],
+    "quoterKey": [
+      "QUOTER"
+    ],
+    "crankerKey": [
+      "BUYBACK"
+    ]
+  },
+  "targets": {
+    "Clearinghouse": {
+      "registerMarket(address,uint64,bool)": "LISTING",
+      "setMarketListing(address,bool,uint64)": "LISTING",
+      "setMinRedeemPayout(uint96)": "LISTING",
+      "setBaseUri(string)": "LISTING",
+      "setMarketFees(address,uint16,uint32)": "MARKET_FEE_MANAGER",
+      "setDefaultMarketFees(uint16,uint32)": "MARKET_FEE_MANAGER",
+      "setMarketOracle(address,address)": "CONFIG_ADMIN",
+      "setDefaultOracle(address)": "CONFIG_ADMIN",
+      "setMinter(address,bool)": "CONFIG_ADMIN",
+      "setCalendar(address)": "CONFIG_ADMIN",
+      "setPayoutAdapter(address,uint16)": "CONFIG_ADMIN",
+      "setKeeperRewards(address)": "CONFIG_ADMIN",
+      "setFeeRecipient(address)": "TREASURY_ADMIN",
+      "setMintPaused(address,bool)": "GUARDIAN",
+      "setCreatePaused(bool)": "GUARDIAN"
+    },
+    "OrderBook": {
+      "setFeeParams((uint16,uint16,uint32,uint16,uint16))": "FEE_MANAGER",
+      "setMakerRegistry(address)": "FEE_MANAGER",
+      "setDiscountModule(address)": "FEE_MANAGER",
+      "setFeeRecipient(address)": "TREASURY_ADMIN",
+      "setFundingAllowed(address,bool)": "CONFIG_ADMIN",
+      "setTradingPaused(bool)": "GUARDIAN"
+    },
+    "SettlementOracle": {
+      "setMarket(address,address[],uint16,uint32,uint32)": "CONFIG_ADMIN",
+      "setClearinghouse(address)": "CONFIG_ADMIN",
+      "setKeeperRewards(address)": "CONFIG_ADMIN",
+      "adminResolve(address,uint40,uint256)": "CONFIG_ADMIN",
+      "veto(address,uint40)": "GUARDIAN",
+      "unveto(address,uint40)": "GUARDIAN"
+    },
+    "ChainlinkFeedSource": {
+      "setFeed(address,address,uint32,uint16)": "CONFIG_ADMIN",
+      "setOracle(address,bool)": "CONFIG_ADMIN"
+    },
+    "UniV3TwapSource": {
+      "setPool(address,address,uint128,uint32)": "CONFIG_ADMIN",
+      "setOracle(address,bool)": "CONFIG_ADMIN"
+    },
+    "DataStreamsSource": {
+      "setFeed(address,bytes32)": "CONFIG_ADMIN",
+      "setOracle(address,bool)": "CONFIG_ADMIN"
+    },
+    "ExpiryCalendar": {
+      "setHolidays(uint32[],bool)": "LISTING",
+      "setSpecialExpiry(uint40,bool)": "LISTING"
+    },
+    "KeeperRewards": {
+      "setBounty(bytes32,uint256)": "FEE_MANAGER",
+      "setDailyCap(uint256)": "FEE_MANAGER",
+      "setCaller(address,bool)": "CONFIG_ADMIN",
+      "defund(uint256)": "TREASURY_ADMIN",
+      "setTreasury(address)": "TREASURY_ADMIN"
+    },
+    "AutoRoller": {
+      "setMinRollUnits(uint64)": "LISTING",
+      "setKeeperRewards(address)": "CONFIG_ADMIN",
+      "reprice(address,address,uint128)": "PRICER"
+    },
+    "MakerVault": {
+      "setLimits((uint64,uint128,uint16,uint16,uint32,uint128))": "TREASURY_ADMIN",
+      "setTreasury(address)": "TREASURY_ADMIN",
+      "withdraw(address,uint256)": "TREASURY_ADMIN",
+      "withdrawPosition(uint256,uint256)": "TREASURY_ADMIN",
+      "depositToClearinghouse(address,uint256)": "QUOTER",
+      "withdrawFromClearinghouse(address,uint256)": "QUOTER",
+      "place(uint256,uint8,uint128,uint64,uint40)": "QUOTER",
+      "replace(uint256,uint128,uint64)": "QUOTER",
+      "cancel(uint256[])": "QUOTER",
+      "take((uint256,bool,uint256[],uint64,uint64,uint128,bool,address,uint40,uint128))": "QUOTER",
+      "close(uint256,uint64)": "QUOTER",
+      "claimOwed()": "QUOTER",
+      "sync(uint256[])": "QUOTER",
+      "refreshApprovals()": "QUOTER"
+    },
+    "MakerRegistry": {
+      "setTier(address,uint16)": "FEE_MANAGER"
+    },
+    "RewardsDistributor": {
+      "setRoot(uint256,bytes32,uint256)": "TREASURY_ADMIN",
+      "defund(uint256)": "TREASURY_ADMIN",
+      "setTreasury(address)": "TREASURY_ADMIN"
+    },
+    "RewardsDistributorLender": {
+      "setRoot(uint256,bytes32,uint256)": "TREASURY_ADMIN",
+      "defund(uint256)": "TREASURY_ADMIN",
+      "setTreasury(address)": "TREASURY_ADMIN"
+    },
+    "PayoutRouter": {
+      "setRouteV3(address,uint24)": "CONFIG_ADMIN",
+      "setRouteV4(address,uint24,int24)": "CONFIG_ADMIN",
+      "clearRoute(address)": "GUARDIAN"
+    },
+    "FeeSplitter": {
+      "setBurnBps(uint16)": "FEE_MANAGER",
+      "setBuybackCap(uint256)": "FEE_MANAGER",
+      "setConversionSlippageBps(uint16)": "FEE_MANAGER",
+      "setTreasury(address)": "TREASURY_ADMIN",
+      "setOrderBook(address)": "TREASURY_ADMIN",
+      "setRouter(address)": "TREASURY_ADMIN",
+      "setBuybackExecutor(address)": "TREASURY_ADMIN",
+      "setOracle(address)": "TREASURY_ADMIN",
+      "setToken(address)": "TREASURY_ADMIN",
+      "setPaused(bool)": "GUARDIAN",
+      "buyback(uint256)": "BUYBACK"
+    },
+    "V4BuybackExecutor": {},
+    "HouseVault": {
+      "depositToClearinghouse(address,uint256)": "QUOTER",
+      "withdrawFromClearinghouse(address,uint256)": "QUOTER",
+      "place(uint256,uint8,uint128,uint64,uint40)": "QUOTER",
+      "replace(uint256,uint128,uint64)": "QUOTER",
+      "cancel(uint256[])": "QUOTER",
+      "take((uint256,bool,uint256[],uint64,uint64,uint128,bool,address,uint40,uint128))": "QUOTER",
+      "close(uint256,uint64)": "QUOTER",
+      "claimOwed()": "QUOTER",
+      "sync(uint256[])": "QUOTER",
+      "refreshApprovals()": "QUOTER",
+      "setLimits((uint64,uint128,uint16,uint16,uint32,uint128))": "GUARDIAN",
+      "setPerformanceFeeBps(uint16)": "TREASURY_ADMIN",
+      "setProtocolAccount(address,bool)": "CONFIG_ADMIN",
+      "setOracle(address)": "CONFIG_ADMIN",
+      "setQuotingPaused(bool)": "GUARDIAN"
+    },
+    "HouseVaultFactory": {
+      "createVault(address,(uint64,uint128,uint16,uint16,uint32,uint128),string,string)": "LISTING"
+    },
+    "Hedger": {
+      "setLimits((uint128,uint128,uint16,uint16,uint128))": "TREASURY_ADMIN",
+      "fund(uint256)": "TREASURY_ADMIN",
+      "withdraw(uint256)": "TREASURY_ADMIN",
+      "withdrawCollateral(address,uint256)": "TREASURY_ADMIN",
+      "setEnabled(address,bool)": "CONFIG_ADMIN",
+      "setStockLoanMarket((address,address,address,address,uint256))": "CONFIG_ADMIN",
+      "setFreshnessSeconds(uint256)": "CONFIG_ADMIN",
+      "pause(bool)": "GUARDIAN",
+      "hedge(address,uint256,uint256,uint256)": "QUOTER",
+      "unwind(address,uint256,uint256,uint24,int24)": "QUOTER"
+    },
+    "EarnVault": {
+      "setSkimBps(uint16)": "TREASURY_ADMIN",
+      "setFundingEnabled(bool)": "CONFIG_ADMIN",
+      "setBookFunding(bool)": "CONFIG_ADMIN",
+      "setAdapter(address)": "TREASURY_ADMIN",
+      "sweepToVenue(uint256)": "QUOTER",
+      "pullFromVenue(uint256)": "QUOTER",
+      "depositToClearinghouse(address,uint256)": "QUOTER",
+      "withdrawFromClearinghouse(address,uint256)": "QUOTER",
+      "place(uint256,uint8,uint128,uint64,uint40)": "QUOTER",
+      "cancel(uint256[])": "QUOTER",
+      "refreshApprovals()": "QUOTER"
+    },
+    "StockVenueAdapter": {
+      "setEnabled(bool)": "CONFIG_ADMIN"
+    }
+  },
+  "unrestricted": {
+    "_comment": "Entry points that LOOK privileged and deliberately carry no manager role. The access-matrix test asserts each of these is NOT restricted, so a later task cannot quietly add a gate (or forget one) without the manifest moving. Source: 03-INTERFACES sections 2.1-2.10 and V8-DESIGN section 2.2.",
+    "Clearinghouse": {
+      "mint(uint256,uint64,address,address)": "in-contract minter allow-list (isMinter) plus the writer-or-operator check, NOT a manager role: the OrderBook's two mint calls sit inside try/gas, so a missing or delayed mapping would turn fills into silent skips that quoteTake had already promised",
+      "sweepFees(address)": "anyone; it can only push accrued fees to the fee recipient"
+    },
+    "OrderBook": {
+      "setFunding(bool)": "the maker itself, and only after CONFIG_ADMIN allowed it with setFundingAllowed"
+    },
+    "MakerVault": {
+      "deposit(address,uint256)": "permissionless from INTERFACE_VERSION 8: it pulls from msg.sender and can only add funds, so the Treasury Safe funds the vault with no role"
+    },
+    "AutoRoller": {
+      "setStrategy(address,(bool,bool,bool,uint16,uint16,uint16,uint16,uint64))": "the writer's own strategy",
+      "stop(address)": "the writer withdrawing its own ask",
+      "roll(address,address)": "permissionless keeper call",
+      "cancelStale(address,address)": "permissionless keeper call"
+    },
+    "PayoutRouter": {
+      "refreshRouteFee(address)": "anyone; it only re-reads the pool's own fee into the cache",
+      "swapToUsdg(address,uint256,uint256,address)": "anyone; the Clearinghouse sets and checks the floor itself"
+    },
+    "FeeSplitter": {
+      "claimOrderBookFees()": "anyone; it can only pull the splitter's own owed balance",
+      "distribute(address)": "anyone; the floor is the oracle's ok spot and the split is fixed"
+    },
+    "V4BuybackExecutor": {
+      "execute(uint256,uint256)": "IBuybackExecutor.execute, frozen here: the FeeSplitter only, checked in the contract. The executor has NO privileged function and no admin at all, which is why its targets entry is empty. T-182/F-CP-11 CORRECTS WHAT THIS NOTE USED TO SAY. It said 'C8-08 makes it implement IBuybackExecutor', as future tense, and described buy(uint256,uint256,uint256) as a spike leftover C8-08 would replace. Re-derived from src/v2/periphery/V4BuybackExecutor.sol at this base: it ALREADY implements IBuybackExecutor (:117) and execute (:396) is live. The REPLACEMENT is what did not happen -- buy (:335) is still there and is KEPT DELIBERATELY as the NON-BURN variant: same route with minWethOut exposed, tokens returned to the splitter rather than burned, splitter-only like execute. Two entry points, both ungated by design. DO NOT CITE test/v2/unit/AccessMatrix.t.sol AS EVIDENCE EITHER WAY: it exempts buy(uint256,uint256,uint256) from the unmapped-restricted check by name (:615), so the matrix stays green whether buy exists or not and cannot see this decision at all"
+    },
+    "KeeperRewards": {
+      "fund(uint256)": "anyone; a donation can only pay bounties",
+      "reward(address,bytes32)": "registered protocol contracts, checked in the contract"
+    },
+    "RewardsDistributor": {
+      "fund(uint256)": "anyone",
+      "claim(uint256,uint256,address,uint256,bytes32[])": "anyone; the USDG always goes to the proven account"
+    },
+    "Hedger": {
+      "repay(address,uint256)": "always-on exit; must work when disabled or the oracle is frozen, so it is not restricted"
+    },
+    "HouseVault": {
+      "requestDeposit(address,uint256)": "anyone; queues USDG or Stock Token for the next boundary and can only add funds",
+      "requestWithdraw(uint256)": "anyone; queues the caller's shares for the next boundary",
+      "cancelDepositRequest(address)": "the requester (or the account named) cancels an unpriced deposit queue",
+      "cancelWithdrawRequest()": "the requester cancels an unpriced withdrawal queue",
+      "rollEpoch()": "permissionless epoch boundary: GUARDIAN pause must never reach it, or queued deposits and withdrawals cannot be priced and depositor funds sit unclaimable; setQuotingPaused only stops quoting",
+      "claim()": "anyone with a priced request; pays the already-decided epoch rates"
+    },
+    "EarnVault": {
+      "cancelQueued(uint256)": "the request owner, checked in-contract at EarnVault.sol:592 (r.owner != msg.sender), NOT a manager role: a queued redemption belongs to whoever queued it and no role should be able to cancel someone else's",
+      "fund(address,uint256)": "the OrderBook only, checked in-contract at EarnVault.sol:702 (msg.sender != address(orderBook)): it is the fill-time funding callback, so a manager role here would let a key impersonate a fill"
+    },
+    "StockVenueAdapter": {
+      "deposit(uint256)": "the owning vault only, onlyVault at Erc4626VenueAdapter.sol:81. The adapter holds no policy; it moves the vault's assets in and out of the venue on the vault's instruction",
+      "withdraw(uint256,address)": "the owning vault only, onlyVault at Erc4626VenueAdapter.sol:86. This is the selector T-170 F-CP-01 was about: it IS gated on disk and was simply never declared, because nothing walked this contract until T-220"
+    }
+  },
+  "unmanagedTargets": {
+    "_comment": "Non-abstract src/v2 contracts that are deliberately NOT manager targets, each with the reason it is gated by something other than the AccessManager. script/v2/check-roles-targets.sh requires every such contract to be either a target or a row here, so the next one cannot drift in silently the way F-CP-01 did on Erc4626VenueAdapter (T-170-SEC-EARN-ADAPTER-AUTH). Same idea as `unrestricted` above, one level up: that section records a deliberately ungated SELECTOR, this one a deliberately unmanaged CONTRACT. A row here is a claim that the contract has NO restricted selector; the checker refuses the row the moment that stops being true.",
+    "Erc4626VenueAdapter": "Gated on an immutable vault, not a role: `onlyVault` tests msg.sender against `address public immutable vault`. T-170-SEC-EARN-ADAPTER-AUTH chose this over a manager role deliberately, because withdraw takes a caller-supplied recipient and every delay-0 role is a hot key, so a role-gated withdraw would still let a role holder pay themselves.",
+    "StockLoanAdapter": "Gated on an immutable owner, the Hedger, via `onlyOwner`. Its own NatSpec states it: not AccessManaged, no restricted selector. The Hedger is the manager target; this adapter is its arm.",
+    "StockZap": "Not gated at all, and correctly so: `writeZap` and `exitZap` move only the caller's own funds (both `safeTransferFrom(msg.sender, ...)`), so there is nothing for a role to protect. Its one privileged-looking entry point, `unlockCallback`, is guarded inside V4UnlockCallback by the pinned immutable poolManager AND a transient in-flight flag.",
+    "UniV3PayoutAdapter": "The v7 adapter, still deployed for the payoutAdapter key. It is `AccessControl`, not `Managed`: `setRoute` is `onlyRole(DEFAULT_ADMIN_ROLE)`, so it has no `restricted` selector for the manager to map. PayoutRouter is its v8 replacement and IS a target."
+  },
+  "notes": {
+    "grantDelays": "Grant delays and target admin delays are deliberately 0: AccessManager's setGrantDelay and setTargetAdminDelay need at least five days (minSetback) to take effect. Role changes are delayed by ADMIN's own 48 h EXECUTION delay instead. T-223/D13 SHARPENS THIS, because the decision text elsewhere says 'lowering a delay is itself delayed' and a reader who takes that as a per-delay setback will size the risk wrongly. There are TWO paths and only one of them is self-delayed. Re-derived from lib/openzeppelin-contracts at this base, not from the decision text: (a) a DIRECT lowering via grantRole on an EXISTING member calls Time.withUpdate(executionDelay, 0) (AccessManager._grantRole), and withUpdate computes setback = max(minSetback, value > newValue ? value - newValue : 0) -- so dropping FEE_MANAGER from 172800 to 0 is itself held for 172800 s, and the minSetback of 0 changes nothing. (b) REVOKE THEN GRANT is NOT self-delayed, and OZ's own comment at _grantRole says so: revoke clears members[account].since, so the following grant takes the newMember branch, assigns delay = executionDelay outright and never reaches withUpdate. Grant delays here are 0, so that path is instant. WHAT ACTUALLY ENFORCES THE 48 h IS THIS FILE'S ADMIN LANE, NOT THE SETBACK: both grantRole and revokeRole are ADMIN-restricted and ADMIN carries delaysS 172800, so each leg waits out the ADMIN execution delay. The property holds; the mechanism in the sentence does not. The four instant lanes are not a hole: GUARDIAN, PRICER, QUOTER and BUYBACK have roleAdmin OPS_ADMIN at delay 0, but all four already carry executionDelay 0, so nothing is ever lowered on them -- that is the intended instant rotation. Every role whose delay is non-zero (FEE_MANAGER, MARKET_FEE_MANAGER, CONFIG_ADMIN, TREASURY_ADMIN) is absent from roleAdmin and therefore admined by ADMIN at 48 h.",
+    "adminHasNoTarget": "No target function is mapped to ADMIN. ADMIN is manager-only. An unmapped restricted selector falls to ADMIN by default, which is exactly the mistake the access-matrix test must catch.",
+    "opsAdmin": "OPS_ADMIN is manager-only too: it is the role admin of GUARDIAN, PRICER, QUOTER and BUYBACK so a compromised hot key can be revoked and rotated with two signatures and no delay.",
+    "deployerRenounces": "The deployer is the manager's initial admin, wires every mapping with no delay, grants the roles with their delays and renounces ADMIN in the same batch. VerifyV8 fails if any EOA holds roles 0-6.",
+    "freezeState": "Written by F8-02 (interface freeze). The Solidity targets still carry their v7 AccessControl gates; C8-01..C8-08 replace each with `restricted` against this file, and the access-matrix test of C8-01 is what starts enforcing it. PayoutRouter, FeeSplitter and V4BuybackExecutor do not exist as contracts yet -- their entries are frozen from 03-INTERFACES sections 2.8-2.10 so the deploy script, the monitor and the indexer can be built against them now.",
+    "houseVaultSetOracle": "T-OP-058 (BUG-02 F6). `HouseVault.setOracle(address)` is CONFIG_ADMIN (delaysS 86400, GUARDIAN-cancellable) because it moves the ONE price source every boundary values depositors on; it was `immutable` before and an oracle migration stranded every live vault on the retired instance, boundary blocked for ever. It refuses zero / code-less / a contract whose SETTLEMENT_WINDOW() is absent or zero (the Clearinghouse.setMarketOracle probe) and refuses while a boundary is pending (block.timestamp >= epochEnd). OPS_ADMIN (delay 0) was the forbidden lane: changing the boundary's price source is a config change with a delay the guardian can cancel, not a rotation. Every factory-created vault needs this selector in its own setTargetFunctionRole batch, like the rest of this block (see houseVaultInstances). HouseVaultFactory keeps its immutable seed: a new vault takes the factory's current oracle at birth and its CONFIG_ADMIN moves it with one call.",
+    "houseVaultInstances": "Every factory-created vault needs its own setTargetFunctionRole batch from the Admin Safe under ADMIN's 48 h execution delay before the bot can quote it. No role is ever granted to a vault or to the factory: a role is (role, member) across ALL targets, so granting TREASURY_ADMIN to a vault would hand it KeeperRewards.defund, RewardsDistributor.setRoot, FeeSplitter.setTreasury and Clearinghouse.setFeeRecipient.",
+    "targetSignatures": "T-539, P8-03's third suspicion, CHECKED AND CORRECT at contracts 6021ee48a26621cb12908acc2bc4b4e952944d63. The suspicion said the Hedger `setLimits` tuple must stay `(uint128,uint128,uint16,uint16,uint128)` or AccessMatrix's dummy calldata will not reach `restricted`. It has not drifted: `IHedger.sol:9-15` declares `Limits { uint128 maxBorrowPerAsset; uint128 maxUsdgCollateral; uint16 healthFactorFloorBps; uint16 slippageBps; uint128 maxDailyNotional; }`, and the SELECTOR WAS RUN rather than reasoned about, both ways: `cast sig` on the string in this file and `forge inspect Hedger methods` on the compiled artifact both give 0x60e6f8bf. WHILE HERE, ALL 115 ROWS OF `.targets` WERE COMPARED AGAINST THE COMPILED ABIs, not just the Hedger one: zero mismatches. Two things that comparison teaches. First, `RewardsDistributorLender` is an INSTANCE name, not a type - it is a second `RewardsDistributor` deployed by `script/v2/DeployLenderRewards.s.sol` - so a checker keyed on file names reports it as a missing contract when it is not. Second, a tuple signature contains nested parentheses, and a regex that stops at the first `)` silently reports EVERY tuple row as a mismatch; that produced eight false positives here before the Hedger selector, already pinned, exposed the parser as the bug. WHAT WAS NOT GUARDED, AND NOW IS (T-569): `script/v2/check-roles-targets.sh` binds this file to the source tree in one direction only - a contract with `restricted` functions must be listed here or in `.unmanagedTargets`. Nothing checked that a signature LISTED here still matches the contract's ABI, which is precisely the drift P8-03 feared, and the 115-row comparison above was one person's hand pass wired into no gate. It is wired now: `test/v2/unit/ManifestResolvers.t.sol::test_everyListedSignatureIsStillOnTheCompiledAbi` compares every signature in `.targets` against the `.methodIdentifiers` of the artifact `VerifyV8._artifactOf` derives for that row. It matches WHOLE STRINGS and parses nothing, so the first-`)` matcher that produced eight false positives here cannot recur, and it asserts a non-zero comparison count per row and overall, so an empty row or an empty ABI cannot let it pass by having nothing to compare. `V4BuybackExecutor` is skipped by name - the one row that is empty on purpose - rather than by a rule that skips anything empty. The one-way property of the shell script is unchanged and is now stated in its own header: it reads source only and never opens `out/`, which is why the second direction had to live in a test."
+  }
+}

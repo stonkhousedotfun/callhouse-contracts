@@ -5,6 +5,8 @@ import {Test, Vm} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {V8AccessTest} from "../lib/V8Access.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {KeeperRewards} from "../../../src/v2/KeeperRewards.sol";
 import {IKeeperRewards} from "../../../src/v2/interfaces/IKeeperRewards.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
@@ -91,7 +93,7 @@ contract QuirkyUSDG is ERC20 {
 ///      reproduce the live token's reverting transfers; QuirkyUSDG covers the rest. Time is carried in local variables
 ///      and set with vm.warp, never read back from block.timestamp inside a test, because via_ir may fold repeated
 ///      block.timestamp reads in one function.
-contract KeeperRewardsTest is Test {
+contract KeeperRewardsTest is V8AccessTest {
     uint256 internal constant USDG = 1e6;
     uint256 internal constant EPOCH = 6 hours;
     uint256 internal constant T0 = 1_789_000_000;
@@ -123,7 +125,9 @@ contract KeeperRewardsTest is Test {
     function setUp() public {
         vm.warp(T0);
         usdg = new MockERC20("Global Dollar", "USDG", 6);
-        rewards = new KeeperRewards(IERC20(address(usdg)), admin);
+        _deployManager();
+        rewards = new KeeperRewards(IERC20(address(usdg)), address(manager), treasury);
+        _wire(address(rewards), "KeeperRewards", admin, 0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -171,7 +175,9 @@ contract KeeperRewardsTest is Test {
 
     function test_constructor_state() public view {
         assertEq(address(rewards.usdg()), address(usdg), "usdg");
-        assertTrue(rewards.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin), "admin role");
+        (bool isFeeManager,) = manager.hasRole(V8Roles.FEE_MANAGER, admin);
+        assertTrue(isFeeManager, "admin holds FEE_MANAGER through the manager");
+        assertEq(rewards.treasury(), treasury, "treasury from the constructor");
         assertEq(rewards.dailyCap(), 0, "cap starts at 0: pays nothing until configured");
         assertEq(rewards.spentToday(), 0, "nothing spent");
         assertEq(rewards.bounty(SETTLE), 0, "no bounties");
@@ -180,14 +186,16 @@ contract KeeperRewardsTest is Test {
 
     function test_constructor_rejectsCodelessUsdg() public {
         vm.expectRevert(V2Errors.UnsupportedAsset.selector);
-        new KeeperRewards(IERC20(address(0)), admin);
+        new KeeperRewards(IERC20(address(0)), address(manager), treasury);
         vm.expectRevert(V2Errors.UnsupportedAsset.selector);
-        new KeeperRewards(IERC20(makeAddr("eoa")), admin);
+        new KeeperRewards(IERC20(makeAddr("eoa")), address(manager), treasury);
     }
 
-    function test_constructor_rejectsZeroAdmin() public {
+    function test_constructor_rejectsZeroTreasuryOrCodelessAuthority() public {
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        new KeeperRewards(IERC20(address(usdg)), address(0));
+        new KeeperRewards(IERC20(address(usdg)), address(manager), address(0));
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new KeeperRewards(IERC20(address(usdg)), address(0), treasury);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -233,25 +241,22 @@ contract KeeperRewardsTest is Test {
             vm.expectRevert(V2Errors.NotAuthorized.selector);
             rewards.setDailyCap(1);
             vm.expectRevert(V2Errors.NotAuthorized.selector);
-            rewards.defund(strangers[i], 1);
+            rewards.defund(1);
             vm.stopPrank();
         }
         assertEq(usdg.balanceOf(address(rewards)), 5 * USDG, "nothing moved");
         assertFalse(rewards.isCaller(alice), "not registered");
     }
 
-    function test_admin_adminRoleTransfers() public {
+    function test_admin_roleChangesLiveOnTheManager() public {
+        // v8: the target holds no role table. Granting FEE_MANAGER on the manager is what lets a new admin set the cap.
         address newAdmin = makeAddr("newAdmin");
-        vm.startPrank(admin);
-        rewards.grantRole(V2Constants.DEFAULT_ADMIN_ROLE, newAdmin);
-        rewards.renounceRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
-        rewards.setDailyCap(1);
-        vm.stopPrank();
-
+        _grant(V8Roles.FEE_MANAGER, newAdmin, 0);
         vm.prank(newAdmin);
         rewards.setDailyCap(1);
-        assertEq(rewards.dailyCap(), 1, "new admin sets the cap");
+        assertEq(rewards.dailyCap(), 1, "new fee manager sets the cap");
+        vm.prank(admin);
+        rewards.setDailyCap(0);
     }
 
     function test_setBounty_ceiling() public {
@@ -619,7 +624,8 @@ contract KeeperRewardsTest is Test {
     ///      funded (minted directly: the budget is the balance).
     function _quirky(QuirkyUSDG.Mode mode) internal returns (KeeperRewards r, QuirkyUSDG q) {
         q = new QuirkyUSDG();
-        r = new KeeperRewards(IERC20(address(q)), admin);
+        r = new KeeperRewards(IERC20(address(q)), address(manager), treasury);
+        _wire(address(r), "KeeperRewards", admin, 0);
         vm.startPrank(admin);
         r.setCaller(oracle, true);
         r.setBounty(SETTLE, 50_000);
@@ -654,7 +660,7 @@ contract KeeperRewardsTest is Test {
 
     function test_fund_measuresDelta() public {
         QuirkyUSDG q = new QuirkyUSDG();
-        KeeperRewards r = new KeeperRewards(IERC20(address(q)), admin);
+        KeeperRewards r = new KeeperRewards(IERC20(address(q)), address(manager), treasury);
         q.mint(treasury, 10 * USDG);
         q.setMode(QuirkyUSDG.Mode.FeeOnTransferFrom);
 
@@ -674,7 +680,7 @@ contract KeeperRewardsTest is Test {
         vm.expectEmit(address(rewards));
         emit Defunded(treasury, 3 * USDG);
         vm.prank(admin);
-        rewards.defund(treasury, 3 * USDG);
+        rewards.defund(3 * USDG);
 
         assertEq(usdg.balanceOf(treasury), 3 * USDG, "treasury received");
         assertEq(usdg.balanceOf(address(rewards)), 5 * USDG - 400_000 - 3 * USDG, "funded - paid - defunded");
@@ -684,12 +690,22 @@ contract KeeperRewardsTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, rewards, 1_600_000, 2 * USDG)
         );
-        rewards.defund(treasury, 2 * USDG); // 1.6 USDG left
+        rewards.defund(2 * USDG); // 1.6 USDG left
 
         vm.prank(admin);
-        rewards.defund(alice, 1_600_000);
+        rewards.defund(1_600_000);
         assertEq(usdg.balanceOf(address(rewards)), 0, "emptied");
         assertEq(_reward(SETTLE), 0, "nothing left to pay");
+    }
+
+    /// @dev v8: defund has no free `to` argument any more; protocol money leaves only to the constructor treasury.
+    function test_defund_paysTreasuryOnly() public {
+        _configure(rewards, 50_000, 10 * USDG, 5 * USDG);
+        uint256 aliceBefore = usdg.balanceOf(alice);
+        vm.prank(admin);
+        rewards.defund(USDG);
+        assertEq(usdg.balanceOf(treasury), USDG, "the treasury is the only destination");
+        assertEq(usdg.balanceOf(alice), aliceBefore, "a non-treasury address receives nothing");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -733,7 +749,7 @@ contract KeeperRewardsTest is Test {
                 uint256 bal = usdg.balanceOf(address(rewards));
                 uint256 amount = r % (bal + 1);
                 vm.prank(admin);
-                rewards.defund(treasury, amount);
+                rewards.defund(amount);
                 defunded += amount;
             } else if (op <= 3) {
                 now_ += r % 12 hours;

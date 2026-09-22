@@ -7,7 +7,9 @@ import {ExpiryCalendar} from "../../../src/v2/ExpiryCalendar.sol";
 import {OrderBook} from "../../../src/v2/OrderBook.sol";
 import {IClearinghouse} from "../../../src/v2/interfaces/IClearinghouse.sol";
 import {IOrderBook} from "../../../src/v2/interfaces/IOrderBook.sol";
+import {ISettlementOracle} from "../../../src/v2/interfaces/ISettlementOracle.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MockClearinghouse} from "../../../src/v2/mocks/MockClearinghouse.sol";
 import {MockMakerRegistry} from "../../../src/v2/mocks/MockMakerRegistry.sol";
@@ -16,7 +18,12 @@ import {MockMakerRegistry} from "../../../src/v2/mocks/MockMakerRegistry.sol";
 ///         (underlying, expiry); until then the expiry reads as not final. trySpot is never ok, so createSeries skips
 ///         the spot band.
 /// @dev Private to the OrderBook suites (C2-05 owns src/v2/mocks/MockSettlementOracle.sol).
-contract BookOracleStub {
+contract BookOracleStub is ISettlementOracle {
+    /// @dev Raised by every ISettlementOracle member this double does not implement. Declared HERE rather
+    ///      than reused from {V2Errors}: an error the real oracle also throws would let a test that catches
+    ///      it pass against a path this stub never implemented.
+    error StubDoesNotImplement();
+
     mapping(address underlying => mapping(uint40 expiry => uint256)) public finalPrice;
 
     function setFinal(address underlying, uint40 expiry, uint256 price) external {
@@ -44,6 +51,46 @@ contract BookOracleStub {
     /// @dev The real Clearinghouse's createSeries pins the expiry's settlement configuration (INTERFACE_VERSION 6);
     ///      the book never depends on it.
     function pin(address, uint40) external pure {}
+
+    /// @dev Since SEC-07 the real Clearinghouse probes this before it accepts an oracle (`_requireSettlementOracle`)
+    ///      and refuses one that lacks it, or answers 0, with NoSource. Without it every real-Clearinghouse twin in
+    ///      test/v2/integration/OrderBookRealClearinghouse.t.sol failed setUp and ran nothing (T-482). The real
+    ///      oracle's value, from the constant SettlementOracle itself uses, never a literal.
+    function SETTLEMENT_WINDOW() external pure returns (uint32) {
+        return V2Constants.SETTLEMENT_WINDOW;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        THE REST OF ISettlementOracle. The book's suites never call these, and a double that answered
+        them with a zero would be answerable on paths it has never been exercised on -- so each one
+        reverts instead. The declaration above is what makes the compiler, not maintenance, the thing
+        that notices when this stub falls behind the interface (T-499; T-482 was that gap reaching
+        seven real-Clearinghouse suites as a setUp failure).
+    //////////////////////////////////////////////////////////////*/
+
+    function spot(address) external pure returns (uint256, uint256) {
+        revert StubDoesNotImplement();
+    }
+
+    function snapshot(address, uint40) external pure returns (uint8) {
+        revert StubDoesNotImplement();
+    }
+
+    function veto(address, uint40) external pure {
+        revert StubDoesNotImplement();
+    }
+
+    function unveto(address, uint40) external pure {
+        revert StubDoesNotImplement();
+    }
+
+    function candidate(address, uint40) external pure returns (uint256, uint8, bool, uint40) {
+        revert StubDoesNotImplement();
+    }
+
+    function adminResolve(address, uint40, uint256) external pure {
+        revert StubDoesNotImplement();
+    }
 }
 
 /// @notice A contract account (a vault, a multisig, a buggy integration) that forwards arbitrary calls and can be
@@ -174,15 +221,17 @@ abstract contract OrderBookBaseTest is BaseV2Test {
     //////////////////////////////////////////////////////////////*/
 
     function _deployCore() internal virtual override {
-        calendar = new ExpiryCalendar(admin, new uint32[](0));
+        calendar = _newCalendar(new uint32[](0), admin);
         oracle = new BookOracleStub();
         ch = _newClearinghouse();
         registry = new MockMakerRegistry();
 
         vm.startPrank(admin);
-        ch.grantRole(V2Constants.GUARDIAN_ROLE, guardian);
-        ch.registerMarket(address(nvda), _market());
-        ch.registerMarket(address(tsla), _market());
+        ch.setMinter(address(this), true);
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(25, 0);
+        ch.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch.registerMarket(address(tsla), STRIKE_TICK, true);
         vm.stopPrank();
 
         callId = ch.createSeries(address(nvda), false, CALL_STRIKE, FRI_2026_09_18);
@@ -190,7 +239,12 @@ abstract contract OrderBookBaseTest is BaseV2Test {
         dailyId = ch.createSeries(address(nvda), false, CALL_STRIKE, THU_2026_09_10);
         tslaId = ch.createSeries(address(tsla), false, TSLA_STRIKE, FRI_2026_09_18);
 
-        book = new OrderBook(IClearinghouse(address(ch)), admin, guardian, treasury, _defaultFees());
+        book = new OrderBook(IClearinghouse(address(ch)), address(manager), treasury, _defaultFees());
+        _wire(address(book), "OrderBook", admin, 0);
+        // INTERFACE_VERSION 8: write fills plan against `isMinter(book)` now, so the fixture opts the book in
+        // exactly as the v8 deploy will.
+        vm.prank(admin);
+        ch.setMinter(address(book), true);
         vm.label(address(ch), "Clearinghouse");
         vm.label(address(book), "OrderBook");
 
@@ -202,7 +256,16 @@ abstract contract OrderBookBaseTest is BaseV2Test {
 
     /// @dev The Clearinghouse under test, deployed with (admin, usdg, calendar, chFees, ""). `calendar` is set first.
     function _newClearinghouse() internal virtual returns (MockClearinghouse) {
-        return new MockClearinghouse(admin, address(usdg), address(calendar), chFees, "");
+        _deployManager();
+        MockClearinghouse house = _deployClearinghouse();
+        _wire(address(house), "Clearinghouse", admin, 0);
+        _grant(V8Roles.GUARDIAN, guardian, 0);
+        return house;
+    }
+
+    /// @dev Override to swap in the real Clearinghouse; keep `_newClearinghouse` so `_wire` still runs.
+    function _deployClearinghouse() internal virtual returns (MockClearinghouse) {
+        return new MockClearinghouse(address(manager), address(usdg), address(calendar), chFees, "");
     }
 
     function _market() internal view returns (V2Types.MarketConfig memory) {
@@ -262,8 +325,14 @@ abstract contract OrderBookBaseTest is BaseV2Test {
                                 HELPERS
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev Direct mint() requires isMinter[msg.sender] (Clearinghouse.sol:565). The fixture grants
+    ///      address(this) and the OrderBook; EOAs are not minters. Mirror ClearinghouseBase._write:
+    ///      writer names this as operator, then this mints.
     function _mintLongs(address who, uint256 longId, uint64 units) internal {
-        vm.prank(who);
+        if (!ch.isOperator(who, address(this))) {
+            vm.prank(who);
+            ch.setOperator(address(this), true);
+        }
         ch.mint(longId, units, who, who);
     }
 
@@ -290,7 +359,9 @@ abstract contract OrderBookBaseTest is BaseV2Test {
             limitPrice: type(uint128).max,
             writeToSell: false,
             recipient: recipient,
-            deadline: NO_DEADLINE
+            deadline: NO_DEADLINE,
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 
@@ -309,7 +380,9 @@ abstract contract OrderBookBaseTest is BaseV2Test {
             limitPrice: 0,
             writeToSell: writeToSell,
             recipient: recipient,
-            deadline: NO_DEADLINE
+            deadline: NO_DEADLINE,
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 

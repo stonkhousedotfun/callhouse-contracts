@@ -142,7 +142,9 @@ contract AF04_FeeSizing is BaseTest {
     function testFuzz_ceilingLeavesRoomForTheFee(uint256 free) public pure {
         free = bound(free, 1e18, 1_000_000e18);
         uint256 n = (free * 9_985) / 10_000 / 1e18;
-        if (n == 0) return;
+        // T-OP-046: a free balance under one lot at 99.85 % (free < 1e18 * 10_000 / 9_985) is outside the property
+        // ("for every free balance of at least one lot"); rejecting it counts as a rejection, a return counted as a pass.
+        vm.assume(n != 0);
         uint256 collateral = n * 1e18;
         uint256 fee = (collateral * 15) / 10_000;
         if (fee == 0) fee = 1;

@@ -1,0 +1,27 @@
+{
+  "_readme": "T-OP-158. HouseVault.Limits per LAUNCH ticker, read by script/v2/DeployHouseVault.s.sol (T-OP-141) through V2_HOUSE_LIMITS_FILE at createVault, inside the deployer's deferred hand-back window (T-OP-153, delay 0). Every value is DERIVED in docs/HOUSE-LIMITS-LAUNCH.md from HouseVault.sol's own arithmetic at contracts 7c2b0dcbfd546cc90f40cd7abadad46872a465a6 and measured market facts (callhouse ops/markets/v2-sources.json at e94a00cb73bf74425e982f1732133140bb01699c, R13 recon observedBlock 69216257); the seed-TVL assumption is stated per entry and the doc carries the 25k / 100k / 500k table for the TVL-dependent fields. Field shape mirrors the registry's v2.vault block (tier1.json): uint64/uint128 as decimal strings, uint16/uint32 as numbers. After launch: HouseVault.setLimits by the GUARDIAN wallet, instantly (T-OP-159/T-OP-160; coordinator amendment M-c53f3fb89fbe489c) -- so every launch value errs TIGHT: the owner can loosen in one transaction and cannot un-lose.",
+  "interfaceVersion": 8,
+  "derivedAt": {
+    "contractsSha": "7c2b0dcbfd546cc90f40cd7abadad46872a465a6",
+    "callhouseSha": "e94a00cb73bf74425e982f1732133140bb01699c",
+    "reconObservedBlock": 69216257,
+    "reconCheckedAt": "2026-09-22T00:09:52.179Z"
+  },
+  "seedTvlUsdgAssumed": 25000,
+  "NVDA": {
+    "maxSeriesUnits": "500",
+    "maxTotalNotional": "25000000000",
+    "askToleranceBps": 25,
+    "maxBidBpsOfSpot": 300,
+    "maxOrderLifetime": 1800,
+    "maxDailyOutflow": "625000000"
+  },
+  "SPCX": {
+    "maxSeriesUnits": "800",
+    "maxTotalNotional": "25000000000",
+    "askToleranceBps": 25,
+    "maxBidBpsOfSpot": 300,
+    "maxOrderLifetime": 1800,
+    "maxDailyOutflow": "625000000"
+  }
+}

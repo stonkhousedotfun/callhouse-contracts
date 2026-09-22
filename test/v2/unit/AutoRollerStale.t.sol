@@ -10,10 +10,11 @@ import {IOrderBook} from "../../../src/v2/interfaces/IOrderBook.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
+import {MockSettlementOracle} from "../../../src/v2/mocks/MockSettlementOracle.sol";
 
 /// @notice Exposes {AutoRoller._overtaken}. v2.0 writes calls only, so the put branch has no series to reach it with.
 contract AutoRollerHarness is AutoRoller {
-    constructor(IOrderBook book_, address admin_) AutoRoller(book_, admin_) {}
+    constructor(IOrderBook book_, address authority_) AutoRoller(book_, authority_) {}
 
     function overtaken(bool isPut, uint256 strike, uint256 spotPrice) external pure returns (bool) {
         return _overtaken(isPut, strike, spotPrice);
@@ -274,7 +275,7 @@ contract AutoRollerStaleTest is AutoRollerTestBase {
         V2Types.MarketConfig memory m = ch.market(address(nvda));
         m.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), m);
+        _reconfigure(ch, address(nvda), m);
 
         assertTrue(_cancelStale(keeper), "cancel is never pausable");
         assertTrue(_order(r.orderId).cancelled, "withdrawn");
@@ -495,7 +496,9 @@ contract AutoRollerStaleTest is AutoRollerTestBase {
 
     /// The put branch of the trigger, which v2.0 has no series to reach: puts are overtaken from above.
     function test_overtaken_putBranch() public {
-        AutoRollerHarness h = new AutoRollerHarness(IOrderBook(address(book)), admin);
+        // C8-05: AutoRoller is Managed, so the second argument is the AccessManager. `admin` is an EOA and
+        // Managed's constructor reverts NoSource on a code-less authority (src/v2/access/Managed.sol:48).
+        AutoRollerHarness h = new AutoRollerHarness(IOrderBook(address(book)), address(manager));
         assertTrue(h.overtaken(true, 231_000_000, 231_000_000), "put: spot == strike");
         assertTrue(h.overtaken(true, 231_000_000, 230_999_999), "put: spot below strike");
         assertFalse(h.overtaken(true, 231_000_000, 231_000_001), "put: spot above strike");
@@ -576,7 +579,9 @@ contract AutoRollerStaleTest is AutoRollerTestBase {
     {
         answer = bound(answer, 10_00000000, 5000_00000000);
         uint16 otmBps = uint16(bound(otm, 100, 2500));
-        uint16 askBps = uint16(bound(ask, 5, 1000));
+        // T-OP-063 / SEC-13: the compiled ask floor is MIN_ASK_BPS = 50; a fuzzed ask in [5, 49] would revert
+        // CeilingExceeded in setStrategy and this property would never reach its roll. The bound mirrors the constant.
+        uint16 askBps = uint16(bound(ask, 50, 1000));
         _setStrategy(alice, _weekly(otmBps, askBps));
         _printAt(_ny(TUE_0915, 9, 30, 0) + bound(offset, 0, SESSION - 1), int256(answer));
 
@@ -584,5 +589,134 @@ contract AutoRollerStaleTest is AutoRollerTestBase {
         _noCancel("a roll never places an ask its own reading could withdraw");
         assertFalse(_order(r.orderId).cancelled, "ask live");
         assertGt(uint256(r.strike), answer / 100, "strictly out of the money");
+    }
+}
+
+/// @notice T-OP-070. The roller's freshness paths driven by MockSettlementOracle's staleness model instead of the real
+///         oracle's feed clock. Before this row the mock's spot was fresh for ever, so every roller test that needed a
+///         stale reading had to build one on the real SettlementOracle; the mock now mirrors that oracle's three-step
+///         rule (T-OP-061) and offers a blunt switch, and these tests hold the roller to the same answers against it.
+///         The market is migrated to the mock BEFORE the roll, so the series is pinned to it and both `_plan`
+///         (market oracle) and `cancelStale` / `reprice` (pinned oracle) read the mock.
+contract AutoRollerMockStaleTest is AutoRollerTestBase {
+    MockSettlementOracle internal mock;
+
+    function _migrateToMock() internal {
+        mock = new MockSettlementOracle();
+        vm.label(address(mock), "mock oracle");
+        vm.prank(admin);
+        ch.setMarketOracle(address(nvda), address(mock));
+        assertEq(ch.market(address(nvda)).oracle, address(mock), "the market reads the mock");
+    }
+
+    /// @dev The Thursday 10:00 roll on the mock: strike 231.00, ask 3.30, series pinned to the mock.
+    function _rolledOnMock(V2Types.Strategy memory strategy) internal returns (Rolled memory r) {
+        _setStrategy(alice, strategy);
+        uint256 t0 = _ny(THU_0910, 10, 0, 0);
+        vm.warp(t0);
+        mock.setSpot(address(nvda), true, 220_000_000, t0);
+        r = _mustRoll(alice);
+        assertEq(r.strike, K_231, "strike 231");
+        assertEq(ch.series(r.longId).oracle, address(mock), "the series is pinned to the mock");
+    }
+
+    function _cancelStale(address caller) internal returns (bool) {
+        vm.prank(caller);
+        return roller.cancelStale(alice, address(nvda));
+    }
+
+    /// THE SWITCH. A crossing print the mock reports STALE is not actionable: cancelStale does nothing (trySpot is
+    /// not ok) and reprice reverts StaleSpot with the print's timestamp, exactly the real oracle's answers. Flip
+    /// the switch back and the same print withdraws the ask. PROVE-BY-BREAKING: with the pre-T-OP-070 mock (spot
+    /// fresh for ever) the first cancelStale here returns TRUE and this test is red at "stale: cancelStale acted".
+    function test_mockStale_switch_freezesCancelStaleAndReprice() public {
+        _migrateToMock();
+        Rolled memory r = _rolledOnMock(_smart(50, 150, 1000));
+        uint256 t = _ny(THU_0910, 11, 0, 0);
+        vm.warp(t);
+        mock.setSpot(address(nvda), true, 240_000_000, t); // past the 231 strike
+        mock.setSpotStale(address(nvda), true);
+
+        (bool ok, uint256 p, uint256 at) = mock.trySpot(address(nvda));
+        assertFalse(ok, "premise: the mock does not report the spot stale");
+        assertEq(p + at, 0, "a stale trySpot answers all zero, as the real oracle does");
+
+        assertFalse(_cancelStale(keeper), "stale: cancelStale acted on a reading the oracle refuses");
+        assertFalse(_order(r.orderId).cancelled, "ask still live");
+        vm.prank(pricer);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, t));
+        roller.reprice(alice, address(nvda), 3_400_000);
+
+        mock.setSpotStale(address(nvda), false);
+        assertTrue(_cancelStale(keeper), "fresh again: the crossing print withdraws the ask");
+        assertTrue(_order(r.orderId).cancelled, "withdrawn");
+    }
+
+    /// THE THREE-STEP RULE (SettlementOracle._spot after T-OP-061, mirrored by the mock). A print older than 30
+    /// minutes needs the modelled witness to agree within the market's band: agreeing, the print is fresh and the
+    /// ask is withdrawn; disagreeing, it is stale (trySpot not ok, spot reverts StaleSpot) and nothing happens. Under
+    /// 30 minutes no witness is asked, and past spotMaxAge the witness cannot help. Each branch runs from the same
+    /// snapshot so only the clock and the witness differ.
+    function test_mockStale_threeStepRule_anOldPrintNeedsAnAgreeingWitness() public {
+        _migrateToMock();
+        Rolled memory r = _rolledOnMock(_weekly(500, 150));
+        mock.setSpotRule(address(nvda), 25 hours, 100); // the launch rows: 25 h outer bound, 1 % band
+        uint256 t = _ny(THU_0910, 11, 0, 0);
+        vm.warp(t);
+        mock.setSpot(address(nvda), true, 240_000_000, t);
+        uint256 snap = vm.snapshotState();
+
+        // 1. Under SPOT_CORROBORATION_AGE: fresh, whatever the witness says.
+        mock.setSpotWitness(address(nvda), true, 260_000_000);
+        vm.warp(t + 29 minutes);
+        assertTrue(_cancelStale(keeper), "a 29-minute-old print needs no witness");
+        vm.revertToState(snap);
+
+        // 2a. Over it, witness agrees (240.50 within 1 % of 240.00): corroborated, fresh.
+        mock.setSpotWitness(address(nvda), true, 240_500_000);
+        vm.warp(t + 31 minutes);
+        (bool ok, uint256 p, uint256 at) = mock.trySpot(address(nvda));
+        assertTrue(ok && p == 240_000_000 && at == t, "corroborated: the print, not the witness, is the answer");
+        assertTrue(_cancelStale(keeper), "an old print the pool agrees with withdraws the ask");
+        assertTrue(_order(r.orderId).cancelled, "withdrawn");
+        vm.revertToState(snap);
+
+        // 2b. Over it, witness disagrees (260.00 is 8.3 % away): the market has moved, the print is stale.
+        mock.setSpotWitness(address(nvda), true, 260_000_000);
+        vm.warp(t + 31 minutes);
+        (ok, p, at) = mock.trySpot(address(nvda));
+        assertFalse(ok, "premise: the disagreeing witness did not make the print stale");
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, t));
+        mock.spot(address(nvda));
+        assertFalse(_cancelStale(keeper), "stale: the roller must not act on a print the market left behind");
+        assertFalse(_order(r.orderId).cancelled, "ask still live");
+        vm.revertToState(snap);
+
+        // 3. Over it, no witness (single-source market): the outer bound alone decides, as before T-OP-061.
+        mock.setSpotWitness(address(nvda), false, 0);
+        vm.warp(t + 25 hours);
+        assertTrue(_cancelStale(keeper), "exactly spotMaxAge old is fresh");
+        vm.revertToState(snap);
+        vm.warp(t + 25 hours + 1);
+        assertFalse(_cancelStale(keeper), "past spotMaxAge: stale");
+
+        // Past spotMaxAge an agreeing witness cannot rescue the print: the outer bound holds in every step.
+        mock.setSpotWitness(address(nvda), true, 240_000_000);
+        assertFalse(_cancelStale(keeper), "spotMaxAge is the outer bound whatever the witness says");
+    }
+
+    /// THE ROLL WAITS ON A STALE SPOT. `_plan` reads trySpot from the market oracle and returns "not due" when it is
+    /// not ok; with the mock reporting stale nothing is written, and the same call rolls once the spot is fresh.
+    function test_mockStale_rollWaitsForAFreshSpot() public {
+        _migrateToMock();
+        _setStrategy(alice, _weekly(500, 150));
+        uint256 t0 = _ny(THU_0910, 10, 0, 0);
+        vm.warp(t0);
+        mock.setSpot(address(nvda), true, 220_000_000, t0);
+        mock.setSpotStale(address(nvda), true);
+        _noRoll(alice, "stale spot: the roll waits");
+        mock.setSpotStale(address(nvda), false);
+        Rolled memory r = _mustRoll(alice);
+        assertEq(r.strike, K_231, "rolled on the fresh reading");
     }
 }

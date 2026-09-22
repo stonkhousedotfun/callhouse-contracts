@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {AutoRollerTestBase} from "../unit/AutoRollerBase.t.sol";
 import {AutoRollerStaleHandler} from "./AutoRollerStaleHandler.sol";
+import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 
 /// @notice Stateful invariants of {AutoRoller.cancelStale} and the open grace (INTERFACE_VERSION 7, v7 design §6.3),
 ///         asserted after every call of {AutoRollerStaleHandler} on the real AutoRoller, OrderBook, Clearinghouse and
@@ -121,5 +122,37 @@ contract AutoRollerStaleInvariantTest is AutoRollerTestBase {
         assertEq(handler.movedValue(), 0, "no value moved");
         assertEq(handler.badRoll(), 0, "no bad placement");
         assertLe(handler.maxStaleCancels(), 1, "one withdrawal per position");
+    }
+
+    /// @dev T-OP-036. The buyer take leg REALLY FILLS, and fills PARTIALLY, so the campaign explores the states the
+    ///      `o.units == o.filled` gate in {AutoRollerStaleHandler.take} otherwise skips. Before this floor the take
+    ///      counted nothing on either arm: if fills silently stopped -- the mutation T-OP-016 ran on V2Invariant,
+    ///      `setMinter(book, false)`, whose revert `OrderBook.sol` swallows -- S1-S6 stayed green with nothing to
+    ///      say. Under that same mutation this test goes red by name while the six invariants stay green, which is
+    ///      exactly the point: the invariants are right, they just could not see that the market had stopped.
+    function test_handler_fillsAndPartiallyFillsARolledAsk() public {
+        handler.roll(0, 0);
+        assertEq(handler.rolls(), 1, "the writer rolled an ask");
+
+        // One unit of an ask that is bigger than one unit: a partial fill by construction.
+        handler.take(0, 1, 0);
+        assertEq(handler.fills(), 1, "the first take did not fill");
+        assertEq(handler.partialFills(), 1, "a one-unit take of a larger ask must leave it partly open");
+        assertEq(handler.fillReverts(), 0, "the book refused a live ask");
+
+        // The whole remainder, passed EXACTLY: forge-std `bound` wraps an out-of-range value into the range rather
+        // than clamping it, so `type(uint64).max` would land on an arbitrary partial size, not on `remaining`.
+        (, uint256 orderId,) = roller.position(alice, address(nvda));
+        V2Types.Order memory o = _order(orderId);
+        assertGt(o.units - o.filled, 0, "precondition: the ask is still partly open");
+        handler.take(0, o.units - o.filled, 0);
+        assertEq(handler.fills(), 2, "the second take did not fill");
+        assertEq(handler.partialFills(), 1, "a full take of the remainder is not a partial fill");
+        assertEq(handler.fillReverts(), 0);
+
+        assertGt(handler.fills(), 0, "fills > 0: the campaign's takes reach the book");
+        assertGt(handler.partialFills(), 0, "partialFills > 0: the partial-fill states are explored");
+        assertEq(handler.movedValue(), 0, "the six invariants' subjects are untouched by a fill");
+        assertEq(handler.badRoll(), 0);
     }
 }

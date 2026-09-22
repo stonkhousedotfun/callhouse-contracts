@@ -99,6 +99,7 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     event LotsListed(uint32 indexed weekId, uint256 indexed optionId, uint64 lots, uint256 askUsdg);
     event LotFilled(bytes32 indexed orderHash, uint256 indexed optionId, uint256 premiumUsdg);
     event Settled(uint256 nvdaReturned, uint256 strikeUsdg);
+    event StrandedClaimRecovered(uint256 nvdaReturned, uint256 strikeUsdg);
     event UsdgClaimed(address indexed to, uint256 amount);
     event OwnershipTransferred(address indexed from, address indexed to);
 
@@ -120,7 +121,13 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
     error NotLiveListing(bytes32 orderHash);
     error BadLot();
     error InventoryLeftBehind(uint256 got, uint256 expected);
+    error NotStranded();
+    error StillStranded();
     error TooEarly();
+    /// @dev SEC-26: a non-zero conduit key would route fills through a conduit this account never approves.
+    error ConduitNotSupported();
+    /// @dev SEC-24: `baseExpiryTs + index` does not fit in the uint40 Valorem option types are keyed by.
+    error ExpiryOutOfRange();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -142,6 +149,13 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         clear = clear_;
         seaport = seaport_;
         priceFeed = priceFeed_;
+        // SEC-26. {initialize} approves SEAPORT ITSELF for the Clear ERC-1155, and nothing else. A non-zero
+        // conduit key tells Seaport to move the offer through that CONDUIT, which is a different address and is
+        // never approved here, so every fill of every listing would revert on the transfer -- the account could
+        // list and never sell. Until this row that was enforced only by the deploy verifier, off chain, where
+        // skipping one check produces a contract that looks correct and cannot trade. Enforce it where it is
+        // used: zero means "no conduit", which is the only configuration this account's approval supports.
+        if (conduitKey_ != bytes32(0)) revert ConduitNotSupported();
         conduitKey = conduitKey_;
     }
 
@@ -161,6 +175,17 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         IERC1155Minimal(address(clear)).setApprovalForAll(address(seaport), true);
     }
 
+    /// @notice Hands the account to `newOwner` and re-keys it on the factory.
+    /// @dev SEC-25, RE-DERIVED AND NOT WHAT THE FINDING SAID. A live listing's consideration recipient is fixed in
+    ///      the SIGNED order, so a listing made before this call still names the OLD owner. It does NOT go on
+    ///      paying them: every listing is `FULL_RESTRICTED` with this account as its zone, and {authorizeOrder}
+    ///      refuses any fill whose `consideration[0].recipient` is not the CURRENT `owner`. So the old listing
+    ///      becomes UNFILLABLE at the moment of transfer, not a leak.
+    ///      WHAT THAT COSTS INSTEAD, and it is real: this contract has no cancel path. Nothing here calls
+    ///      `seaport.cancel` or `incrementCounter`, so the dead order stays in `liveListing` and `reserved` stays
+    ///      debited until the listing's own `listedExerciseTs` passes and {settle} runs. The new owner cannot
+    ///      re-list before that ({list} reverts `AlreadyListed`). Transfer an account while it is listed and it is
+    ///      idle until the week ends.
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddr();
         address old = owner;
@@ -224,7 +249,14 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         (,,,,, uint64 cap) = factory.policy();
         if (lots > cap) revert TooManyLots();
 
-        uint40 expiryTs = uint40(uint256(baseExpiryTs) + index);
+        // SEC-24. `index` is a uint32 the factory assigns, so the sum is computed in uint256 and cannot wrap
+        // THERE -- but the downcast to uint40 truncates silently, and a truncated expiry keys a DIFFERENT
+        // Valorem option type: the account would write and list against terms nobody agreed to rather than
+        // refuse. Unreachable at any plausible timestamp (uint40 runs to the year 36812) and it costs one
+        // comparison to make the impossible case loud instead of silent.
+        uint256 rawExpiry = uint256(baseExpiryTs) + index;
+        if (rawExpiry > type(uint40).max) revert ExpiryOutOfRange();
+        uint40 expiryTs = uint40(rawExpiry);
         listedWeekId = weekId;
         listedStrikeUsdg = strikeUsdg;
         listedAskUsdg = askUsdg;
@@ -366,6 +398,54 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         emit Settled(nvdaIn, usdgIn);
     }
 
+    /// @notice True while {settle} has left a claim it could not redeem (SEC-03, AUDIT-FINDINGS F-02).
+    /// @dev MIRRORS `Vault.isStranded` (`src/Vault.sol:517-519`), which reads `phase == Phase.Idle &&
+    ///      claimKey != 0` and calls that "the one state only a failed redeem can produce". This account has no
+    ///      phase, and the equivalent fact is a CLEARED LISTING WITH A CLAIM STILL OPEN: {settle} zeroes
+    ///      `listedExpiryTs` on every path, and every path that clears `claimKey` does so inside {settle}'s
+    ///      success branch, so the two together can only mean the redeem was attempted and failed.
+    ///
+    ///      `claimKey != 0` ALONE WOULD BE WRONG AND THE DIFFERENCE MATTERS. A claim is open for the whole of a
+    ///      normal listing too, where `listedExpiryTs` is still set; gating on the claim by itself would let
+    ///      anyone redeem a LIVE position out from under the writer before its expiry.
+    function isStranded() public view returns (bool) {
+        return claimKey != 0 && listedExpiryTs == 0;
+    }
+
+    /// @notice Retries a claim redeem that {settle} could not complete. PERMISSIONLESS.
+    /// @dev THE DEAD END THIS REMOVES (SEC-03). `settle` redeems through `ValoremLib.tryRedeemClaim`, which
+    ///      CATCHES a reverting `redeem` and returns `ok == false` (`src/lib/ValoremLib.sol:319-335`). The
+    ///      account then cleared `listedExpiryTs` anyway, so the next `settle` reverted `TooEarly`
+    ///      (`Account.sol:328`), `list` reverted `StillOpen` on the still-set `optionId` (`Account.sol:208`),
+    ///      and NOTHING ELSE REDEEMS. The collateral stayed in Valorem permanently.
+    ///
+    ///      IT IS REACHABLE WITHOUT AN ATTACKER. `settle` is permissionless, so anyone may call it at the first
+    ///      eligible second, and a redeem reverts while USDG is paused or either token is frozen on this account
+    ///      or on Clear. Pauses are not announced; in a mass-pause week this lands on every settling account at
+    ///      once. `docs/V1-RUNOFF.md` warned the keeper not to crank `settle` during a pause, which is guidance
+    ///      standing in for a recovery path -- and it explicitly noted anyone else still can.
+    ///
+    ///      MIRRORED from `Vault.retryStrandedClaim` (`src/Vault.sol:1445-1473`) in form: permissionless, gated
+    ///      on {isStranded}, `NotStranded` when there is nothing to recover and `StillStranded` when the redeem
+    ///      fails again, so a caller can retry every block until the cause clears. It carries none of the
+    ///      vault's strand accounting because an account has no queue and no epochs to apportion between: the
+    ///      assets simply return to this account's balance, where `claimUsdg` and the owner already reach them.
+    function retryStrandedClaim() external nonReentrant {
+        if (!isStranded()) revert NotStranded();
+
+        (bool ok, uint256 nvdaIn, uint256 usdgIn) = ValoremLib.tryRedeemClaim(clear, asset, usdg, claimKey);
+        if (!ok) revert StillStranded();
+
+        // The same three fields {settle}'s success branch clears, for the same reason: `optionId` still being
+        // set is what makes `list` revert `StillOpen`, so leaving it would recover the collateral and keep the
+        // account unable to write again.
+        claimKey = 0;
+        optionId = 0;
+        contractsWritten = 0;
+
+        emit StrandedClaimRecovered(nvdaIn, usdgIn);
+    }
+
     function claimUsdg() external onlyOwner nonReentrant {
         uint256 amount = usdg.balanceOf(address(this));
         if (amount == 0) revert ZeroAmount();
@@ -373,6 +453,17 @@ contract WriterAccount is ReentrancyGuardTransient, IZone {
         emit UsdgClaimed(owner, amount);
     }
 
+    /// @notice The Seaport order this account lists a single lot under, for `salt`.
+    /// @dev SEC-44, THE CONSIDERATION ORDER IS LOAD-BEARING. `consideration[0]` is the SELLER's leg and
+    ///      `consideration[1]`, when there is a fee, is the fee recipient's. {authorizeOrder} enforces exactly
+    ///      that shape at fill time -- `consideration[0].recipient` must be the current `owner` -- so an order
+    ///      built with the fee first would be refused there, and a reader changing this ordering must change that
+    ///      check in the same commit.
+    ///      WHAT THIS DOES NOT ESTABLISH: the original finding held that Seaport itself requires consideration
+    ///      recipients to be SORTED, which would make an account unlistable whenever `feeRecipient < owner`. I did
+    ///      not verify that requirement against the Seaport version this repo pins, and nothing in this contract
+    ///      sorts or compares the two addresses. If that requirement is real it bites at list time, which is the
+    ///      loud direction, but it is unproven here and is recorded as such rather than guarded against.
     function lotOrder(uint256 salt) public view returns (OrderComponents memory c) {
         uint256 askUsdg = listedAskUsdg;
         (,,,, uint16 feeBps,) = factory.policy();

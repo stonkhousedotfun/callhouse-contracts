@@ -7,7 +7,6 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 import {BaseV2Test} from "../BaseV2.t.sol";
 import {MockERC20} from "../../../src/mocks/MockERC20.sol";
 import {IRewardsDistributor} from "../../../src/v2/interfaces/IRewardsDistributor.sol";
-import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {RewardsDistributor} from "../../../src/v2/mm/RewardsDistributor.sol";
 
@@ -39,7 +38,7 @@ contract RewardsDistributorTest is BaseV2Test {
     }
 
     function _deployCore() internal override {
-        dist = new RewardsDistributor(IERC20(address(usdg)), admin);
+        dist = _newDistributor(IERC20(address(usdg)), treasury, admin);
         usdg.mint(address(dist), 10_000_000e6);
     }
 
@@ -190,7 +189,7 @@ contract RewardsDistributorTest is BaseV2Test {
                                  ROOTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_setRoot_oncePerEpochAdminOnlyNonZero() public {
+    function test_setRoot_oncePerEpochTreasuryAdminOnlyNonZero() public {
         Vector memory v = _vector();
         vm.prank(stranger);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
@@ -333,7 +332,7 @@ contract RewardsDistributorTest is BaseV2Test {
         _setVectorRoot(v);
         uint256 balance = usdg.balanceOf(address(dist));
         vm.prank(admin);
-        dist.defund(treasury, balance);
+        dist.defund(balance);
         Entry memory e = v.entries[0];
         vm.expectRevert();
         dist.claim(v.epoch, e.index, e.account, e.amount, e.proof);
@@ -350,20 +349,52 @@ contract RewardsDistributorTest is BaseV2Test {
 
         vm.prank(stranger);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        dist.defund(stranger, 1);
+        dist.defund(1);
 
         vm.expectEmit(address(dist));
         emit RewardsDistributor.Defunded(treasury, 50e6);
         vm.prank(admin);
-        dist.defund(treasury, 50e6);
+        dist.defund(50e6);
         assertEq(usdg.balanceOf(treasury), 50e6);
-        assertTrue(dist.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin));
+        assertEq(dist.authority(), address(manager), "the AccessManager is the authority");
+    }
+
+    /// @dev INTERFACE_VERSION 8: rewards leave only to {treasury}. The v7 form with a free recipient is deleted, so
+    ///      nothing answers that selector, and the pointer moves only under TREASURY_ADMIN.
+    function test_defund_paysTheTreasuryAndNowhereElse() public {
+        address next = makeAddr("nextTreasury");
+        (bool ok,) = address(dist).call(abi.encodeWithSignature("defund(address,uint256)", stranger, uint256(1)));
+        assertFalse(ok, "defund(address,uint256) is deleted in v8");
+
+        vm.prank(stranger);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        dist.setTreasury(stranger);
+
+        vm.prank(admin);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        dist.setTreasury(address(0));
+
+        vm.expectEmit(address(dist));
+        emit IRewardsDistributor.TreasurySet(next);
+        vm.prank(admin);
+        dist.setTreasury(next);
+
+        vm.prank(admin);
+        dist.defund(25e6);
+        assertEq(usdg.balanceOf(next), 25e6, "the exit followed the pointer");
+        assertEq(usdg.balanceOf(stranger), 0, "and nothing reached anyone else");
     }
 
     function test_constructor_rejectsBadArgs() public {
         vm.expectRevert(V2Errors.UnsupportedAsset.selector);
-        new RewardsDistributor(IERC20(address(0xdead)), admin);
+        new RewardsDistributor(IERC20(address(0xdead)), address(manager), treasury);
+        // A code-less authority would make every restricted call revert with no way back.
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new RewardsDistributor(IERC20(address(usdg)), address(0), treasury);
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new RewardsDistributor(IERC20(address(usdg)), makeAddr("eoaAuthority"), treasury);
+        // Rewards must always have somewhere to go back to.
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        new RewardsDistributor(IERC20(address(usdg)), address(0));
+        new RewardsDistributor(IERC20(address(usdg)), address(manager), address(0));
     }
 }

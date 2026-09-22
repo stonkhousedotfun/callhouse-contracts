@@ -44,6 +44,11 @@ contract PinnedSettlementTest is V2IntegrationBase {
     int24 internal constant TICK_230 = 221941;
     uint256 internal constant EVIL = 400_000_000;
     int24 internal constant TICK_EVIL = 216407;
+    /// @dev The evil pool's liquidity floor. It was 0 ("no floor") until T-OP-062 made {UniV3TwapSource.setPool} refuse
+    ///      a zero floor (`CeilingExceeded`) and three walks here died at that call (T-OP-097 (b)(1)). This is the
+    ///      smallest legal floor, the value T-OP-062's own tests chose; the evil pool is pushed with exactly 1 L of
+    ///      in-range liquidity (setUp), so its harmonic-mean liquidity is 1, `1 < 1` is false, and the pool prices.
+    uint128 internal constant EVIL_POOL_MIN_LIQUIDITY = 1;
     uint128 internal constant K220 = 220_000_000;
 
     /// @dev R13 Regular Hours feed ids (callhouse ops/markets/v2-sources.json): NVDA's, and AAPL's as "another stream".
@@ -65,7 +70,8 @@ contract PinnedSettlementTest is V2IntegrationBase {
         // casting to 'uint40' is safe because START is a 2026 timestamp
         // forge-lint: disable-next-line(unsafe-typecast)
         evilPool.pushState(uint40(START - 2 hours), TICK_EVIL, 1);
-        dsSource = new DataStreamsSource(admin, address(new MockVerifierProxy()));
+        dsSource = new DataStreamsSource(address(manager), address(new MockVerifierProxy()));
+        _wire(address(dsSource), "DataStreamsSource", admin, 0);
         vm.startPrank(admin);
         dsSource.setFeed(address(nvda), DS_NVDA_FEED_ID);
         dsSource.setOracle(address(oracle), true);
@@ -88,6 +94,7 @@ contract PinnedSettlementTest is V2IntegrationBase {
         longId = ch.createSeries(address(nvda), false, strike, expiry);
         _deposit(alice, address(nvda), 1e18);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(longId, 100, alice, bob);
     }
 
@@ -167,7 +174,7 @@ contract PinnedSettlementTest is V2IntegrationBase {
 
         vm.startPrank(admin);
         clSource.setFeed(address(nvda), address(evilFeed), clSource.MAX_MAX_STALE(), clSource.MAX_ROUND_JUMP_CEIL_BPS());
-        poolSource.setPool(address(nvda), address(evilPool), 0, poolSource.MIN_WINDOW());
+        poolSource.setPool(address(nvda), address(evilPool), EVIL_POOL_MIN_LIQUIDITY, poolSource.MIN_WINDOW());
         oracle.setMarket(address(nvda), _list(address(clSource), address(poolSource)), 1000, 30 minutes, 0);
         vm.stopPrank();
         uint256 laterId = _createAndWrite(E2, 400_000_000); // spot is 400 now, so the strike band is [200, 800]
@@ -581,7 +588,7 @@ contract PinnedSettlementTest is V2IntegrationBase {
             if (honest) {
                 poolSource.setPool(address(nvda), address(pool), POOL_MIN_LIQUIDITY, poolSource.DEFAULT_WINDOW());
             } else {
-                poolSource.setPool(address(nvda), address(evilPool), 0, poolSource.MIN_WINDOW());
+                poolSource.setPool(address(nvda), address(evilPool), EVIL_POOL_MIN_LIQUIDITY, poolSource.MIN_WINDOW());
             }
         } else {
             dsSource.setFeed(address(nvda), honest ? DS_NVDA_FEED_ID : DS_OTHER_FEED_ID);
@@ -593,7 +600,8 @@ contract PinnedSettlementTest is V2IntegrationBase {
     /// pinned on the first oracle can be created on the second while the sources' configurations are unchanged (each
     /// confirms its pin without a log), and cannot once one changed (SourceNotPinned(Chainlink, PinMismatch)).
     function test_twoOracleMigration_worksOnlyWithUnchangedSources() public {
-        SettlementOracle oracle2 = new SettlementOracle(admin, guardian);
+        SettlementOracle oracle2 = new SettlementOracle(address(manager));
+        _wire(address(oracle2), "SettlementOracle", admin, 0);
         vm.startPrank(admin);
         oracle2.setMarket(address(nvda), _list(address(clSource), address(poolSource)), 0, 0, 0);
         oracle2.setClearinghouse(address(ch));
@@ -608,7 +616,7 @@ contract PinnedSettlementTest is V2IntegrationBase {
         V2Types.MarketConfig memory cfg = _nvdaMarket();
         cfg.oracle = address(oracle2);
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
 
         vm.recordLogs();
         vm.prank(keeper);
@@ -634,7 +642,8 @@ contract PinnedSettlementTest is V2IntegrationBase {
         uint256 oldLong = _createAndWrite(E2, K220);
         _printHonestWindow(E);
 
-        SettlementOracle oracle2 = new SettlementOracle(admin, guardian);
+        SettlementOracle oracle2 = new SettlementOracle(address(manager));
+        _wire(address(oracle2), "SettlementOracle", admin, 0);
         vm.startPrank(admin);
         oracle2.setMarket(address(nvda), _list(address(clSource), address(poolSource)), 0, 0, 0);
         oracle2.setClearinghouse(address(ch));
@@ -658,9 +667,16 @@ contract PinnedSettlementTest is V2IntegrationBase {
         assertTrue(finalized, "oracle2 captures E from the shared sources");
         assertEq(usdg.balanceOf(keeper), earned, "but pays nothing for an expiry it has no series of");
 
-        Clearinghouse ch2 = new Clearinghouse(admin, address(usdg), address(calendar), chFees, BASE_URI);
+        Clearinghouse ch2 =
+            new Clearinghouse(address(manager), address(usdg), address(calendar), address(splitter), BASE_URI);
+        _wire(address(ch2), "Clearinghouse", admin, 0);
         vm.startPrank(admin);
-        ch2.registerMarket(address(nvda), _nvdaMarket());
+        ch2.setMinter(alice, true);
+        ch2.setDefaultOracle(address(oracle));
+        ch2.setDefaultMarketFees(EXERCISE_FEE_BPS, 0);
+        ch2.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch2.setMarketOracle(address(nvda), address(oracle));
+        ch2.setMarketFees(address(nvda), EXERCISE_FEE_BPS, 0);
         oracle.setClearinghouse(address(ch2));
         vm.stopPrank();
         vm.prank(keeper);
@@ -696,6 +712,7 @@ contract PinnedSettlementTest is V2IntegrationBase {
         uint256 longId = ch.createSeries(address(nvda), false, 210_000_000, thu);
         _deposit(alice, address(nvda), 10e18);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(longId, 1000, alice, bob);
 
         vm.warp(thu + V2Constants.SNAPSHOT_GRACE + 1);
@@ -743,7 +760,7 @@ contract PinnedSettlementTest is V2IntegrationBase {
         assertTrue(pinned, "pinned anyway");
 
         vm.prank(admin);
-        poolSource.setPool(address(nvda), address(evilPool), 0, 300);
+        poolSource.setPool(address(nvda), address(evilPool), EVIL_POOL_MIN_LIQUIDITY, 300);
         (bool poolPinned, address pinnedPool) = _poolPinned(far);
         assertTrue(poolPinned && pinnedPool == address(pool), "the pool change does not reach it");
     }

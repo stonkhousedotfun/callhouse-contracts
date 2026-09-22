@@ -55,6 +55,96 @@ contract V2DocsNumbersTest is V2IntegrationBase {
 
     /// V2-ARCHITECTURE.md "Values no role can change" and the per-contract bounds quoted there. V2Constants itself is
     /// pinned by InterfaceIdsTest.
+    /*//////////////////////////////////////////////////////////////
+       T-513 -- THE DOCUMENTS THAT CITE THIS SUITE, READ
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Every constant this suite pins must actually APPEAR in the document that cites this suite as its
+    ///         guarantee. Until T-513 the suite asserted the CONTRACT side of each number and never opened either
+    ///         document, so `V2-ARCHITECTURE.md` -- which names `V2DocsNumbersTest` 16 times -- and
+    ///         `V2-ACCOUNTING.md`, which names it 12, cited a guarantor that could not see them. A reader checking
+    ///         whether the docs were protected found a citation and stopped.
+    ///
+    /// @dev    EVERY NEEDLE IS A QUALIFIED PHRASE, NEVER A BARE NUMBER, and that is the whole design. Measured in
+    ///         `V2-ARCHITECTURE.md` at this base: the bare token `8` occurs 246 times, `24 h` 43, `300` 21, `1 h`
+    ///         17, `1000` 13. An anchor asserting that `8` appears is green forever whatever the document says --
+    ///         a second check that cannot fail, stacked on top of the one this row exists to remove. Each phrase
+    ///         below occurs once or twice, so deleting or changing the sentence it lives in turns this red.
+    ///
+    ///         The grant in `foundry.toml` is the two files by name, not `./docs`. A third document stays
+    ///         unreadable on purpose, which is what {test_docs_anchorFailsClosedOnAnUngrantedPath} proves.
+    function test_docs_pinnedConstantsAppearInTheDocumentsThatCiteThem() public view {
+        string memory arch = vm.readFile("docs/V2-ARCHITECTURE.md");
+        string memory acct = vm.readFile("docs/V2-ACCOUNTING.md");
+
+        // SettlementOracle, against the parameter table V2-ARCHITECTURE.md:385 cites this test for.
+        _inDoc(arch, "settlement window 1800 s", "SETTLEMENT_WINDOW");
+        _inDoc(arch, "150 bps", "DEFAULT_MAX_DEVIATION_BPS");
+        _inDoc(arch, "ceiling 1000", "MAX_DEVIATION_CEIL_BPS");
+        _inDoc(arch, "delay 6 h", "DEFAULT_UNCORROBORATED_DELAY");
+        _inDoc(arch, "30 min to 24 h", "MIN/MAX_UNCORROBORATED_DELAY");
+        _inDoc(arch, "spot age 1 h", "DEFAULT_SPOT_MAX_AGE");
+        _inDoc(arch, "ceiling 4 days", "MAX_SPOT_MAX_AGE");
+        _inDoc(arch, "at most 8 sources", "MAX_SOURCES");
+
+        // ChainlinkFeedSource.
+        _inDoc(arch, "at most 96 round reads", "MAX_ROUND_READS");
+        _inDoc(arch, "26 h", "DEFAULT_MAX_STALE");
+        _inDoc(arch, "1 h to 7 days", "MIN/MAX_MAX_STALE");
+        _inDoc(arch, "jump 2000 bps", "DEFAULT_MAX_ROUND_JUMP_BPS");
+        _inDoc(arch, "ceiling 5000", "MAX_ROUND_JUMP_CEIL_BPS");
+
+        // UniV3TwapSource.
+        _inDoc(arch, "default 300 s", "DEFAULT_WINDOW");
+        _inDoc(arch, "60 s to 3600 s", "MIN/MAX_WINDOW");
+
+        // V2-ACCOUNTING.md cites this suite for worked arithmetic rather than for the constant table, so its
+        // needles are the FIGURES of those examples -- the strings a changed example would take with it.
+        _inDoc(acct, "502_740_189_445_196", "settlement payout per unit at 221.70");
+        _inDoc(acct, "`100_000` = 0.10 USDG", "USDG base-unit convention");
+        _inDoc(acct, "1 USDG at deploy", "minRedeemPayout");
+    }
+
+    /// @notice The fail-closed arm. An ungranted path must REVERT, not read as an absent phrase.
+    /// @dev    This is why `foundry.toml` grants the two documents by name instead of `./docs`: without a path
+    ///         that genuinely refuses, an anchor that silently read nothing would be indistinguishable from one
+    ///         that read the file and found its needle. `docs/V2-DATA-STREAMS.md` is a real document in the same
+    ///         directory, it exists at this base, and it is deliberately NOT granted.
+    function test_docs_anchorFailsClosedOnAnUngrantedPath() public {
+        vm.expectRevert();
+        this.readDocExternal("docs/V2-DATA-STREAMS.md");
+    }
+
+    /// @dev `vm.readFile` reverts inside the cheatcode, so the call needs an external boundary to catch it.
+    function readDocExternal(string calldata path) external view returns (string memory) {
+        return vm.readFile(path);
+    }
+
+    /// @dev Asserts `needle` appears in `doc`, naming the constant rather than printing the document.
+    function _inDoc(string memory doc, string memory needle, string memory what) internal pure {
+        assertTrue(
+            _contains(doc, needle),
+            string.concat(what, ": the document that cites this suite no longer contains '", needle, "'")
+        );
+    }
+
+    function _contains(string memory haystack, string memory needle) internal pure returns (bool) {
+        bytes memory h = bytes(haystack);
+        bytes memory n = bytes(needle);
+        if (n.length == 0 || h.length < n.length) return false;
+        for (uint256 i; i + n.length <= h.length; ++i) {
+            bool ok = true;
+            for (uint256 j; j < n.length; ++j) {
+                if (h[i + j] != n[j]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return true;
+        }
+        return false;
+    }
+
     function test_docs_contractConstants() public {
         // SettlementOracle: parameter defaults and bounds, source count.
         assertEq(uint256(oracle.SETTLEMENT_WINDOW()), 1800, "window");
@@ -81,7 +171,7 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         assertEq(uint256(poolSource.MAX_WINDOW()), 1 hours, "max window");
 
         // DataStreamsSource (built, disabled).
-        DataStreamsSource ds = new DataStreamsSource(admin, address(new MockVerifierProxy()));
+        DataStreamsSource ds = new DataStreamsSource(address(manager), address(new MockVerifierProxy()));
         assertEq(ds.RING_SIZE(), 256, "ring");
         assertEq(ds.MIN_OBSERVATIONS(), 10, "observations per window");
         assertEq(uint256(ds.MAX_GAP()), 300, "max gap");
@@ -94,15 +184,22 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         assertEq(uint256(ch.DEFAULT_MIN_REDEEM_PAYOUT()), 1_000_000, "min redeem payout constant");
         assertEq(uint256(ch.minRedeemPayout()), 1_000_000, "min redeem payout at deploy");
         assertEq(uint256(calendar.NEXT_EXPIRY_SEARCH()), 14 days, "nextExpiry search");
-        KeeperRewards fresh = new KeeperRewards(IERC20(address(usdg)), admin);
+        KeeperRewards fresh = new KeeperRewards(IERC20(address(usdg)), address(manager), treasury);
         assertEq(fresh.dailyCap(), 0, "a new KeeperRewards pays nothing");
 
         // AutoRoller.
-        AutoRoller roller = new AutoRoller(IOrderBook(address(book)), admin);
+        // C8-05: the second argument is the AccessManager, not an admin EOA. Passing `admin` here compiles
+        // (both are `address`) and then reverts in Managed's constructor, which is how this line survived
+        // the migration unnoticed; it mirrors the KeeperRewards line above, migrated the same way by C8-04.
+        AutoRoller roller = new AutoRoller(IOrderBook(address(book)), address(manager));
         assertEq(uint256(roller.MIN_OTM_BPS()), 100, "min otm");
         assertEq(uint256(roller.MAX_OTM_BPS()), 2500, "max otm");
-        assertEq(uint256(roller.MIN_ASK_BPS()), 5, "min ask");
+        // T-OP-063 / SEC-13: the compiled ask floor is 50 bps (was 5) and a single reprice may lower an ask by at
+        // most 2,500 bps of itself. docs/V8-ACCEPTED-RISKS.md:170 still quotes the old 5; the doc is out of that
+        // row's fence and is reported there.
+        assertEq(uint256(roller.MIN_ASK_BPS()), 50, "min ask");
         assertEq(uint256(roller.MAX_ASK_BPS()), 1000, "max ask");
+        assertEq(uint256(roller.MAX_REPRICE_DROP_BPS()), 2500, "max reprice drop per call");
         assertEq(uint256(roller.DAILY_MIN_LEAD()), 2 hours, "daily lead");
         assertEq(uint256(roller.WEEKLY_MIN_LEAD()), 24 hours, "weekly lead");
         assertEq(uint256(roller.minRollUnits()), 100, "min roll units at deploy");
@@ -110,8 +207,8 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         // MakerVault.
         MakerVault vault = new MakerVault(
             IOrderBook(address(book)),
-            admin,
-            address(0),
+            address(manager),
+            treasury,
             MakerVault.Limits({
                 maxSeriesUnits: 0,
                 maxTotalNotional: 0,
@@ -122,9 +219,9 @@ contract V2DocsNumbersTest is V2IntegrationBase {
             })
         );
         assertEq(vault.MAX_LIVE_ORDERS_PER_SERIES(), 16, "live orders per series");
-        assertEq(vault.OUTFLOW_WINDOW(), 1 days, "outflow refill window (INTERFACE_VERSION 7)");
+        assertEq(vault.OUTFLOW_WINDOW(), 1 days, "outflow refill window (INTERFACE_VERSION 8)");
 
-        // INTERFACE_VERSION 7 shared constants: the collateral rent and the pool ring the c10 sign-off needs.
+        // INTERFACE_VERSION 8 shared constants: the collateral-rent dial (launch 0) and the pool ring.
         assertEq(V2Constants.PPM, 1_000_000, "rent denominator");
         assertEq(uint256(V2Constants.MINT_FEE_PERIOD), 7 days, "rent is quoted per week of remaining life");
         assertEq(uint256(V2Constants.MINT_FEE_CEIL_PPM), 5_000, "rent ceiling, 0.5 %/week of the locked collateral");
@@ -179,7 +276,7 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         uint256 carolFree = ch.free(carol, address(nvda));
 
         // Micro ticket: 1 unit (0.01 share) from carol at 12.50.
-        uint256[4] memory before = _usdgOf(bob, carol, alice, treasury);
+        uint256[4] memory before = _usdgOf(bob, carol, alice, address(splitter));
         vm.recordLogs();
         vm.prank(bob);
         (uint64 units, uint256 premium, uint256 takerFee) =
@@ -190,10 +287,10 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         assertEq(takerFee, 12_500, "micro: taker fee = min(100_000, 10 % of 125_000)");
         assertEq(f.length, 1, "micro: one fill");
         _assertFill(f[0], carol, 1, 12_500_000, 125_000, 6_250, 6_250, true);
-        uint256[4] memory afterIt = _usdgOf(bob, carol, alice, treasury);
+        uint256[4] memory afterIt = _usdgOf(bob, carol, alice, address(splitter));
         assertEq(before[0] - afterIt[0], 137_500, "micro: buyer pays premium + taker fee");
         assertEq(afterIt[1] - before[1], 125_000, "micro: maker gets premium - seller fee + rebate");
-        assertEq(afterIt[3] - before[3], 12_500, "micro: fee recipient gets seller fee + taker fee - rebate");
+        assertEq(afterIt[3] - before[3], 12_500, "micro: FeeSplitter gets seller fee + taker fee - rebate");
         assertEq(carolFree - ch.free(carol, address(nvda)), 1e16, "micro: one unit of NVDA collateral locked");
         _logTake("micro", premium, takerFee, f);
 
@@ -209,11 +306,11 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         assertEq(f.length, 2, "share: two fills");
         _assertFill(f[0], carol, 99, 12_500_000, 12_375_000, 618_750, 49_480, true);
         _assertFill(f[1], alice, 1, 13_000_000, 130_000, 6_500, 520, true);
-        afterIt = _usdgOf(bob, carol, alice, treasury);
+        afterIt = _usdgOf(bob, carol, alice, address(splitter));
         assertEq(before[0] - afterIt[0], 12_605_000, "share: buyer");
         assertEq(afterIt[1] - before[1], 11_805_730, "share: carol");
         assertEq(afterIt[2] - before[2], 124_020, "share: alice");
-        assertEq(afterIt[3] - before[3], 675_250, "share: fee recipient");
+        assertEq(afterIt[3] - before[3], 675_250, "share: FeeSplitter");
         assertEq(ch.balanceOf(bob, c210), 101, "bob's longs");
         _logTake("one share", premium, takerFee, f);
     }
@@ -224,14 +321,13 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         uint256 c210 = _market();
         _deposit(alice, address(nvda), 1e18);
         _deposit(carol, address(nvda), 1e18);
-        vm.prank(alice);
-        ch.mint(c210, 40, alice, bob); // bob holds 40 longs to sell
+        _mintAs(alice, c210, 40, bob); // bob holds 40 longs to sell; mint through the fixture minter, not alice
 
         uint256 bid = _place(mm, c210, BID, 9_000_000, 60);
         assertEq(usdg.balanceOf(address(book)), 5_400_000, "bid escrow = 9_000_000 x 60 / 100");
 
         // bob sells 40 from his wallet.
-        uint256[4] memory before = _usdgOf(bob, mm, carol, treasury);
+        uint256[4] memory before = _usdgOf(bob, mm, carol, address(splitter));
         vm.recordLogs();
         vm.prank(bob);
         (uint64 units, uint256 premium, uint256 takerFee) = book.take(_sellParams(c210, _ids(bid), 40, false, bob));
@@ -240,10 +336,10 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         assertEq(premium, 3_600_000, "inventory: premium");
         assertEq(takerFee, 100_000, "inventory: flat taker fee");
         _assertFill(f[0], mm, 40, 9_000_000, 3_600_000, 0, 50_000, false);
-        uint256[4] memory afterIt = _usdgOf(bob, mm, carol, treasury);
+        uint256[4] memory afterIt = _usdgOf(bob, mm, carol, address(splitter));
         assertEq(afterIt[0] - before[0], 3_500_000, "inventory: seller gets premium - taker fee");
         assertEq(afterIt[1] - before[1], 50_000, "inventory: bid maker gets its rebate");
-        assertEq(afterIt[3] - before[3], 50_000, "inventory: fee recipient");
+        assertEq(afterIt[3] - before[3], 50_000, "inventory: FeeSplitter");
         _logTake("sell from inventory", premium, takerFee, f);
 
         // carol writes 10 into the rest of the bid.
@@ -257,10 +353,10 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         assertEq(premium, 900_000, "write: premium");
         assertEq(takerFee, 90_000, "write: taker fee at the 10 % cap");
         _assertFill(f[0], mm, 10, 9_000_000, 900_000, 45_000, 45_000, true);
-        afterIt = _usdgOf(bob, mm, carol, treasury);
+        afterIt = _usdgOf(bob, mm, carol, address(splitter));
         assertEq(afterIt[2] - before[2], 765_000, "write: seller gets premium - seller fee - taker fee");
         assertEq(afterIt[1] - before[1], 45_000, "write: bid maker rebate");
-        assertEq(afterIt[3] - before[3], 90_000, "write: fee recipient");
+        assertEq(afterIt[3] - before[3], 90_000, "write: FeeSplitter");
         assertEq(carolFree - ch.free(carol, address(nvda)), 10e16, "write: carol's collateral locked");
         assertEq(ch.balanceOf(mm, c210), 50, "mm bought 50");
         assertEq(usdg.balanceOf(address(book)), 900_000, "the bid's last 10 units stay escrowed");
@@ -283,12 +379,10 @@ contract V2DocsNumbersTest is V2IntegrationBase {
         vm.stopPrank();
         _deposit(alice, address(nvda), 3e18);
         _deposit(alice, address(usdg), 230e6);
-        vm.startPrank(alice);
-        ch.mint(c210, 100, alice, bob);
-        ch.mint(c220, 100, alice, carol);
-        ch.mint(c230, 100, alice, bob);
-        ch.mint(p230, 100, alice, bob);
-        vm.stopPrank();
+        _mintAs(alice, c210, 100, bob);
+        _mintAs(alice, c220, 100, carol);
+        _mintAs(alice, c230, 100, bob);
+        _mintAs(alice, p230, 100, bob);
         assertEq(ch.locked(c210), 1e18, "a one-share call locks 1 NVDA");
         assertEq(ch.locked(p230), 230_000_000, "a one-share put locks the strike in USDG");
         assertEq(ch.openInterest(address(nvda), E), 400, "open interest in units");

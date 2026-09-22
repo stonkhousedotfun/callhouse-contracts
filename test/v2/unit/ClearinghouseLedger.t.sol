@@ -52,7 +52,7 @@ contract ClearinghouseLedgerTest is ClearinghouseTestBase {
     function test_deposit_measuresBalanceDelta() public {
         ClearinghouseFeeOnTransferToken fot = new ClearinghouseFeeOnTransferToken();
         vm.prank(admin);
-        ch.registerMarket(address(fot), _cfg(address(oracle)));
+        ch.registerMarket(address(fot), STRIKE_TICK, true);
         fot.mint(alice, 100e18);
         vm.prank(alice);
         fot.approve(address(ch), type(uint256).max);
@@ -62,6 +62,47 @@ contract ClearinghouseLedgerTest is ClearinghouseTestBase {
         _deposit(alice, address(fot), 100e18);
         assertEq(ch.free(alice, address(fot)), 99e18, "credited what arrived, not what was asked");
         assertEq(fot.balanceOf(address(ch)), 99e18);
+    }
+
+    /// @notice SEC-49. A credit to `free[address(this)]` can never be spent: {withdraw} pays `msg.sender` and this
+    ///         contract never calls it on itself, so the balance is bricked dust that also overstates the ledger
+    ///         against the token balance. There is no recovery path after the fact, so the refusal is the only one.
+    /// @dev POSITIVE CONTROL: the identical call to an ordinary account succeeds, so the revert is the recipient
+    ///      and not the asset, the amount, the approval or the caller.
+    function test_deposit_refusesCreditingTheHouseItself() public {
+        vm.prank(alice);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        ch.deposit(address(usdg), 1_000e6, address(ch));
+        assertEq(ch.free(address(ch), address(usdg)), 0, "nothing was credited to the house");
+
+        vm.prank(alice);
+        ch.deposit(address(usdg), 1_000e6, bob);
+        assertEq(ch.free(bob, address(usdg)), 1_000e6, "the same call to an ordinary account goes through");
+    }
+
+    /// @notice SEC-22. {sweepFees} zeroes `accruedFees[asset]` and THEN transfers to the recipient. With the
+    ///         recipient set to this contract that transfer moves nothing, so one sweep strands every accrued fee
+    ///         permanently and flips invariant I2' from balance == sum of claims to balance > sum of claims. Zero
+    ///         was already refused; this one is the SILENT version of the same mistake.
+    /// @dev POSITIVE CONTROL: an ordinary address is still accepted and stored, so the refusal is this contract's
+    ///      address and not the role gate, the reentrancy guard or the setter itself.
+    function test_setFeeRecipient_refusesTheHouseAndZero() public {
+        address before_ = ch.feeRecipient();
+
+        vm.prank(admin);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        ch.setFeeRecipient(address(ch));
+        assertEq(ch.feeRecipient(), before_, "the house was accepted as the fee recipient");
+
+        vm.prank(admin);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        ch.setFeeRecipient(address(0));
+        assertEq(ch.feeRecipient(), before_, "zero was accepted");
+
+        address safe = makeAddr("a fee safe");
+        vm.prank(admin);
+        ch.setFeeRecipient(safe);
+        assertEq(ch.feeRecipient(), safe, "an ordinary recipient is still accepted");
     }
 
     function test_deposit_unsupportedAsset() public {
@@ -82,7 +123,7 @@ contract ClearinghouseLedgerTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory off = _cfg(address(oracle));
         off.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), off);
+        _reconfigure(ch, address(nvda), off);
         _deposit(alice, address(nvda), 1e18);
         assertEq(ch.free(alice, address(nvda)), 1e18);
     }
@@ -171,6 +212,13 @@ contract ClearinghouseLedgerTest is ClearinghouseTestBase {
     function test_operator_mintsFromWritersCollateralOnly() public {
         uint256 longId = _call(K_240, FRI_2026_09_18);
         _deposit(alice, address(nvda), 1e18);
+
+        // T-603, repair (b): this test's SUBJECT is a specific sender minting on a writer's behalf, so `mm` has to
+        // reach the operator check at Clearinghouse.sol:642 rather than being stopped by the minter gate at :641.
+        // It is allowlisted HERE, at the call site and visibly, never in ClearinghouseBase -- allowlisting an
+        // arbitrary EOA in the base would green this test by deleting the coverage every other suite inherits.
+        vm.prank(admin);
+        ch.setMinter(mm, true);
 
         vm.prank(mm);
         vm.expectRevert(V2Errors.NotAuthorized.selector);

@@ -12,12 +12,14 @@ import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Ids} from "../../../src/v2/interfaces/V2Ids.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MockSettlementOracle} from "../../../src/v2/mocks/MockSettlementOracle.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {MakerRegistry} from "../../../src/v2/mm/MakerRegistry.sol";
 import {MakerVault} from "../../../src/v2/mm/MakerVault.sol";
 
 /// @notice Shared fixture of the maker suites (C2-11): the REAL Clearinghouse and OrderBook (no mocks between them),
 ///         the real ExpiryCalendar, MockSettlementOracle for spot and settlement, a MakerRegistry wired into the book,
-///         and a MakerVault funded by the admin with `quoter` holding QUOTER_ROLE.
+///         and a MakerVault funded by the admin, with `admin` holding TREASURY_ADMIN and `quoter` holding QUOTER on
+///         the shared AccessManager.
 /// @dev Markets NVDA and TSLA: strikeTick 1.00 USDG, exercise fee 25 bps, spot NVDA 220 / TSLA 358.04. Book fees are the
 ///      registry defaults (premium 500 bps, resale 0, taker 0.10 USDG flat / 1000 bps cap, rebate 5000 bps). Traders
 ///      (alice, bob, carol, mm) deposit collateral and give the book every approval; the vault starts with
@@ -25,6 +27,12 @@ import {MakerVault} from "../../../src/v2/mm/MakerVault.sol";
 ///      Limits: 100 shares per series, 100,000 USDG total notional, 1 % ask tolerance, bids <= 10 % of spot, no
 ///      lifetime bound, and the launch outflow cap of 2,500 USDG a day (v7 design §5.3) — so every maker suite runs
 ///      under the cap the launch deploy sets, and the turnover PoCs of {MakerVaultQuoterTest} hit it.
+///
+///      ROLES (INTERFACE_VERSION 8). `admin` holds TREASURY_ADMIN **and** QUOTER, mirroring `roles.v8.json`
+///      `holders.adminSafe`, which lists the Admin Safe as a QUOTER member so it can cancel and close in an
+///      emergency. `quoter` holds QUOTER only. The vault's treasury is `treasury`, the same address the
+///      Clearinghouse and the book pay fees to, so an exit and a fee both land there; the treasury-exit invariant
+///      uses a dedicated address instead, precisely so the two cannot be confused.
 abstract contract MakerTestBase is BaseV2Test {
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
@@ -89,12 +97,19 @@ abstract contract MakerTestBase is BaseV2Test {
     //////////////////////////////////////////////////////////////*/
 
     function _deployCore() internal virtual override {
-        calendar = new ExpiryCalendar(admin, new uint32[](0));
+        calendar = _newCalendar(new uint32[](0), admin);
         oracle = new MockSettlementOracle();
-        ch = new Clearinghouse(admin, address(usdg), address(calendar), treasury, "");
+        ch = _newClearinghouse(address(usdg), address(calendar), treasury, "", admin);
         vm.startPrank(admin);
-        ch.registerMarket(address(nvda), _market());
-        ch.registerMarket(address(tsla), _market());
+        ch.setMinter(address(this), true);
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(25, 0);
+        ch.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch.setMarketOracle(address(nvda), address(oracle));
+        ch.setMarketFees(address(nvda), 25, 0);
+        ch.registerMarket(address(tsla), STRIKE_TICK, true);
+        ch.setMarketOracle(address(tsla), address(oracle));
+        ch.setMarketFees(address(tsla), 25, 0);
         vm.stopPrank();
         oracle.setSpot(address(nvda), true, NVDA_SPOT, START);
         oracle.setSpot(address(tsla), true, TSLA_SPOT, START);
@@ -103,11 +118,17 @@ abstract contract MakerTestBase is BaseV2Test {
         putId = ch.createSeries(address(nvda), true, PUT_STRIKE, FRI_2026_09_18);
         tslaId = ch.createSeries(address(tsla), false, TSLA_STRIKE, FRI_2026_09_18);
 
-        book = new OrderBook(IClearinghouse(address(ch)), admin, guardian, treasury, _defaultFees());
-        registry = new MakerRegistry(admin);
-        vm.prank(admin);
+        book = new OrderBook(IClearinghouse(address(ch)), address(manager), treasury, _defaultFees());
+        _wire(address(book), "OrderBook", admin, 0);
+        registry = _newRegistry(admin);
+        vm.startPrank(admin);
+        ch.setMinter(address(book), true);
         book.setMakerRegistry(registry);
-        vault = new MakerVault(IOrderBook(address(book)), admin, quoter, _defaultLimits());
+        vm.stopPrank();
+        vault = _newVault(IOrderBook(address(book)), treasury, _defaultLimits(), admin, quoter);
+        // The Admin Safe is a QUOTER member in roles.v8.json; the fixture mirrors that rather than inventing a
+        // narrower admin, so "the cap applies to every caller" is tested against the caller it used to exempt.
+        _grant(V8Roles.QUOTER, admin, 0);
         vm.label(address(ch), "Clearinghouse");
         vm.label(address(book), "OrderBook");
         vm.label(address(registry), "MakerRegistry");
@@ -217,6 +238,17 @@ abstract contract MakerTestBase is BaseV2Test {
         orderId = vault.place(longId, kind, price, units, 0);
     }
 
+    /// @dev The same placement made by `admin` rather than `quoter`. T-521: the C8-05 suspicion doubted that
+    ///      granting QUOTER to `admin` only INCLUDES the admin in the cap's statement rather than CHARGING it,
+    ///      and {test_outflowCap_chargesTheAdminPathNotJustTheQuoterPath} is what makes the difference visible.
+    function _adminPlace(uint256 longId, V2Types.OrderKind kind, uint128 price, uint64 units)
+        internal
+        returns (uint256 orderId)
+    {
+        vm.prank(admin);
+        orderId = vault.place(longId, kind, price, units, 0);
+    }
+
     function _place(address maker, uint256 longId, V2Types.OrderKind kind, uint128 price, uint64 units)
         internal
         returns (uint256 orderId)
@@ -239,7 +271,9 @@ abstract contract MakerTestBase is BaseV2Test {
             limitPrice: limit,
             writeToSell: false,
             recipient: recipient,
-            deadline: NO_DEADLINE
+            deadline: NO_DEADLINE,
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 
@@ -257,7 +291,9 @@ abstract contract MakerTestBase is BaseV2Test {
             limitPrice: limit,
             writeToSell: writeToSell,
             recipient: to,
-            deadline: NO_DEADLINE
+            deadline: NO_DEADLINE,
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 
@@ -325,5 +361,40 @@ abstract contract MakerTestBase is BaseV2Test {
     function _makerOf(Vm.Log memory log) internal pure returns (address maker) {
         (maker,,,,,,,,) =
             abi.decode(log.data, (address, uint64, uint128, uint256, uint256, uint256, bool, bool, address));
+    }
+}
+
+/// @notice T-521. The one thing the C8-05 ledger suspicion asked for and nothing had checked.
+/// @dev THE SUSPICION, verbatim: "`MakerBase.t.sol` now grants QUOTER to `admin` … so 'the cap applies to every
+///      caller' is tested against the caller it used to exempt. That is the right idea, and it is also the single
+///      change most likely to make an outflow test pass for the wrong reason. Check that
+///      `invariant_usedNeverAboveTheCapForEveryCaller` actually charges the admin path rather than merely
+///      including it."
+///
+///      INCLUDED IS NOT CHARGED, and the distinction is the whole point: a handler that pranks the admin proves
+///      the call is REACHED; only a delta on the shared bucket proves it is BOOKED. The invariant handler does
+///      prank the admin (`test/v2/invariant/MakerVaultOutflowHandler.sol:345-351` and `:361-364`), but that file
+///      is outside this row's fence and, on its own, would still be consistent with a per-caller exemption.
+///      This test closes that gap from inside the fence: it charges the admin path and reads the same `used`
+///      the quoter path moves.
+contract MakerBaseAdminIsChargedTest is MakerTestBase {
+    /// @dev Identical bids, one from each caller, must each move `used` by the same escrow. If the admin were
+    ///      exempt — the v7 shape C8-05 removed — the second assertion would hold at zero.
+    function test_outflowCap_chargesTheAdminPathNotJustTheQuoterPath() public {
+        assertEq(_used(), 0, "precondition: the bucket starts empty");
+
+        _adminPlace(callId, BID, P2_00, 1_000);
+        uint256 afterAdmin = _used();
+        assertEq(afterAdmin, 20_000_000, "the ADMIN's resting bid is charged: 2.00 x 1,000 / 100 = 20 USDG");
+
+        _vaultPlace(callId, BID, P2_00, 1_000);
+        assertEq(_used(), afterAdmin + 20_000_000, "and the quoter's bid adds to the SAME bucket, not a second one");
+    }
+
+    /// @dev The admin holds QUOTER because `roles.v8.json` `holders.adminSafe` lists it. Pinned here so a fixture
+    ///      that stopped granting it would fail loudly rather than silently make the test above vacuous.
+    function test_theFixtureGrantsQuoterToTheAdmin() public view {
+        (bool isQuoter,) = manager.hasRole(V8Roles.QUOTER, admin);
+        assertTrue(isQuoter, "the Admin Safe is a QUOTER member in roles.v8.json and the fixture mirrors it");
     }
 }

@@ -1,11 +1,30 @@
 // SPDX-License-Identifier: MIT
+// NOT VENDORED. This file is a REWRITE, and it is stated here because the audit scope excluded
+// "vendored Uniswap FullMath/TickMath" as one phrase and this half of that phrase does not hold.
+// Compare `FullMath.sol` in this directory: it opens with a vendoring header naming the upstream
+// repo, branch and commit and says every line is identical, so it really is out of scope. This one
+// has no upstream to diff against. It differs from Uniswap v3-core's TickMath deliberately and in
+// ways that matter to a reader: its own `TickOutOfRange()` error instead of `require(..., 'T')`, a
+// `uint256[20]` factor table walked in a loop instead of the unrolled `if (absTick & 0x…)` chain,
+// and only the forward conversion -- there is no `getTickAtSqrtRatio` here. Rewriting it is also
+// why a later checkout stopped reproducing the live `UniV3TwapSource` bytecode (docs/DEPLOY-V2.md,
+// pinned runtimes). Treat it as first-party code on the price path: `UniV3TwapSource.sol:384` calls
+// {getSqrtRatioAtTick} for every TWAP it converts.
 pragma solidity ^0.8.0;
 
 /// @notice Converts a 1.0001-spaced integer tick to a Q64.96 square-root price.
 /// @dev Only the forward conversion is needed by UniV3TwapSource. The factors are fixed-point
 ///      evaluations of (10000 / 10001)^(2^i / 2), scaled by 2^128. The first is rounded down
-///      and the others up; this preserves the established pool tick-price rounding, including
-///      its endpoint values. Multiplication truncates after each selected binary factor.
+///      and the others up. MEASURED AGAINST UPSTREAM (T-OP-076, T-OP-089; Uniswap v3-core 6562c52e,
+///      vendored as test/v2/fixtures/TickMathUpstream.sol): three of the twenty factors -- bits 12,
+///      17 and 19 -- are +1 ulp over upstream, which rounds them to nearest. The endpoint values
+///      agree, and so does every negative tick and zero. For positive ticks the inversion below
+///      turns that +1 into a price strictly BELOW upstream's on 20,325 ticks (first at 132822, by
+///      1), bounded in relative terms only: at most 5.63e-23 of the sqrt price (tick 749860). NOT A
+///      FINDING: 1e-22 of a price is below any tick, fee, band or rounding step in this repo, and
+///      the fork suites pin pool prices computed by THIS table -- do not "fix" the factors to match
+///      upstream. test/v2/unit/TickMath.t.sol pins the exact difference set over every tick.
+///      Multiplication truncates after each selected binary factor.
 library TickMath {
     error TickOutOfRange();
 

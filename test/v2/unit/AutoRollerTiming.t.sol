@@ -305,8 +305,10 @@ contract AutoRollerTimingTest is AutoRollerTestBase {
         spotAnswer = bound(spotAnswer, 10_00000000, 5000_00000000);
         // forge-lint: disable-next-line(unsafe-typecast)
         uint16 otmBps = uint16(bound(otm, 100, 2500));
+        // T-OP-063 / SEC-13: the compiled ask floor is MIN_ASK_BPS = 50; a fuzzed ask in [5, 49] would revert
+        // CeilingExceeded in setStrategy before the formula under test is reached. The bound mirrors the constant.
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint16 askBps = uint16(bound(ask, 5, 1000));
+        uint16 askBps = uint16(bound(ask, 50, 1000));
         _setStrategy(alice, _weekly(otmBps, askBps));
         uint256 t = _ny(TUE_0915, 11, 0, 0);
         vm.warp(t - 1);

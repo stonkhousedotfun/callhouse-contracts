@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+// FIXTURE, copied to test/Inherited.t.sol beside Shapes.t.sol. Its only job is to wear a modifier that
+// is declared in ANOTHER file, so the modifier-bail finding in Shapes.t.sol depends on this test.
+
+import {Harness} from "./Shapes.t.sol";
+
+contract Inherited is Harness {
+    function test_wearsTheBaseModifier() public bailsInBase {
+        assertTrue(true);
+    }
+}

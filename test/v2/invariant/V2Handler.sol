@@ -7,6 +7,7 @@ import {ExpiryCalendar} from "../../../src/v2/ExpiryCalendar.sol";
 import {KeeperRewards} from "../../../src/v2/KeeperRewards.sol";
 import {OrderBook} from "../../../src/v2/OrderBook.sol";
 import {IOrderBook} from "../../../src/v2/interfaces/IOrderBook.sol";
+import {IFeeDiscount} from "../../../src/v2/interfaces/IFeeDiscount.sol";
 import {IPriceSource} from "../../../src/v2/interfaces/IPriceSource.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Ids} from "../../../src/v2/interfaces/V2Ids.sol";
@@ -15,6 +16,7 @@ import {OptionMath} from "../../../src/v2/lib/OptionMath.sol";
 import {MockERC20} from "../../../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../../../src/mocks/MockStockToken.sol";
 import {MockRoundFeed} from "../../../src/v2/mocks/MockRoundFeed.sol";
+import {MockFeeDiscount} from "../../../src/v2/mocks/MockFeeDiscount.sol";
 import {MockOraclePriceSource} from "../../../src/v2/mocks/MockOraclePriceSource.sol";
 import {MockUniV3Pool} from "../../../src/v2/mocks/MockUniV3Pool.sol";
 import {ChainlinkFeedSource} from "../../../src/v2/oracle/ChainlinkFeedSource.sol";
@@ -61,6 +63,18 @@ import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
 ///      prints a heartbeat at least every 6 hours of simulated time so a window is not stale merely because nobody
 ///      printed.
 contract V2Handler is Test {
+    /// @dev THIS MAKES THREE RESTRICTED CALLS, SO ONE `vm.prank` IS NOT ENOUGH. A single prank covers the NEXT
+    ///      external call only; the second and third then run as whatever contract called this helper, and on a
+    ///      `Managed` Clearinghouse that is `NotAuthorized()`. Every caller must hold the prank open across the
+    ///      whole helper -- `vm.startPrank` / `vm.stopPrank`, not `vm.prank`. Found by T-INV5 when the handler
+    ///      walk finally reached `toggleOracleFault`: the call had been wrong since the v8 setter split and had
+    ///      never once executed.
+    function _reconfigure(Clearinghouse house, address underlying, V2Types.MarketConfig memory cfg) internal {
+        house.setMarketListing(underlying, cfg.enabled, cfg.strikeTick);
+        house.setMarketFees(underlying, cfg.exerciseFeeBps, cfg.mintFeePpm);
+        house.setMarketOracle(underlying, cfg.oracle);
+    }
+
     struct Deps {
         Clearinghouse ch;
         OrderBook book;
@@ -93,6 +107,13 @@ contract V2Handler is Test {
     uint256 internal constant MAX_SERIES = 16;
     uint256 internal constant EXPIRIES = 12;
     uint128 internal constant POOL_LIQUIDITY = 1e19;
+    /// @dev The evil pool's liquidity floor. It used to be 0 ("no floor": the evil pool must PRICE, so the campaign
+    ///      can check what the oracle does with a manipulated print); T-OP-062 made {UniV3TwapSource.setPool} refuse a
+    ///      zero floor (`CeilingExceeded`), which killed every campaign at its first {reconfigure} (T-OP-097 (b)(1)).
+    ///      This is the smallest legal floor, the value T-OP-062's own tests chose for the same purpose, and it is
+    ///      justified by the fixture: the evil pool sits at POOL_LIQUIDITY (1e19) in-range liquidity, so its
+    ///      harmonic-mean liquidity over any window is 1e19 >= 1 and the pool keeps pricing exactly as before.
+    uint128 internal constant EVIL_POOL_MIN_LIQUIDITY = 1;
     uint256 internal constant UNIT = V2Constants.UNIT;
     /// @dev Series stages the selectors aim at (see {_seriesIn}).
     uint8 internal constant OPEN = 0;
@@ -167,6 +188,10 @@ contract V2Handler is Test {
     /// @dev When set, nobody snapshots the pool inside the grace unless the fuzzer calls {snapshot} in time.
     bool public crankerAsleep;
     bool public badOracleOn;
+    /// @dev INTERFACE_VERSION 8: the book's discount module and whether it is currently set (10 % while on), so the
+    ///      campaign's takes sometimes run discounted and the rebate-vs-fee invariant checks the DISCOUNTED figure.
+    MockFeeDiscount public discount;
+    bool public discountOn;
 
     /*//////////////////////////////////////////////////////////////
                                  GHOSTS
@@ -260,6 +285,7 @@ contract V2Handler is Test {
         // Spot is fresh and the pool agrees with the feed at the start.
         _printFeed();
         _printPool();
+        discount = new MockFeeDiscount(0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -405,31 +431,146 @@ contract V2Handler is Test {
         }
     }
 
+    /// @dev INTERFACE_VERSION 8: MINTING GOES THROUGH THE BOOK, never `ch.mint` directly. T-77 made the OrderBook
+    ///      the only protocol minter (`Clearinghouse.sol` reverts `NotMinter()` for anyone else), so the v7 shape of
+    ///      this function -- `abi.encodeCall(ch.mint, ...)` from an actor -- can no longer succeed and would turn
+    ///      every mint into a silent no-op that still counts as a campaign step. The real mint path is: the writer
+    ///      rests an AskWrite, a buyer takes it, and the book mints the pair out of the writer's free collateral.
+    ///      V8-DESIGN section 12 requires the handler to exercise that path so the invariants see real book-minted
+    ///      supply rather than supply the handler conjured behind the book's back.
     function mint(uint8 a, uint8 s, uint64 units, uint8 to, uint16 dt) external {
         _advance(dt);
         if (series.length == 0) return;
         address writer = _actor(a);
+        // `(uint256(a) + 1) % 4`, NOT `uint8(a + 1)`. The old form adds in uint8, so a == 255 -- which the fuzzer
+        // reaches as soon as it explores this leg at all -- overflows and PANICS 0x11 before a single external
+        // call is made. It had never fired because invariant_5's walk died in setUp, so this leg was only ever
+        // reached by the shallow stage walk; the first campaign that actually ran found it at runs: 53. The
+        // modulo also makes the intent explicit: the buyer is the NEXT actor, wrapping.
+        address buyer = to & 1 == 0 ? _actor(uint8(to >> 1)) : _actor(uint8((uint256(a) + 1) % 4));
+        if (buyer == writer) return;
         uint256 longId = _seriesIn(s, OPEN);
         V2Types.Series memory sr = ch.series(longId);
         (address asset, uint256 perUnit) = _collateral(sr);
-        // INTERFACE_VERSION 7: mint takes collateral AND rent out of the same free balance, so the largest size the
-        // writer can afford is free / (perUnit + rent per unit). ceil(u x r) <= u x ceil(r), so sizing on the ceiled
-        // per-unit rate is never too large; it can be one unit short, which only makes the handler slightly gentler.
+        // The writer still needs the collateral AND the rent out of one free balance, exactly as in v7: the book
+        // pulls both when it mints. ceil(u x r) <= u x ceil(r), so sizing on the ceiled per-unit rate is never too
+        // large; it can be one unit short, which only makes the handler slightly gentler.
         uint256 costPerUnit = perUnit;
         if (clock < sr.expiry) costPerUnit += OptionMath.mintFee(perUnit, sr.mintFeePpm, sr.expiry - clock);
         uint256 maxUnits = ch.free(writer, asset) / costPerUnit;
         if (maxUnits == 0) return;
-        units = uint64(_bound(units, 1, maxUnits < 500 ? maxUnits : 500));
-        bool expectOk = !ch.market(address(nvda)).mintPaused && clock < sr.expiry - V2Constants.SETTLEMENT_WINDOW;
-        uint256[] memory before = _snap();
-        (bool ok, bytes memory ret) = _call(
-            writer,
-            address(ch),
-            abi.encodeCall(ch.mint, (longId, units, writer, to & 1 == 0 ? writer : _actor(to >> 1)))
+        units = uint64(_bound(units, 1, maxUnits < 300 ? maxUnits : 300));
+
+        uint256 mintCutoff = sr.expiry - V2Constants.SETTLEMENT_WINDOW;
+        if (book.tradingPaused() || clock >= mintCutoff) return;
+
+        // A price the buyer can actually pay, escrowed up front.
+        uint128 price = _price(uint32(uint256(keccak256(abi.encode(longId, units, clock))) % type(uint32).max));
+        uint256 premium = uint256(price) * units / V2Constants.UNITS_PER_SHARE;
+        // MIRROR, DO NOT RE-REASON: the taker fee is READ from the book, never retyped, so a fee change moves the
+        // top-up with it instead of quietly under-funding the buyer and turning every mint into a no-op.
+        _topUp(buyer, address(usdg), premium + book.feeParams().takerFeeFlat);
+        if (_usdgBlocked(buyer) || _usdgBlocked(writer)) return;
+
+        (bool placed, bytes memory placeRet) = _call(
+            writer, address(book), abi.encodeCall(book.place, (longId, V2Types.OrderKind.AskWrite, price, units, 0))
         );
-        _expect("mint", expectOk, ok, ret);
+        if (!placed) {
+            _expect("mint.place", false, placed, placeRet);
+            return;
+        }
+        uint256 orderId = abi.decode(placeRet, (uint256));
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = orderId;
+        V2Types.TakeParams memory p;
+        p.longId = longId;
+        p.buying = true;
+        p.orderIds = ids;
+        p.units = units;
+        p.minUnits = 0;
+        p.limitPrice = price;
+        p.recipient = buyer;
+        // casting to 'uint40' is safe because simulated time stays far below 2^40
+        // forge-lint: disable-next-line(unsafe-typecast)
+        p.deadline = uint40(clock + 1 hours);
+        p.maxTotalFee = type(uint128).max;
+
+        uint256[] memory before = _snap();
+        vm.recordLogs();
+        (bool ok, bytes memory ret) = _call(buyer, address(book), abi.encodeCall(book.take, (p)));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
         if (ok) ++nMints;
-        _inv5("mint", writer, before, _none(), _none(), 0);
+        // A MINT IS A TWO-PARTY ACTION AND INVARIANT 5 EXEMPTS EXACTLY ONE ACTOR. The book pulls the BUYER's
+        // premium and the WRITER's collateral in this single call, so no choice of exempt actor is correct on its
+        // own: naming the writer leaves the buyer's legitimate premium reading as a violation, and naming the
+        // buyer leaves the writer's legitimate collateral lock reading as one. The exempt actor must therefore be
+        // the REAL caller -- `buyer`, the address passed to `_call` on the line above -- and the writer's movement
+        // must be DESCRIBED through the allowance vectors rather than excused by an exemption.
+        //
+        // MIRRORED FROM THE ONE SITE THAT ALREADY DOES THIS, the generic take path at the `usdgDrop`/`nvdaDrop`
+        // block below: cost is `units * perUnit` with the mint rent charged on the TOTAL, not the per-unit rate
+        // ceiled and then multiplied. The two differ by rounding, and `_inv5` compares the drop with `!=`, so the
+        // sizing figure `costPerUnit` computed above is NOT usable here -- it is deliberately conservative for
+        // bounding `units` and would be one wei high.
+        //
+        // WHY THE WRITER'S DROP IS EXACTLY THE COST, with no premium netted against it: the book credits maker
+        // proceeds to `owed`, not to the ledger, and they reach the ledger only through a later `claimOwed` --
+        // which is its own handler leg with its own `_inv5` call.
+        //
+        // MEASURED FROM THE FILLS, NOT PREDICTED FROM THE REQUEST. An earlier version of this computed the cost
+        // from the `units` ASKED FOR and assumed the fill was primary. invariant_5 -- running for the first time
+        // in this campaign's life -- shrank a two-call sequence, togglePause(0) then mint(...), down to
+        // "mint: another actor's NVDA ledger moved other than its filled write asks" and was RIGHT: a take can
+        // fill PARTIALLY, and it can fill against a resting AskResale that mints nothing at all, and in both
+        // cases the writer's collateral movement is not the figure the request implies. Only the `OrderFilled`
+        // events say what actually happened, which is exactly why the generic take path decodes them instead of
+        // predicting -- this now mirrors that block rather than paraphrasing it.
+        uint256[4] memory usdgDrop;
+        uint256[4] memory nvdaDrop;
+        uint64 primaryUnits;
+        if (ok) {
+            for (uint256 i; i < logs.length; ++i) {
+                if (logs[i].emitter != address(book) || logs[i].topics[0] != IOrderBook.OrderFilled.selector) {
+                    continue;
+                }
+                (address maker, uint64 u,,,,, bool primary,,) =
+                    abi.decode(logs[i].data, (address, uint64, uint128, uint256, uint256, uint256, bool, bool, address));
+                if (!primary) continue;
+                primaryUnits += u;
+                uint256 cost = uint256(u) * perUnit;
+                cost += OptionMath.mintFee(cost, sr.mintFeePpm, sr.expiry - clock);
+                uint256 idx = _indexOf(maker);
+                if (asset == address(usdg)) usdgDrop[idx] += cost;
+                else nvdaDrop[idx] += cost;
+            }
+        }
+        // THE CALL SUCCEEDING AND A MINT HAPPENING ARE DIFFERENT EVENTS, AND CONFLATING THEM FAILED invariant_4.
+        // The old prediction was `expectOk = !tradingPaused && !mintPaused && clock < mintCutoff`, compared against
+        // whether `book.take` REVERTED. Two of those three are already excluded by the early return at the top of
+        // this function, so it reduced to `!mintPaused` -- and `mintPaused` does not make the CALL revert. The book
+        // SKIPS a maker it cannot fill and returns normally having filled nothing. So a paused market produced a
+        // successful call, the prediction said "revert", and invariant_4 went red at runs: 24 with
+        // "mint: succeeded where a revert was predicted" -- against a protocol that had behaved correctly.
+        // Verified on the failing seed: the only `OrderFilled` in that trace is the SETUP mint, sixty lines before
+        // `setMintPaused(NVDAx, true)`; the failing call emits none. The guardian pause held.
+        //
+        // SO THE CALL IS EXPECTED TO SUCCEED, and the thing `mintPaused` actually governs -- whether a PRIMARY fill
+        // occurred -- is read from the events rather than inferred from the return value.
+        _expect("mint", true, ok, ret);
+
+        // ONE DIRECTION ONLY, AND THAT IS DELIBERATE RATHER THAN LAZY. A primary fill WHILE the market mint pause
+        // is on would be a guardian pause failing open, which is a safety violation and is asserted here. The
+        // converse -- no primary fill while minting is allowed -- is NOT asserted, because a legitimate zero fill
+        // has causes this leg does not control (the order can be overtaken, pruned or priced out between place and
+        // take) and an invariant that reds on those would be measuring liveness, not safety. The asymmetry is
+        // stated so the next reader does not "restore" the missing half and then disable the whole check when it
+        // trips on a benign zero fill.
+        _expect(
+            "mint minted under the market pause", false, primaryUnits != 0 && ch.market(address(nvda)).mintPaused, ""
+        );
+
+        _inv5("mint", buyer, before, usdgDrop, nvdaDrop, 0);
     }
 
     function close(uint8 a, uint8 s, uint64 units, uint16 dt) external {
@@ -562,7 +703,7 @@ contract V2Handler is Test {
         bool expectOk = !book.tradingPaused();
         if (expectOk) {
             vm.prank(taker);
-            (, uint256 premium, uint256 fee) = book.quoteTake(p);
+            (, uint256 premium, uint256 fee,) = book.quoteTake(p);
             if (premium + fee > 0) {
                 _topUp(taker, address(usdg), premium + fee);
                 if (_usdgBlocked(taker)) expectOk = false;
@@ -744,12 +885,16 @@ contract V2Handler is Test {
         address asset = isUsdg ? address(usdg) : address(nvda);
         uint256 accrued = ch.accruedFees(asset);
         bool expectOk = !(isUsdg && accrued != 0 && usdg.paused());
-        uint256 feesBefore = _bal(asset, chFees);
+        // MIRROR, DO NOT RE-REASON: the sweep destination is the Clearinghouse's {feeRecipient}, which the
+        // fixture set to the FeeSplitter. Measuring {chFees} here would count every honest sweep as a payout
+        // violation the moment C8-09a landed.
+        address to = ch.feeRecipient();
+        uint256 feesBefore = _bal(asset, to);
         uint256[] memory before = _snap();
         (bool ok, bytes memory ret) = _call(keeper, address(ch), abi.encodeCall(ch.sweepFees, (asset)));
         _expect("sweepFees", expectOk, ok, ret);
         if (ok) {
-            uint256 got = _bal(asset, chFees) - feesBefore;
+            uint256 got = _bal(asset, to) - feesBefore;
             if (got != accrued) _payoutViolation("sweep paid other than accrued");
             ghostOut[asset] += got;
         }
@@ -876,18 +1021,22 @@ contract V2Handler is Test {
             badOracleOn = !badOracleOn;
             V2Types.MarketConfig memory m = ch.market(address(nvda));
             m.oracle = badOracleOn ? badOracle : address(oracle);
-            vm.prank(admin);
-            ch.setMarketConfig(address(nvda), m);
+            // startPrank, NOT prank: _reconfigure makes three restricted calls and one prank covers only the
+            // first. See the helper's NatSpec.
+            vm.startPrank(admin);
+            _reconfigure(ch, address(nvda), m);
+            vm.stopPrank();
         }
     }
 
     /// The admin reconfigures settlement MID-LIFE, which must reach only expiries no series has pinned (owner decision
     /// 2026-09-17): the oracle market flips to or from the evil list ([evil source, Chainlink], 1000 bps, 30 min), the
     /// Chainlink source to or from the evil feed with its loosest bounds, the pool source to or from the evil pool with
-    /// no floor. Everything evil prices NVDA at 400 USDG. Invariant 6 checks that an expiry keeps what it pinned.
+    /// the smallest legal floor (EVIL_POOL_MIN_LIQUIDITY; zero is refused since T-OP-062). Everything evil prices NVDA
+    /// at 400 USDG. Invariant 6 checks that an expiry keeps what it pinned.
     function reconfigure(uint8 which) external {
         if (which % 4 != 0) return;
-        uint256 w = (which / 4) % 3;
+        uint256 w = (which / 4) % 4;
         ++nReconfigured;
         if (w == 0) {
             _setMarket(marketMode == EVIL ? HONEST : EVIL);
@@ -902,15 +1051,21 @@ contract V2Handler is Test {
             } else {
                 cl.setFeed(address(nvda), address(feed), cl.DEFAULT_MAX_STALE(), cl.DEFAULT_MAX_ROUND_JUMP_BPS());
             }
-        } else {
+        } else if (w == 2) {
             evilPoolOn = !evilPoolOn;
             UniV3TwapSource ps = UniV3TwapSource(poolSource);
             ps.setPool(
                 address(nvda),
                 evilPoolOn ? address(evilPool) : address(pool),
-                evilPoolOn ? 0 : 1e18,
+                evilPoolOn ? EVIL_POOL_MIN_LIQUIDITY : 1e18,
                 ps.DEFAULT_WINDOW()
             );
+        } else {
+            // INTERFACE_VERSION 8: a 10 % discount module on/off, so takes in the campaign sometimes run discounted
+            // and `invariant_book_takesConserveAndRebatesStayUnderTheFee` checks rebates against the DISCOUNTED fee.
+            discountOn = !discountOn;
+            discount.setBps(discountOn ? 1_000 : 0);
+            book.setDiscountModule(IFeeDiscount(discountOn ? address(discount) : address(0)));
         }
         vm.stopPrank();
     }
@@ -1201,7 +1356,9 @@ contract V2Handler is Test {
             recipient: recipient,
             // casting to 'uint40' is safe because simulated time stays far below 2^40
             // forge-lint: disable-next-line(unsafe-typecast)
-            deadline: uint40(clock)
+            deadline: uint40(clock),
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 
@@ -1417,7 +1574,7 @@ contract V2Handler is Test {
         for (uint256 i; i < 4; ++i) {
             total += book.owed(actors[i]);
         }
-        total += book.owed(treasury) + book.owed(keeper);
+        total += book.owed(treasury) + book.owed(keeper) + book.owed(ch.feeRecipient());
     }
 
     function _collateral(V2Types.Series memory sr) internal view returns (address asset, uint256 perUnit) {

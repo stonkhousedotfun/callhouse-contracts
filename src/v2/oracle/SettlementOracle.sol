@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {Managed} from "../access/Managed.sol";
 import {IClearinghouse} from "../interfaces/IClearinghouse.sol";
 import {IKeeperRewards} from "../interfaces/IKeeperRewards.sol";
 import {IPriceSource} from "../interfaces/IPriceSource.sol";
@@ -65,6 +65,7 @@ import {IOraclePausable} from "./OracleDeps.sol";
 ///        |-------------------------------------------------------|------------------|---------------------------------|
 ///        | no source ever ok (not captured)                      | any but Final    | (false, 0), nothing stored      |
 ///        | first ok source i agreeing with another ok source     | any but Final    | Finalized at p_i, corroborated  |
+///        |   -- INCLUDING Held: see the note under HELD below    | (Held too)       | Finalized at p_i, corroborated  |
 ///        | ok source(s), none agreeing: candidate = first ok     | None / Pending   | new or changed candidate:       |
 ///        |                                                       |                  |   Pending, SettlementCandidate  |
 ///        |                                                       | Pending          | same candidate, before          |
@@ -74,6 +75,13 @@ import {IOraclePausable} from "./OracleDeps.sol";
 ///        |                                                       | Held             | (false, 0), candidate untouched |
 ///      "Agree" is symmetric: |p_i - p_j| x 10_000 <= min(p_i, p_j) x maxDeviationBps. The first index in priority order
 ///      that agrees with ANY other ok source wins, so a disagreeing primary is skipped when two others agree.
+///
+///      READ THAT LAST ROW WITH ITS BRANCH, NOT ALONE. It belongs to the "ok source(s), NONE AGREEING" row above it
+///      and says nothing about a corroborated expiry. T-223 records this because an audit finding read it in
+///      isolation, concluded a Held expiry never advances, and from there concluded that a delay-0 GUARDIAN can
+///      freeze redemption on a fully corroborated series. That is not what {_advance} does: it tests `corroborated`
+///      and finalizes BEFORE it ever reads `Held`. The veto reaches only the uncorroborated path -- which is
+///      precisely the single-source settlement the guardian is authorised to veto.
 ///
 ///      A CHANGED CANDIDATE RESTARTS THE DELAY. The candidate is (price, sourceIndex, disagreed). When an upgrade changes
 ///      it (a higher-priority source starts answering, or a second source answers and disagrees), the new candidate is
@@ -123,7 +131,10 @@ import {IOraclePausable} from "./OracleDeps.sol";
 ///      first {pin} of an expiry: {SettlementConfigPinned}, then each source's own pin log in priority order (none for
 ///      a source that already held an equal pin). A {pin} that confirms another Clearinghouse's pin logs nothing.
 ///
-///      TRUST. Sources, their order and the parameters are DEFAULT_ADMIN_ROLE's (ADR-09), for expiries not pinned yet.
+///      TRUST. Sources, their order and the parameters are CONFIG_ADMIN's (ADR-09), for expiries not pinned yet.
+///      INTERFACE_VERSION 8: that role is a `uint64` in the one AccessManager, not a `bytes32` table on this
+///      contract -- `script/v2/roles.v8.json` maps each selector here to CONFIG_ADMIN (24 h execution delay),
+///      except {veto} and {unveto}, which are GUARDIAN with no delay. `restricted` is the whole gate.
 ///      Two sources that read the same upstream (two ChainlinkFeedSource instances on one feed) would corroborate each
 ///      other: configure independent sources only. Duplicate addresses are rejected for exactly that reason. The admin
 ///      also sets the Clearinghouse pointer {pin} trusts and each source's oracle allow-list, so it can pin an expiry
@@ -131,7 +142,7 @@ import {IOraclePausable} from "./OracleDeps.sol";
 ///      a SeriesCreated, the sources' pin logs, {settlementConfig}, {pinnedBy}), and it can only BLOCK series creation
 ///      on that expiry, never be settled on in secret: see PINNING FAILS CLOSED. Integrations still show an expiry's
 ///      pinned configuration rather than the market's.
-contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTransient {
+contract SettlementOracle is ISettlementOracle, Managed, ReentrancyGuardTransient {
     /*//////////////////////////////////////////////////////////////
                                  TYPES
     //////////////////////////////////////////////////////////////*/
@@ -204,6 +215,16 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
     /// @notice spotMaxAge when unset, and its ceiling, seconds.
     uint32 public constant DEFAULT_SPOT_MAX_AGE = 1 hours;
     uint32 public constant MAX_SPOT_MAX_AGE = 4 days;
+    /// @notice A source-0 print no older than this is spot on its own; an older one (up to spotMaxAge) needs the
+    ///         market's source 1 to agree with it within maxDeviationBps, unless the market has no usable source 1.
+    /// @dev OWNER RULING SEC-08b/08c, 2026-09-22 (T-OP-061): "I don't want it to be 25 hours old, it should be accurate;
+    ///      ... let's say 30 min". Thirty minutes is the owner's number. It is NOT the whole rule, because a 30-minute
+    ///      clock cannot be: the 4663 equity feeds print on a 0.5 % move OR a 24 h heartbeat, so in a quiet half hour
+    ///      there is no print and the last one is accurate by the feed's own rule while being hours old. Age is the wrong
+    ///      instrument past this bound; AGREEMENT with the on-chain pool is the right one -- the pool moves when the
+    ///      market does, so a stale print across a weekend or a holiday is refused the moment the pool disagrees, and a
+    ///      quiet session keeps quoting. See {_spot}.
+    uint32 public constant SPOT_CORROBORATION_AGE = 30 minutes;
     /// @notice Most sources per market (source indexes are uint8 in the events).
     uint256 public constant MAX_SOURCES = 8;
 
@@ -254,23 +275,17 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
         uint32 uncorroboratedDelay,
         uint32 spotMaxAge
     );
-    /// @notice DEFAULT_ADMIN_ROLE set the Clearinghouse pointer.
+    /// @notice CONFIG_ADMIN set the Clearinghouse pointer.
     event ClearinghouseSet(address indexed clearinghouse);
-    /// @notice DEFAULT_ADMIN_ROLE set the KeeperRewards pointer.
+    /// @notice CONFIG_ADMIN set the KeeperRewards pointer.
     event KeeperRewardsSet(address indexed keeperRewards);
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @param admin Receives DEFAULT_ADMIN_ROLE: markets, pointers, {adminResolve}, {unveto}.
-    /// @param guardian Receives GUARDIAN_ROLE ({veto}, {unveto}) unless zero; the admin can grant it later.
-    constructor(address admin, address guardian) {
-        // A zero admin would leave every market permanently unconfigurable.
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
-        _grantRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
-        if (guardian != address(0)) _grantRole(V2Constants.GUARDIAN_ROLE, guardian);
-    }
+    /// @param authority The `AccessManager` mapping this contract's selectors to roles (V8Roles).
+    constructor(address authority) Managed(authority) {}
 
     /*//////////////////////////////////////////////////////////////
                                  ADMIN
@@ -278,7 +293,7 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
 
     /// @notice Sets the source list and settlement parameters of `underlying`. Emits {MarketSourcesSet} then
     ///         {MarketConfigured}.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). A zero parameter means its default. Reverts
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). A zero parameter means its default. Reverts
     ///      V2Errors.UnsupportedAsset for a zero underlying; V2Errors.CeilingExceeded for more than MAX_SOURCES sources,
     ///      maxDeviationBps above MAX_DEVIATION_CEIL_BPS, a non-zero uncorroboratedDelay outside
     ///      [MIN_UNCORROBORATED_DELAY, MAX_UNCORROBORATED_DELAY], or spotMaxAge above MAX_SPOT_MAX_AGE; V2Errors.NoSource
@@ -298,7 +313,7 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
         uint16 maxDeviationBps,
         uint32 uncorroboratedDelay,
         uint32 spotMaxAge
-    ) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    ) external nonReentrant restricted {
         if (underlying == address(0)) revert V2Errors.UnsupportedAsset();
         uint256 n = sources.length;
         if (n > MAX_SOURCES) revert V2Errors.CeilingExceeded();
@@ -326,17 +341,28 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
     }
 
     /// @notice Sets the Clearinghouse whose openInterest gates bounties and which alone may call {pin}.
-    ///         DEFAULT_ADMIN_ROLE. Zero disables bounties and {pin}, which stops series creation on this oracle.
+    ///         CONFIG_ADMIN. Zero disables bounties and {pin}, which stops series creation on this oracle.
+    /// @dev Deliberately NOT code-checked, unlike {setKeeperRewards} (SEC-31). A code-less pointer here is loud, not
+    ///      silent: the real Clearinghouse's {pin} reverts V2Errors.NotAuthorized, so no series can be created, and
+    ///      {_payBounty}'s openInterest staticcall answers no data, so it pays nothing (BOUNTIES). Pointing this at an
+    ///      account of the admin's own and pre-pinning through it is the documented admin power (PINNING), and a code
+    ///      check would not remove it: the same pin goes through a one-function contract. What stays unguarded is a
+    ///      mistyped pointer, which halts series creation until someone reads {ClearinghouseSet}.
     /// @param clearinghouse_ The Clearinghouse (the one whose settle calls {finalize} and createSeries calls {pin}).
-    function setClearinghouse(address clearinghouse_) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setClearinghouse(address clearinghouse_) external nonReentrant restricted {
         clearinghouse = clearinghouse_;
         emit ClearinghouseSet(clearinghouse_);
     }
 
-    /// @notice Sets the KeeperRewards that pays SNAPSHOT and FINALIZE bounties. DEFAULT_ADMIN_ROLE. Zero disables them.
+    /// @notice Sets the KeeperRewards that pays SNAPSHOT and FINALIZE bounties. CONFIG_ADMIN. Zero disables them.
     /// @dev The KeeperRewards admin must also register this oracle with `setCaller`, or every reward pays 0.
-    /// @param keeperRewards_ KeeperRewards contract.
-    function setKeeperRewards(address keeperRewards_) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    ///      Reverts V2Errors.NoSource for a non-zero pointer without code (SEC-31): the reward is a raw call whose
+    ///      failure only means "no bounty" (BOUNTIES), so a code-less pointer would disable every bounty with no revert
+    ///      and no log saying so. Zero is the one way to disable them, and it says what it does. Mirrors
+    ///      Clearinghouse.setKeeperRewards.
+    /// @param keeperRewards_ KeeperRewards contract, or address(0) to pay nothing.
+    function setKeeperRewards(address keeperRewards_) external nonReentrant restricted {
+        if (keeperRewards_ != address(0) && keeperRewards_.code.length == 0) revert V2Errors.NoSource();
         keeperRewards = keeperRewards_;
         emit KeeperRewardsSet(keeperRewards_);
     }
@@ -399,8 +425,13 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
     /// @inheritdoc ISettlementOracle
     /// @dev Reverts V2Errors.NoSource when the market has no source, the token's `oraclePaused()` is true or cannot be
     ///      read (fail closed), or source 0's `latest` is not ok, malformed, 0, above 2^128 or stamped in the future;
-    ///      V2Errors.StaleSpot(updatedAt) when `now - updatedAt > spotMaxAge`. Exactly spotMaxAge old is fresh. Reads the
-    ///      market's current source 0 and spotMaxAge, never a pinned copy: spot prices no settlement.
+    ///      V2Errors.StaleSpot(updatedAt) when `now - updatedAt > spotMaxAge`, or when the print is older than
+    ///      SPOT_CORROBORATION_AGE and the market's source 1 is ok but disagrees with it by more than maxDeviationBps
+    ///      (an old print the market has moved away from is stale in the sense that matters, whatever the clock says).
+    ///      Exactly spotMaxAge old is fresh. A print older than spotMaxAge is still ok when source 1 is ok and agrees with
+    ///      it, up to the compiled MAX_SPOT_MAX_AGE (4 days): the corroborated path has its own ceiling (T-OP-087), the
+    ///      uncorroborated one keeps spotMaxAge. Reads the market's current source list, maxDeviationBps and spotMaxAge,
+    ///      never a pinned copy: spot prices no settlement. The three-step rule is in {_spot}.
     function spot(address underlying) external view returns (uint256 price, uint256 updatedAt) {
         uint8 status;
         (status, price, updatedAt) = _spot(underlying);
@@ -459,7 +490,7 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
     /// @inheritdoc ISettlementOracle
     /// @dev A veto of an already Held expiry is a no-op without an event. Allowed at any time before finalization,
     ///      including before expiry (a pre-emptive veto).
-    function veto(address underlying, uint40 expiry) external nonReentrant onlyRole(V2Constants.GUARDIAN_ROLE) {
+    function veto(address underlying, uint40 expiry) external nonReentrant restricted {
         Settlement storage s = _settlements[underlying][expiry];
         if (s.status == V2Types.SettlementStatus.Finalized) revert V2Errors.AlreadyFinal();
         if (s.status == V2Types.SettlementStatus.Held) return;
@@ -474,10 +505,7 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
     ///      candidate was ever announced) {candidate} stays all zero and the next {finalize} that finds an ok source
     ///      announces one with its own `now + uncorroboratedDelay`, which is never earlier than the unveto's: the
     ///      emitted value is then a lower bound, and nothing can finalize uncorroborated before it.
-    function unveto(address underlying, uint40 expiry) external nonReentrant {
-        if (!hasRole(V2Constants.GUARDIAN_ROLE, msg.sender) && !hasRole(V2Constants.DEFAULT_ADMIN_ROLE, msg.sender)) {
-            revert V2Errors.NotAuthorized();
-        }
+    function unveto(address underlying, uint40 expiry) external nonReentrant restricted {
         Settlement storage s = _settlements[underlying][expiry];
         if (s.status == V2Types.SettlementStatus.Finalized) revert V2Errors.AlreadyFinal();
         if (s.status != V2Types.SettlementStatus.Held) return;
@@ -497,11 +525,7 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
     ///      refresh) uses [p x 8_000 / 10_000, p x 10_000 / 8_000] instead, both floored, inclusive (see A VETOED
     ///      SINGLE PRICE WIDENS THE RESOLVE BAND AFTER 7 DAYS). The capture reads the expiry's pinned sources, so emptying or changing the market's list does not
     ///      make a pinned expiry unbounded. Works from None, Pending or Held.
-    function adminResolve(address underlying, uint40 expiry, uint256 price)
-        external
-        nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
-    {
+    function adminResolve(address underlying, uint40 expiry, uint256 price) external nonReentrant restricted {
         _requireNotBefore(uint256(expiry) + V2Constants.RESOLVE_DELAY);
         Settlement storage s = _settlements[underlying][expiry];
         if (s.status == V2Types.SettlementStatus.Finalized) revert V2Errors.AlreadyFinal();
@@ -852,16 +876,58 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
 
     /// @dev {spot} without reverting: the status code, and the observation when it is ok or merely stale. Market-level:
     ///      the current configuration, never a pinned one.
+    ///
+    ///      THE PRICE IS ALWAYS SOURCE 0's (SEC-09: the pool is manipulable on thin liquidity and its freshness is
+    ///      vacuous, so Chainlink is the source and the pool is only ever a WITNESS). Three steps, in order:
+    ///        1. the print is at most SPOT_CORROBORATION_AGE old: ok, as before -- a print younger than the owner's bound
+    ///           needs no witness;
+    ///        2. else, the market has a source 1 whose `latest` is ok: ok iff source 1 AGREES with the print within the
+    ///           market's own maxDeviationBps (the same {_agree} settlement corroboration uses; one band, not a wider
+    ///           one), and STALE otherwise -- the market has moved and the print has not. The answer is still source
+    ///           0's print and timestamp, now corroborated;
+    ///        3. else (single-source market, or source 1 not ok): ok iff the print is at most spotMaxAge old -- the rule
+    ///           every market had before T-OP-061, unchanged for the single-source ones and for a dual-source market
+    ///           whose pool is down.
+    ///      TWO CEILINGS, NOT ONE (T-OP-087). The corroborated path (step 2) is bounded by the COMPILED ceiling
+    ///      MAX_SPOT_MAX_AGE (4 days), not by the market's spotMaxAge; the uncorroborated path (step 3) keeps
+    ///      spotMaxAge. T-OP-061 first put spotMaxAge ahead of step 2 as "the outer bound in every step", and with the
+    ///      live rows' 90,000 s (25 h) a Friday print was StaleSpot all weekend (~65.5 h) whatever the pool said -- so
+    ///      the owner's SEC-21c weekend ruling ("use the live pool price on a weekend", T-OP-066's unwind) and the
+    ///      after-close launch case both died on the outer bound the moment the print was a day old. The 4-day cap is
+    ///      the registry validator's own ceiling for spotMaxAgeS, a weekend plus a Monday holiday is ~89 h < 96 h, and
+    ///      it is what stops a months-old print passing on a coincidental agreement. Widening spotMaxAgeS in the
+    ///      registry instead would have widened the UNCORROBORATED window for every consumer, reversing owner sign-off
+    ///      c01 (DECISIONS-2026-09-17 s7); the code keeps 25 h for that case, which is what c01 protects.
+    ///      So, with the live rows: at a launch after the close, or on Sunday, the last print is accepted while the pool
+    ///      agrees with it and refused once the pool says the market moved; at the open a gap the pool follows refuses
+    ///      the stale print until the feed's 0.5 % rule prints; a quiet session keeps quoting; a dual-source market
+    ///      whose pool is down falls back to the 25 h clock.
     function _spot(address underlying) private view returns (uint8 status, uint256 price, uint256 updatedAt) {
         Market storage m = _markets[underlying];
         address[] storage sources = m.sources;
         if (sources.length == 0 || _oraclePaused(underlying)) return (SPOT_NO_SOURCE, 0, 0);
-        (bool success, bytes memory ret) = sources[0].staticcall(abi.encodeCall(IPriceSource.latest, (underlying)));
-        if (!success || ret.length < 96) return (SPOT_NO_SOURCE, 0, 0);
-        (uint256 okWord, uint256 p, uint256 t) = abi.decode(ret, (uint256, uint256, uint256));
-        if (okWord != 1 || p == 0 || p > MAX_PRICE || t > block.timestamp) return (SPOT_NO_SOURCE, 0, 0);
-        if (block.timestamp - t > _spotMaxAge(m)) return (SPOT_STALE, p, t);
+        (bool ok, uint256 p, uint256 t) = _latestOf(sources[0], underlying);
+        if (!ok) return (SPOT_NO_SOURCE, 0, 0);
+        uint256 age = block.timestamp - t;
+        if (age <= SPOT_CORROBORATION_AGE) return (SPOT_OK, p, t);
+        if (sources.length > 1 && age <= MAX_SPOT_MAX_AGE) {
+            (bool ok1, uint256 p1,) = _latestOf(sources[1], underlying);
+            if (ok1) return (_agree(p, p1, _maxDeviationBps(m)) ? SPOT_OK : SPOT_STALE, p, t);
+        }
+        if (age > _spotMaxAge(m)) return (SPOT_STALE, p, t);
         return (SPOT_OK, p, t);
+    }
+
+    /// @dev `source.latest(underlying)` as a staticcall, decoded by hand so a revert, short data, a dirty ok word, a zero
+    ///      or over-range price or a future timestamp all read as "not ok" rather than reverting the caller. A future
+    ///      timestamp is refused here, not clamped, so `block.timestamp - t` in {_spot} cannot underflow.
+    function _latestOf(address source, address underlying) private view returns (bool ok, uint256 p, uint256 t) {
+        (bool success, bytes memory ret) = source.staticcall(abi.encodeCall(IPriceSource.latest, (underlying)));
+        if (!success || ret.length < 96) return (false, 0, 0);
+        uint256 okWord;
+        (okWord, p, t) = abi.decode(ret, (uint256, uint256, uint256));
+        if (okWord != 1 || p == 0 || p > MAX_PRICE || t > block.timestamp) return (false, 0, 0);
+        return (true, p, t);
     }
 
     /// @dev The configuration (underlying, expiry) settles on: the pinned copy once {pin} ran, else the market's
@@ -963,10 +1029,5 @@ contract SettlementOracle is ISettlementOracle, AccessControl, ReentrancyGuardTr
         if (block.timestamp >= notBefore) return;
         // forge-lint: disable-next-line(unsafe-typecast)
         revert V2Errors.TooEarly(notBefore > type(uint40).max ? type(uint40).max : uint40(notBefore));
-    }
-
-    /// @dev Every role failure reverts V2Errors.NotAuthorized (not OpenZeppelin's AccessControlUnauthorizedAccount).
-    function _checkRole(bytes32 role, address account) internal view override {
-        if (!hasRole(role, account)) revert V2Errors.NotAuthorized();
     }
 }

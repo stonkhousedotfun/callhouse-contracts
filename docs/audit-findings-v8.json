@@ -1,0 +1,12 @@
+{
+  "_readme": "The audit-response register. It ships EMPTY on purpose - auditor null, packetShas null, findings [] - and script/v2/check-audit-response.sh passes green on exactly this state (\"0 findings registered\"). T-544 checked the C8-14A suspicion on 2026-09-21 by BREAKING this file rather than by reading the YAML, and the checker refused every time, by rule name: a half-filled record was rejected as severity-invalid, scope-empty and status-unset with exit 1, and a fixCommit set to the four-character STRING \"null\" was rejected as fixcommit-unresolvable. The script's own --self-test passed 25 of 25 - its first run outside the worktree that wrote it. TWO THINGS THAT RUN PROVED AND ONE IT DID NOT. Proved: FAIL survives the record walk, because it is fed by a here-document and not a pipe (check-audit-response.sh:170 and :240) - three rejections printed AND the script still exited 1, which on a pipe it would not have. Proved: a string \"null\" is caught, but only downstream and with a message about an unresolvable commit rather than about the value you typed. NOT proved: that anything RUNS this checker. The pre-commit hook is registered (.pre-commit-config.yaml, id audit-response) but .github/workflows/ci.yml never invokes pre-commit or this script, so enforcement is opt-in per machine. A hook that never runs is indistinguishable from one that passes.",
+  "interfaceVersion": 8,
+  "auditor": null,
+  "packetShas": {
+    "contracts": null,
+    "app": null,
+    "site": null,
+    "docs": null
+  },
+  "findings": []
+}

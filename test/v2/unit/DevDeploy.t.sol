@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {AccessManager} from "@openzeppelin/contracts/access/manager/AccessManager.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {DevDeploy} from "../../../script/v2/DevDeploy.s.sol";
 import {BaseV2Test} from "../BaseV2.t.sol";
 import {AutoRoller} from "../../../src/v2/AutoRoller.sol";
@@ -15,6 +17,7 @@ import {MockPayoutSwapRouter} from "../../../src/v2/mocks/MockPayoutSwapRouter.s
 import {MockPayoutV3Factory} from "../../../src/v2/mocks/MockPayoutV3Factory.sol";
 import {MockRoundFeed} from "../../../src/v2/mocks/MockRoundFeed.sol";
 import {MockUniV3Pool} from "../../../src/v2/mocks/MockUniV3Pool.sol";
+import {FeeSplitter} from "../../../src/v2/periphery/FeeSplitter.sol";
 import {UniV3PayoutAdapter} from "../../../src/v2/periphery/UniV3PayoutAdapter.sol";
 
 /// @notice `script/v2/DevDeploy.s.sol` over the v2 mocks: every core contract is deployed and wired as the devnet
@@ -45,6 +48,7 @@ contract DevDeployTest is BaseV2Test {
     MockPayoutV3Factory internal factory;
     MockPayoutSwapRouter internal router;
     address internal pricer = makeAddr("pricer");
+    address internal cranker = makeAddr("cranker");
 
     function _deployFeeds() internal override {
         realNvdaFeed = new MockRoundFeed(8, "RHNVDA / USD");
@@ -70,9 +74,14 @@ contract DevDeployTest is BaseV2Test {
     function _inputs() internal view returns (DevDeploy.Inputs memory in_) {
         in_.admin = admin;
         in_.guardian = guardian;
-        in_.feeRecipient = treasury;
+        // The treasury and the fee recipient are two roles that used to share one address. The treasury keeps the
+        // EOA; the fee recipient is now the FeeSplitter the run deploys, so it is left unset here and adopted.
+        in_.treasury = treasury;
+        in_.feeRecipient = address(0);
         in_.pricer = pricer;
         in_.mmQuoter = mm;
+        in_.cranker = cranker;
+        in_.burnBps = 5000;
         in_.usdg = address(usdg);
         in_.markets = new DevDeploy.MarketIn[](2);
         in_.markets[0] = DevDeploy.MarketIn({
@@ -133,17 +142,42 @@ contract DevDeployTest is BaseV2Test {
 
         // roles: admin everywhere, guardian where the contracts have one
         bytes32 adminRole = V2Constants.DEFAULT_ADMIN_ROLE;
-        assertTrue(d.calendar.hasRole(adminRole, admin), "calendar admin");
-        assertTrue(d.chainlink.hasRole(adminRole, admin), "chainlink admin");
-        assertTrue(d.univ3.hasRole(adminRole, admin), "univ3 admin");
-        assertTrue(d.oracle.hasRole(adminRole, admin), "oracle admin");
-        assertTrue(d.oracle.hasRole(V2Constants.GUARDIAN_ROLE, guardian), "oracle guardian");
-        assertTrue(d.clearinghouse.hasRole(adminRole, admin), "clearinghouse admin");
-        assertTrue(d.clearinghouse.hasRole(V2Constants.GUARDIAN_ROLE, guardian), "clearinghouse guardian");
-        assertTrue(d.orderBook.hasRole(adminRole, admin), "book admin");
-        assertTrue(d.orderBook.hasRole(V2Constants.GUARDIAN_ROLE, guardian), "book guardian");
-        assertTrue(d.keeperRewards.hasRole(adminRole, admin), "rewards admin");
-        assertFalse(d.clearinghouse.hasRole(adminRole, address(script)), "the script contract holds no role");
+        assertTrue(d.calendar.authority().code.length > 0, "calendar is Managed");
+        vm.prank(admin);
+        d.calendar.setHolidays(new uint32[](0), true);
+        // v8 (C8-04): the sources, the oracle and KeeperRewards are Managed; the manager maps their selectors.
+        assertTrue(d.chainlink.authority().code.length > 0, "chainlink is Managed");
+        assertTrue(d.univ3.authority().code.length > 0, "univ3 is Managed");
+        assertTrue(d.oracle.authority().code.length > 0, "oracle is Managed");
+        assertTrue(d.keeperRewards.authority().code.length > 0, "rewards is Managed");
+        vm.startPrank(admin);
+        d.oracle.setKeeperRewards(address(d.keeperRewards)); // CONFIG_ADMIN through the manager
+        d.keeperRewards.setDailyCap(100e6); // FEE_MANAGER through the manager
+        vm.stopPrank();
+        // v8 (C8-02): the Clearinghouse is Managed too; its role table lives on the same manager.
+        AccessManager chMgr = AccessManager(d.clearinghouse.authority());
+        (bool listingOk,) = chMgr.hasRole(V8Roles.LISTING, admin);
+        (bool guardianOk,) = chMgr.hasRole(V8Roles.GUARDIAN, guardian);
+        assertTrue(listingOk, "clearinghouse LISTING on manager");
+        assertTrue(guardianOk, "clearinghouse guardian on manager");
+        // C8-03: the book is Managed and shares the one manager; admin holds its fee lanes, guardian the pause.
+        assertEq(d.orderBook.authority(), address(chMgr), "book and clearinghouse share the one manager");
+        (bool feeOk,) = chMgr.hasRole(V8Roles.FEE_MANAGER, admin);
+        assertTrue(feeOk, "book FEE_MANAGER on manager");
+        // Exercise the pause lane instead of re-reading hasRole: `guardian` already holds GUARDIAN from the
+        // oracle and Clearinghouse wiring, so a hasRole read stays green even if the book's own
+        // setTargetFunctionRole(setTradingPaused -> GUARDIAN) and its admin grant were deleted from the script.
+        vm.prank(admin);
+        d.orderBook.setTradingPaused(true);
+        vm.prank(admin);
+        d.orderBook.setTradingPaused(false);
+        vm.prank(guardian);
+        d.orderBook.setTradingPaused(true);
+        vm.prank(guardian);
+        d.orderBook.setTradingPaused(false);
+        assertTrue(d.clearinghouse.isMinter(address(d.orderBook)), "book joined the minter allow-list");
+        (bool scriptOk,) = chMgr.hasRole(V8Roles.LISTING, address(script));
+        assertFalse(scriptOk, "the script contract holds no listing role");
 
         // calendar
         assertTrue(d.calendar.holiday(20703), "Labor Day seeded");
@@ -187,7 +221,7 @@ contract DevDeployTest is BaseV2Test {
         assertEq(d.clearinghouse.market(address(nvda)).mintFeePpm, 80, "NVDA rent rate");
         assertEq(d.clearinghouse.market(address(tsla)).mintFeePpm, 80, "TSLA rent rate");
         assertEq(d.clearinghouse.calendar(), address(d.calendar), "calendar");
-        assertEq(d.clearinghouse.feeRecipient(), treasury, "fee recipient");
+        assertEq(d.clearinghouse.feeRecipient(), d.feeSplitter, "fee recipient is the splitter, not an EOA");
         assertEq(address(d.clearinghouse.keeperRewards()), address(d.keeperRewards), "clearinghouse -> rewards");
         assertEq(d.clearinghouse.baseUri(), "https://app.stonkhouse.fun/api/token/", "base URI");
         assertFalse(d.clearinghouse.thirdPartyRedeemAllowed(address(d.orderBook)), "book opted out");
@@ -200,7 +234,7 @@ contract DevDeployTest is BaseV2Test {
         assertEq(f.takerFeeCapBps, 1000, "taker cap");
         assertEq(f.makerRebateBps, 5000, "rebate");
         assertEq(d.orderBook.clearinghouse(), address(d.clearinghouse), "book -> clearinghouse");
-        assertEq(d.orderBook.feeRecipient(), treasury, "book fee recipient");
+        assertEq(d.orderBook.feeRecipient(), d.feeSplitter, "book fee recipient is the splitter, not an EOA");
 
         // keeper rewards
         assertTrue(d.keeperRewards.isCaller(address(d.oracle)), "oracle may reward");
@@ -217,6 +251,95 @@ contract DevDeployTest is BaseV2Test {
     }
 
     /// @notice The C2-09 / C2-10 / C2-11 wiring of the hand-off notes, on the default (auto) flags.
+    /*//////////////////////////////////////////////////////////////
+                              THE FLYWHEEL
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice C8-DEVDEPLOY-FLYWHEEL: the devnet has a REAL FeeSplitter, the fee path runs through it, and the
+    ///         AccessManager it has always constructed is now published.
+    /// @dev WHY EACH ASSERTION IS HERE RATHER THAN A HAPPY-PATH SWEEP. T-119's flywheel gates check for CONTRACT
+    ///      CODE at the splitter and the executor. A second EOA, or a passthrough stub, would satisfy a naive
+    ///      "is it set" check and record a flywheel that does not exist -- a false green, which is worse than the
+    ///      honest named skip T-119 ships today. So this asserts the splitter is a CONTRACT, that it is the
+    ///      address the two fee takers actually hold, and that the treasury is NOT that address.
+    function test_flywheel_feeSplitterIsRealAndIsTheFeePath() public {
+        DevDeploy.Deployment memory d = script.runWith(_inputs());
+
+        assertTrue(d.feeSplitter != address(0), "a FeeSplitter address was emitted");
+        assertGt(d.feeSplitter.code.length, 0, "the FeeSplitter is a contract, not an EOA standing in for one");
+        assertEq(d.clearinghouse.feeRecipient(), d.feeSplitter, "the Clearinghouse pays the splitter");
+        assertEq(d.orderBook.feeRecipient(), d.feeSplitter, "the OrderBook pays the splitter");
+
+        // The splitter is not the treasury and the treasury is not the splitter: that conflation is what made the
+        // old single-EOA wiring look correct.
+        assertEq(FeeSplitter(d.feeSplitter).treasury(), treasury, "the splitter's exit is the treasury");
+        assertTrue(d.feeSplitter != treasury, "the splitter and the treasury are different addresses");
+        assertEq(FeeSplitter(d.feeSplitter).usdg(), address(usdg), "the splitter takes USDG");
+    }
+
+    /// @dev KeeperRewards takes the TREASURY, not the splitter. Its third constructor argument is the Treasury Safe
+    ///      (`src/v2/KeeperRewards.sol:121`, and :91-92 "Protocol-owned money (bounties) can only leave to it"), and
+    ///      prod passes `treasurySafe` there while passing the splitter to the other two
+    ///      (`script/v2/DeployV8.s.sol:529` vs `:502`). Routing defunded bounties through a burn-and-split would be
+    ///      a different thing than wiring the fee path.
+    function test_flywheel_keeperRewardsKeepsTheTreasuryNotTheSplitter() public {
+        DevDeploy.Deployment memory d = script.runWith(_inputs());
+        assertEq(d.keeperRewards.treasury(), treasury, "keeper bounties return to the treasury");
+        assertTrue(d.keeperRewards.treasury() != d.feeSplitter, "and NOT through the splitter");
+    }
+
+    /// @dev The manager was always constructed; it was simply never published, so T-119 had to recover it from a
+    ///      deployed contract's `authority()`. There is still exactly ONE.
+    function test_flywheel_accessManagerIsPublishedAndIsTheOnlyOne() public {
+        DevDeploy.Deployment memory d = script.runWith(_inputs());
+        assertTrue(d.accessManager != address(0), "the AccessManager is emitted");
+        assertGt(d.accessManager.code.length, 0, "and it is a contract");
+        assertEq(d.clearinghouse.authority(), d.accessManager, "the Clearinghouse is on it");
+        assertEq(d.orderBook.authority(), d.accessManager, "the OrderBook is on it");
+        assertEq(FeeSplitter(d.feeSplitter).authority(), d.accessManager, "and so is the splitter");
+    }
+
+    /// @dev The cranker is a PRINCIPAL holding BUYBACK, not a role. v8 has eleven roles and none is called
+    ///      "cranker" (`src/v2/access/V8Roles.sol` COUNT = 11).
+    function test_flywheel_crankerHoldsBuybackAndBuybackIsMapped() public {
+        DevDeploy.Deployment memory d = script.runWith(_inputs());
+        AccessManager mgr = AccessManager(d.accessManager);
+
+        assertEq(
+            mgr.getTargetFunctionRole(d.feeSplitter, FeeSplitter.buyback.selector),
+            V8Roles.BUYBACK,
+            "buyback(uint256) is mapped to BUYBACK on the splitter"
+        );
+        (bool holds,) = mgr.hasRole(V8Roles.BUYBACK, cranker);
+        assertTrue(holds, "the cranker principal holds BUYBACK");
+        assertEq(V8Roles.COUNT, 11, "v8 has eleven roles and none of them is a cranker role");
+    }
+
+    /// @dev On a bare anvil the executor CANNOT be deployed -- its constructor reads live v4 pool state and needs a
+    ///      registered launch hook. The JSON must say WHICH path ran, so a null executor here is never mistaken for
+    ///      a failed one on a fork.
+    function test_flywheel_bareAnvilEmitsNoExecutorAndSaysSo() public {
+        DevDeploy.Inputs memory in_ = _inputs();
+        DevDeploy.Deployment memory d = script.runWith(in_);
+
+        assertEq(d.buybackExecutor, address(0), "no buyback executor on a bare anvil");
+        string memory json = script.toJson(in_, d);
+        assertTrue(_contains(json, "\"mode\": \"bare-anvil\""), "the JSON names the bare-anvil path");
+        assertTrue(_contains(json, "\"accessManager\""), "the JSON publishes the accessManager");
+        assertTrue(_contains(json, "\"feeSplitter\""), "the JSON publishes the feeSplitter");
+        assertTrue(_contains(json, "\"cranker\""), "the JSON publishes the cranker principal");
+        assertTrue(_contains(json, "\"mmQuoter\""), "mmQuoter is still spelled mmQuoter");
+    }
+
+    /// @dev A fork run that has not been given the venue REFUSES by name instead of quietly falling back to the
+    ///      bare-anvil path. A flywheel that silently did not deploy is the false green criterion 5 forbids.
+    function test_flywheel_forkWithoutVenueRefusesByName() public {
+        DevDeploy.Inputs memory in_ = _inputs();
+        in_.flywheel.fork = true;
+        vm.expectRevert();
+        script.runWith(in_);
+    }
+
     function test_runWith_wiresThePeriphery() public {
         DevDeploy.Deployment memory d = script.runWith(_inputs());
         bytes32 adminRole = V2Constants.DEFAULT_ADMIN_ROLE;
@@ -227,8 +350,17 @@ contract DevDeployTest is BaseV2Test {
         assertEq(address(roller.orderBook()), address(d.orderBook), "roller -> book");
         assertEq(address(roller.clearinghouse()), address(d.clearinghouse), "roller -> clearinghouse");
         assertEq(roller.usdg(), address(usdg), "roller usdg");
-        assertTrue(roller.hasRole(adminRole, admin), "roller admin");
-        assertTrue(roller.hasRole(V2Constants.PRICER_ROLE, pricer), "pricer role");
+        // C8-05: the roller is `Managed` on the SAME manager as the core (the devnet no longer deploys a second
+        // one), and `reprice` is PRICER there rather than a role on the roller.
+        AccessManager rollerMgr = AccessManager(roller.authority());
+        assertEq(address(rollerMgr), d.clearinghouse.authority(), "one manager for the whole devnet");
+        (bool pricerOk,) = rollerMgr.hasRole(V8Roles.PRICER, pricer);
+        assertTrue(pricerOk, "pricer role");
+        assertEq(
+            rollerMgr.getTargetFunctionRole(address(roller), AutoRoller.reprice.selector),
+            V8Roles.PRICER,
+            "reprice is PRICER"
+        );
         assertEq(address(roller.keeperRewards()), address(d.keeperRewards), "roller -> rewards");
         assertTrue(d.keeperRewards.isCaller(address(roller)), "roller may reward");
         assertEq(d.keeperRewards.bounty(V2Constants.ACTION_ROLL), 50_000, "ROLL bounty");
@@ -253,12 +385,27 @@ contract DevDeployTest is BaseV2Test {
         MakerRegistry makers = MakerRegistry(d.makerRegistry);
         MakerVault vault = MakerVault(d.makerVault);
         RewardsDistributor distributor = RewardsDistributor(d.rewardsDistributor);
-        assertTrue(makers.hasRole(adminRole, admin), "registry admin");
+        assertTrue(makers.authority().code.length > 0, "registry is Managed");
+        vm.prank(admin);
+        makers.setTier(admin, 0);
         assertEq(address(d.orderBook.makerRegistry()), address(makers), "book -> registry");
         assertEq(address(vault.orderBook()), address(d.orderBook), "vault -> book");
         assertEq(address(vault.clearinghouse()), address(d.clearinghouse), "vault -> clearinghouse");
-        assertTrue(vault.hasRole(adminRole, admin), "vault admin");
-        assertTrue(vault.hasRole(V2Constants.QUOTER_ROLE, mm), "quoter role");
+        // C8-05: TREASURY_ADMIN and QUOTER live on the manager, `deposit` is permissionless, and the vault's and
+        // the distributor's exits point at the devnet's fee recipient (DeployV8 sets the real Treasury Safe).
+        AccessManager vaultMgr = AccessManager(vault.authority());
+        assertEq(address(vaultMgr), d.clearinghouse.authority(), "vault on the same manager");
+        (bool treasuryOk,) = vaultMgr.hasRole(V8Roles.TREASURY_ADMIN, admin);
+        (bool quoterOk,) = vaultMgr.hasRole(V8Roles.QUOTER, mm);
+        assertTrue(treasuryOk, "admin holds TREASURY_ADMIN");
+        assertTrue(quoterOk, "quoter role");
+        assertEq(
+            vaultMgr.getTargetFunctionRole(address(vault), MakerVault.deposit.selector),
+            0,
+            "deposit carries no role: it is permissionless in v8"
+        );
+        assertEq(vault.treasury(), treasury, "the vault's only exit");
+        assertEq(distributor.treasury(), treasury, "the distributor's only exit");
         MakerVault.Limits memory l = vault.limits();
         assertEq(l.maxSeriesUnits, 10_000, "maxSeriesUnits");
         assertEq(l.maxTotalNotional, 250_000e6, "maxTotalNotional");
@@ -269,29 +416,25 @@ contract DevDeployTest is BaseV2Test {
         assertTrue(d.clearinghouse.isApprovedForAll(address(vault), address(d.orderBook)), "book moves vault tokens");
         assertEq(usdg.allowance(address(vault), address(d.orderBook)), type(uint256).max, "book pulls vault USDG");
         assertEq(address(distributor.usdg()), address(usdg), "distributor usdg");
-        assertTrue(distributor.hasRole(adminRole, admin), "distributor admin");
+        assertEq(distributor.authority(), address(vaultMgr), "distributor on the same manager");
         assertFalse(address(script).code.length == 0, "script alive");
-        assertFalse(roller.hasRole(adminRole, address(script)), "the script contract holds no periphery role");
+        // The script broadcasts as the admin, so it is the admin that holds the roles, not the script contract.
+        (bool scriptHoldsPricer,) = rollerMgr.hasRole(V8Roles.PRICER, address(script));
+        (bool scriptHoldsQuoter,) = vaultMgr.hasRole(V8Roles.QUOTER, address(script));
+        assertFalse(scriptHoldsPricer, "the script contract holds no periphery role");
+        assertFalse(scriptHoldsQuoter, "nor the quoting one");
     }
 
-    /// @notice V2-ARCHITECTURE §2.1: grantRole and revokeRole revert NotAuthorized on every contract that overrides
-    ///         _checkRole, and OpenZeppelin's AccessControlUnauthorizedAccount on KeeperRewards and the price sources,
-    ///         whose own admin calls use explicit NotAuthorized checks (DataStreamsSource is not deployed here:
-    ///         DataStreamsSourceTest.test_admin_grantRole_keepsOpenZeppelinsError; sweep contracts-c25).
+    /// @notice V2-ARCHITECTURE §2.1: grantRole and revokeRole revert NotAuthorized on every contract that still
+    ///         overrides _checkRole. The v8 Managed set (calendar, the price sources, the oracle, KeeperRewards,
+    ///         the Clearinghouse, the MakerRegistry, since C8-05 the AutoRoller, the MakerVault and the
+    ///         RewardsDistributor, and since C8-03 the OrderBook) has no AccessControl surface at all, so the call
+    ///         reverts with no data rather than with NotAuthorized: its role table lives on the AccessManager.
+    ///         UniV3PayoutAdapter is the last one still carrying an on-contract role table.
     function test_roles_grantAndRevokeErrorPerContract() public {
         DevDeploy.Deployment memory d = script.runWith(_inputs());
         bytes32 role = V2Constants.GUARDIAN_ROLE;
-        address[9] memory shared = [
-            address(d.calendar),
-            address(d.oracle),
-            address(d.clearinghouse),
-            address(d.orderBook),
-            d.autoRoller,
-            d.payoutAdapter,
-            d.makerRegistry,
-            d.makerVault,
-            d.rewardsDistributor
-        ];
+        address[1] memory shared = [d.payoutAdapter];
         vm.startPrank(alice);
         for (uint256 i; i < shared.length; ++i) {
             vm.expectRevert(V2Errors.NotAuthorized.selector);
@@ -299,15 +442,41 @@ contract DevDeployTest is BaseV2Test {
             vm.expectRevert(V2Errors.NotAuthorized.selector);
             IAccessControl(shared[i]).revokeRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
         }
-        address[3] memory openZeppelins = [address(d.keeperRewards), address(d.chainlink), address(d.univ3)];
-        bytes memory unauthorized = abi.encodeWithSelector(
-            IAccessControl.AccessControlUnauthorizedAccount.selector, alice, V2Constants.DEFAULT_ADMIN_ROLE
-        );
-        for (uint256 i; i < openZeppelins.length; ++i) {
-            vm.expectRevert(unauthorized);
-            IAccessControl(openZeppelins[i]).grantRole(role, alice);
-            vm.expectRevert(unauthorized);
-            IAccessControl(openZeppelins[i]).revokeRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
+        address[11] memory managed = [
+            address(d.calendar),
+            address(d.chainlink),
+            address(d.univ3),
+            address(d.oracle),
+            address(d.keeperRewards),
+            address(d.clearinghouse), // C8-02 moved the Clearinghouse onto the manager as well
+            d.makerRegistry,
+            d.autoRoller, // C8-05 moved these three across, so they lost grantRole/revokeRole entirely
+            d.makerVault,
+            d.rewardsDistributor,
+            address(d.orderBook) // C8-03 moved the book onto the manager: no grantRole, so no revert data
+        ];
+        for (uint256 i; i < managed.length; ++i) {
+            // v8 (C8-04): Managed contracts have no AccessControl surface at all; the role table lives on the manager.
+            // T-522. A LOW-LEVEL CALL, NOT `vm.expectRevert()`. The C8-05 author flagged this line themselves -
+            // moving a contract into `managed` swaps a selector-specific assertion for a bare one, "and if I got it
+            // wrong the test still passes". It did: putting `payoutAdapter` in this array, which DOES have grantRole
+            // and refuses alice with NotAuthorized, left the test green. A bare expectRevert accepts ANY revert, so
+            // it cannot tell "no such function" from "function here, caller refused" - which is the only thing this
+            // loop exists to say. `vm.expectRevert(bytes(""))` is not the fix either: on this forge it PANICS the
+            // runner rather than failing the test when the revert carries data (alloy-dyn-abi, "range end index 4
+            // out of range for slice of length 0"), so a mismatch crashes instead of reporting. Asserting on the
+            // returndata of a raw call says exactly what is meant and fails cleanly.
+            (bool grantOk, bytes memory grantRet) =
+                managed[i].call(abi.encodeWithSelector(IAccessControl.grantRole.selector, role, alice));
+            assertFalse(grantOk, "grantRole must revert on a Managed target");
+            assertEq(grantRet.length, 0, "a Managed target has no grantRole, so the revert carries NO data");
+            // And revokeRole, which the move silently dropped: `shared` above asserts both calls, `managed` asserted
+            // only grantRole, so the three contracts C8-05 moved across lost half their coverage in the move.
+            (bool revokeOk, bytes memory revokeRet) = managed[i].call(
+                abi.encodeWithSelector(IAccessControl.revokeRole.selector, V2Constants.DEFAULT_ADMIN_ROLE, admin)
+            );
+            assertFalse(revokeOk, "revokeRole must revert on a Managed target");
+            assertEq(revokeRet.length, 0, "a Managed target has no revokeRole, so the revert carries NO data");
         }
         vm.stopPrank();
     }
@@ -548,7 +717,9 @@ contract DevDeployTest is BaseV2Test {
                     limitPrice: 11_000_000,
                     writeToSell: false,
                     recipient: bob,
-                    deadline: uint40(block.timestamp + 60)
+                    deadline: uint40(block.timestamp + 60),
+                    // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+                    maxTotalFee: type(uint128).max
                 })
             );
         vm.stopPrank();
@@ -608,7 +779,7 @@ contract DevDeployTest is BaseV2Test {
                 smartPricing: true,
                 otmBps: 500,
                 askBps: 60,
-                minAskBps: 30,
+                minAskBps: 50, // T-OP-063 / SEC-13: MIN_ASK_BPS is 50 now; 30 would revert CeilingExceeded
                 maxAskBps: 150,
                 maxUnits: 1_000
             })

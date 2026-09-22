@@ -38,6 +38,30 @@ contract HolderRefundEscrow {
 /// @dev Fixture: NVDA call K = 240 settled at P = 250; bob holds 100 units. Owed 3.75e16 NVDA base units (0.0375
 ///      share) worth 9.375 USDG at P; with the 100 bps bound and the mock's default route fee of 0, minOut = 9_281_250.
 ///      The adapter quotes at 250.00 unless a test changes the rate.
+/// @dev T-OP-080. A `trySpot` that needs at least `need` gas to answer: it burns down until `need` (less a margin
+///      for the return) has been spent, so a caller that forwarded less runs out of gas inside it and reads "no
+///      spot", and a caller that forwarded enough gets an ok answer at `spotPrice`. Etched over the fixture's oracle
+///      with its immutables in the runtime code, so no storage is needed. `need` is set to the two-source read
+///      MEASURED on a 4663 fork (`V2ForkTest.test_fork_spotReadGas_oldPrintPoolAgrees_twoSourceReads`), which makes
+///      this the unit-level twin of that measurement: a cap lowered under the need goes red here, offline.
+contract SpotOracleThatNeedsGas {
+    uint256 public immutable need;
+    uint256 public immutable spotPrice;
+
+    constructor(uint256 need_, uint256 spotPrice_) {
+        need = need_;
+        spotPrice = spotPrice_;
+    }
+
+    function trySpot(address) external view returns (bool ok, uint256 price, uint256 updatedAt) {
+        uint256 start = gasleft();
+        // Spin until `need` less a return margin is spent. With less than `need` forwarded this loop exhausts the
+        // frame, which is the failure being modelled: the capped read sees an out-of-gas, not an answer.
+        while (start - gasleft() < need - 2_000) {}
+        return (true, spotPrice, block.timestamp);
+    }
+}
+
 contract ClearinghousePayoutTest is ClearinghouseTestBase {
     uint256 internal callId;
     uint256 internal otmId;
@@ -53,6 +77,13 @@ contract ClearinghousePayoutTest is ClearinghouseTestBase {
     uint256 internal constant MIN_OUT_FEE_30 = 9_253_125;
     /// @dev A spot 5 % above P, what OWED is worth there, and that value less the 100 bps bound.
     uint256 internal constant SPOT_UP = 262_500_000;
+    /// @dev MIRROR of `Clearinghouse.SPOT_READ_GAS` (private there); T-OP-080 re-sized it from 150_000 for the
+    ///      two-source read T-OP-061 added. The two tests that cite it go red if the constant moves without them.
+    uint256 internal constant SPOT_READ_GAS = 240_000;
+    /// @dev The two-source `trySpot` read measured COLD on a 4663 fork (old print, pool agrees -- the after-close
+    ///      launch state), from `V2ForkTest.test_fork_spotReadGas_oldPrintPoolAgrees_twoSourceReads`; the block and
+    ///      SHA are in `Clearinghouse.sol`'s comment on `SPOT_READ_GAS`. The cap must hold this with headroom.
+    uint256 internal constant SPOT_READ_NEED_TWO_SOURCES = 155_000; // 154_400 measured, rounded up to 1_000
     uint256 internal constant VALUE_AT_SPOT_UP = 9_843_750;
     uint256 internal constant MIN_OUT_AT_SPOT_UP = 9_745_312;
 
@@ -647,7 +678,7 @@ contract ClearinghousePayoutTest is ClearinghouseTestBase {
     }
 
     /// @dev Redemption needs only the stored settlement: an oracle that burns every unit of gas it is given costs a
-    ///      converted redemption at most the 150_000 gas the spot read is capped at, and counts as no spot.
+    ///      converted redemption at most the SPOT_READ_GAS the spot read is capped at, and counts as no spot.
     function test_floorPrice_gasBurningOracleCostsAtMostTheCap() public {
         vm.prank(admin);
         ch.setKeeperRewards(address(0));
@@ -666,7 +697,34 @@ contract ClearinghousePayoutTest is ClearinghouseTestBase {
         console2.log("gas: redeem converted, honest oracle / gas-burning oracle", honest, burning);
         assertTrue(inUsdg, "converts on P inside the grace");
         assertEq(adapter.lastMinOut(), MIN_OUT);
-        assertLe(burning - honest, 150_000, "the read costs at most its gas cap");
+        assertLe(burning - honest, SPOT_READ_GAS, "the read costs at most its gas cap");
+    }
+
+    /// @notice T-OP-080 / AC3. In the after-close launch state `trySpot` reads TWO sources (T-OP-061), and the cap
+    ///         `_floorPrice` forwards must still let it answer: with an oracle that needs exactly the measured
+    ///         two-source gas, the redemption takes the ok-spot branch (floor at the spot, so a fill at P pays in
+    ///         kind). PROVE BY BREAKING, authored: set `Clearinghouse.SPOT_READ_GAS` below
+    ///         SPOT_READ_NEED_TWO_SOURCES (or this mock's `need` above the cap, which the control below does) and the
+    ///         read runs out of gas, the floor falls back to P, the fill converts, and `_assertInKind` goes red with
+    ///         "fell back to in kind". The control is the same test with the roles reversed, so a mock that answered
+    ///         regardless of gas would fail the control rather than pass both.
+    function test_floorPrice_twoSourceReadAtTheMeasuredGas_takesTheSpotBranch() public {
+        vm.prank(admin);
+        ch.setKeeperRewards(address(0));
+        adapter.setRate(P, 10_000); // a fill at the settlement price: misses a floor set at the spot, meets one at P
+        assertLe(SPOT_READ_NEED_TWO_SOURCES * 3 / 2, SPOT_READ_GAS, "the cap holds the measured need, 1.5x headroom");
+
+        uint256 snap = vm.snapshotState();
+        vm.etch(address(oracle), address(new SpotOracleThatNeedsGas(SPOT_READ_NEED_TWO_SOURCES, SPOT_UP)).code);
+        _assertInKind(); // the spot branch was taken: the floor sat at SPOT_UP and the fill at P missed it
+        vm.revertToState(snap);
+
+        // CONTROL: a read that needs MORE than the cap is the failure the cap models -- no spot, floor at P, converts.
+        vm.etch(address(oracle), address(new SpotOracleThatNeedsGas(SPOT_READ_GAS + 5_000, SPOT_UP)).code);
+        (uint256 paid, bool inUsdg) = _redeem(callId, bob);
+        assertTrue(inUsdg, "over the cap the read is no spot, the floor is P and the fill at P converts");
+        assertEq(adapter.lastMinOut(), MIN_OUT, "minOut = value at P less the bound: the floor never saw the spot");
+        assertEq(paid, VALUE, "the fill at P pays the value at P");
     }
 
     /// @dev For any spot, age and fill: the payout converts exactly when the fill meets the bound below the value at

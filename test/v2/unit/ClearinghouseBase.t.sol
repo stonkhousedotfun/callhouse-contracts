@@ -8,6 +8,7 @@ import {Clearinghouse} from "../../../src/v2/Clearinghouse.sol";
 import {ExpiryCalendar} from "../../../src/v2/ExpiryCalendar.sol";
 import {KeeperRewards} from "../../../src/v2/KeeperRewards.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {V2Ids} from "../../../src/v2/interfaces/V2Ids.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MockPayoutAdapter} from "../../../src/v2/mocks/MockPayoutAdapter.sol";
@@ -45,10 +46,12 @@ abstract contract ClearinghouseTestBase is BaseV2Test {
     uint128 internal constant K_240 = 240_000_000;
 
     function _deployCore() internal virtual override {
-        calendar = new ExpiryCalendar(admin, new uint32[](0));
+        calendar = _newCalendar(new uint32[](0), admin);
         oracle = new MockSettlementOracle();
-        ch = new Clearinghouse(admin, address(usdg), address(calendar), treasury, BASE_URI);
-        rewards = new KeeperRewards(IERC20(address(usdg)), admin);
+        ch = _newClearinghouse(address(usdg), address(calendar), treasury, BASE_URI, admin);
+        _grant(V8Roles.GUARDIAN, guardian, 0);
+        rewards = new KeeperRewards(IERC20(address(usdg)), address(manager), treasury);
+        _wire(address(rewards), "KeeperRewards", admin, 0);
         adapter = new MockPayoutAdapter(IERC20(address(usdg)), NVDA_SPOT);
         vm.label(address(ch), "Clearinghouse");
         vm.label(address(calendar), "ExpiryCalendar");
@@ -57,9 +60,15 @@ abstract contract ClearinghouseTestBase is BaseV2Test {
         vm.label(address(adapter), "MockPayoutAdapter");
 
         vm.startPrank(admin);
-        ch.grantRole(V2Constants.GUARDIAN_ROLE, guardian);
-        ch.registerMarket(address(nvda), _cfg(address(oracle)));
-        ch.registerMarket(address(tsla), _cfg(address(oracle)));
+        ch.setMinter(address(this), true);
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(FEE_BPS, 0);
+        ch.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch.setMarketOracle(address(nvda), address(oracle));
+        ch.setMarketFees(address(nvda), FEE_BPS, 0);
+        ch.registerMarket(address(tsla), STRIKE_TICK, true);
+        ch.setMarketOracle(address(tsla), address(oracle));
+        ch.setMarketFees(address(tsla), FEE_BPS, 0);
         ch.setPayoutAdapter(address(adapter), SLIPPAGE_BPS);
         ch.setKeeperRewards(address(rewards));
         rewards.setCaller(address(ch), true);
@@ -111,10 +120,19 @@ abstract contract ClearinghouseTestBase is BaseV2Test {
         ch.deposit(asset, amount, who);
     }
 
-    /// @dev Deposits exactly the collateral `units` need, then mints them with `writer` as the caller.
+    /// @dev Direct mint() requires isMinter[msg.sender] (Clearinghouse.sol:565). The fixture grants
+    ///      address(this); EOAs are not minters. Writer names this as operator, then this mints.
+    function _asMinter(address writer) internal {
+        if (!ch.isOperator(writer, address(this))) {
+            vm.prank(writer);
+            ch.setOperator(address(this), true);
+        }
+    }
+
+    /// @dev Deposits exactly the collateral `units` need, then mints as the fixture minter.
     function _write(address writer, uint256 longId, uint64 units, address longTo) internal {
         _deposit(writer, ch.collateralAsset(longId), units * ch.collateralPerUnit(longId));
-        vm.prank(writer);
+        _asMinter(writer);
         ch.mint(longId, units, writer, longTo);
     }
 

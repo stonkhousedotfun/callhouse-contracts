@@ -1621,6 +1621,13 @@ contract VaultInvariantTest is BaseTest {
     ///      hold an option token of an id the vault armed.
     address internal mallory;
 
+    /// @dev T-OP-046. How many times {invariant_noFreeShares} checked the share price against the assets and
+    ///      how many times it had no supply to check. A campaign that never minted a share would pass that
+    ///      invariant vacuously and look the same as one that did; {test_handlerReachesEveryState} reads the
+    ///      pair after its scripted pass, since the campaign rolls the test contract's state back between runs.
+    uint256 public noFreeSharesChecked;
+    uint256 public noFreeSharesSkipped;
+
     function setUp() public override {
         super.setUp();
 
@@ -1803,47 +1810,52 @@ contract VaultInvariantTest is BaseTest {
 
     /// @notice Nobody can redeem more than the vault actually has. Premium lives outside the
     ///         share price, so the whole supply must always convert to at most `totalAssets`.
-    function invariant_noFreeShares() public view {
-        if (vault.totalSupply() == 0) return;
-        assertLe(
-            vault.convertToAssets(vault.totalSupply()),
-            vault.totalAssets(),
-            "share price over-quotes the assets behind it"
-        );
+    function invariant_noFreeShares() public {
+        if (vault.totalSupply() == 0) {
+            // No shares, nothing to over-quote. Counted in a branch, not returned out of (T-OP-046).
+            ++noFreeSharesSkipped;
+        } else {
+            ++noFreeSharesChecked;
+            assertLe(
+                vault.convertToAssets(vault.totalSupply()),
+                vault.totalAssets(),
+                "share price over-quotes the assets behind it"
+            );
 
-        // The version with teeth. The line above is close to an identity of `mulDiv`; this one
-        // ties three independent numbers together — the live share price, the reserve carved
-        // out for settled redeemers, and the collateral sitting inside Valorem. If settlement
-        // ever reserved assets it did not first remove from the share price, or a cycle closed
-        // without the collateral coming back, the standing holders would be quoted a redemption
-        // value that eats a settled redeemer's money, and this is where that shows up.
-        uint256 owedToHolders;
-        for (uint256 i; i < holders.length; i++) {
-            owedToHolders += vault.convertToAssets(vault.balanceOf(holders[i]));
+            // The version with teeth. The line above is close to an identity of `mulDiv`; this one
+            // ties three independent numbers together — the live share price, the reserve carved
+            // out for settled redeemers, and the collateral sitting inside Valorem. If settlement
+            // ever reserved assets it did not first remove from the share price, or a cycle closed
+            // without the collateral coming back, the standing holders would be quoted a redemption
+            // value that eats a settled redeemer's money, and this is where that shows up.
+            uint256 owedToHolders;
+            for (uint256 i; i < holders.length; i++) {
+                owedToHolders += vault.convertToAssets(vault.balanceOf(holders[i]));
+            }
+            // The reserve's REAL claim is `min(reservedAssets, balance)`: after an issuer burn takes the
+            // balance below it, every uncollected claimant is paid the same `balance / reserved` fraction
+            // ({Vault._payoutOwed}), so together they take exactly the balance and not a base unit
+            // more. With no burn in the run this is the plain `reservedAssets`.
+            uint256 balance = nvda.balanceOf(address(vault));
+            uint256 reserved = vault.reservedAssets();
+            uint256 reserveClaim = reserved < balance ? reserved : balance;
+            assertLe(
+                owedToHolders + reserveClaim,
+                balance + vault.lockedAssets(),
+                "holders plus settled redeemers are owed more asset than exists"
+            );
+            // And NAV is the formula, not a paraphrase of it: the reserve comes off the whole book and
+            // only the final figure saturates (F-05). Stated here because a burn is the only action that
+            // can make `balance + locked < reserved`, and this is where the two formulas diverged. While
+            // a claim is stranded only the live shares' `strandedRemainingWad` of the locked collateral
+            // counts: the rest is owed to epochs that settled while it was stranded (F-02).
+            uint256 gross = balance + handler.navLocked();
+            assertEq(
+                vault.totalAssets(),
+                gross > reserved ? gross - reserved : 0,
+                "totalAssets != max(balance + locked x live share - reserved, 0)"
+            );
         }
-        // The reserve's REAL claim is `min(reservedAssets, balance)`: after an issuer burn takes the
-        // balance below it, every uncollected claimant is paid the same `balance / reserved` fraction
-        // ({Vault._payoutOwed}), so together they take exactly the balance and not a base unit
-        // more. With no burn in the run this is the plain `reservedAssets`.
-        uint256 balance = nvda.balanceOf(address(vault));
-        uint256 reserved = vault.reservedAssets();
-        uint256 reserveClaim = reserved < balance ? reserved : balance;
-        assertLe(
-            owedToHolders + reserveClaim,
-            balance + vault.lockedAssets(),
-            "holders plus settled redeemers are owed more asset than exists"
-        );
-        // And NAV is the formula, not a paraphrase of it: the reserve comes off the whole book and
-        // only the final figure saturates (F-05). Stated here because a burn is the only action that
-        // can make `balance + locked < reserved`, and this is where the two formulas diverged. While
-        // a claim is stranded only the live shares' `strandedRemainingWad` of the locked collateral
-        // counts: the rest is owed to epochs that settled while it was stranded (F-02).
-        uint256 gross = balance + handler.navLocked();
-        assertEq(
-            vault.totalAssets(),
-            gross > reserved ? gross - reserved : 0,
-            "totalAssets != max(balance + locked x live share - reserved, 0)"
-        );
     }
 
     /// @notice Deposits are shut, and quoted shut, for exactly as long as the reserve is unbacked.
@@ -2343,6 +2355,9 @@ contract VaultInvariantTest is BaseTest {
 
         // And the invariants still hold at the end of it.
         _assertAllInvariants();
+        // T-OP-046: shares exist at the end of the scripted pass, so {invariant_noFreeShares} must have checked
+        // the price rather than skipped; the pair is the campaign's vacuity floor for that invariant.
+        assertGt(noFreeSharesChecked, 0, "invariant_noFreeShares checked the share price at least once");
     }
 
     /// @dev The issuer toggles roll a hash of their seed ({VaultHandler._roll}), so a deterministic
@@ -2360,7 +2375,7 @@ contract VaultInvariantTest is BaseTest {
         }
     }
 
-    function _assertAllInvariants() internal view {
+    function _assertAllInvariants() internal {
         invariant_assetConservation();
         invariant_usdgBooksBalance();
         invariant_usdgHolderSolvency();

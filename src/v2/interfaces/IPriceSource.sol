@@ -7,7 +7,8 @@ pragma solidity ^0.8.28;
 /// @dev Every price is USDG base units (6 dp) per whole share. `latest` and `windowPrice` never revert: a source
 ///      that cannot answer returns ok = false, which is what lets the oracle's fallback chain move to the next
 ///      source instead of stalling a payout. Per-market configuration (feed, pool, staleness, jump bounds, which
-///      oracles may call {pin}) is DEFAULT_ADMIN_ROLE implementation surface and not frozen here.
+///      oracles may call {pin}) is CONFIG_ADMIN lane surface on each source (setFeed / setPool / setOracle, 24 h) and
+///      not frozen here.
 ///
 ///      PINNING (INTERFACE_VERSION 6). SettlementOracle.pin calls {pin} on every source of a market when the first
 ///      series of an expiry is created, and the creation reverts unless every source pins. From then on
@@ -47,7 +48,8 @@ interface IPriceSource {
 
     /// @notice Pins this source's configuration of `underlying` for `expiry`: `windowPrice(underlying, start, expiry)`
     ///         and `record(underlying, expiry)` use the pinned copy from then on, whatever the configuration becomes.
-    /// @dev Only an oracle the source's DEFAULT_ADMIN_ROLE registered (V2Errors.NotAuthorized); SettlementOracle.pin is
+    /// @dev Only an oracle the CONFIG_ADMIN lane registered on the source (setOracle, 24 h; V2Errors.NotAuthorized);
+    ///      SettlementOracle.pin is
     ///      the caller, when the first series of an expiry is created. FAILS CLOSED: V2Errors.NoSource when the source
     ///      has no configuration for `underlying` (a source listed for a market must be able to price it), and, for an
     ///      expiry already pinned, V2Errors.PinMismatch unless the pinned copy equals the current configuration (then

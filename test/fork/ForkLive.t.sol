@@ -20,8 +20,12 @@ import {
 } from "../../src/interfaces/ISeaport.sol";
 import {AdvancedOrder, CriteriaResolver, ISeaportFulfil} from "../helpers/RealSeaportBase.sol";
 
+import {ForkFloor} from "../v2/fork/ForkFloor.sol";
+
 /// @dev The three USDG (Paxos) admin entry points the strand tests drive on the live token: `freeze` and
 ///      `unfreeze` are `ASSET_PROTECTION_ROLE`, instant and untimelocked (integrations/usdg.md §3).
+///      C8-09b: this is the v1 vault fork, not the v8 matrix. Without `--fork-url` and `--fork-block-number`
+///      it is GREEN HAVING RUN NOTHING (`06-QUIRKS.md` §A.1). No RPC was granted for this task.
 interface IUsdgAssetProtection {
     function freeze(address addr) external;
     function unfreeze(address addr) external;
@@ -87,6 +91,7 @@ contract ForkLiveTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -276,6 +281,7 @@ contract ForkLiveTest is Test {
             assertEq(IERC20(NVDA).balanceOf(alice), 5e18, "dealt NVDA");
         } catch {
             console2.log("deal() could not locate the NVDA balance slot; skipping deposit path");
+            vm.skip(true);
             return;
         }
 
@@ -310,6 +316,7 @@ contract ForkLiveTest is Test {
         (bool ok, bytes memory data) = NVDA.staticcall(abi.encodeWithSelector(IStockToken.oraclePaused.selector));
         if (!ok || data.length != 32) {
             console2.log("oraclePaused() not present on this implementation");
+            vm.skip(true);
             return;
         }
         assertFalse(abi.decode(data, (bool)), "issuer oracle is live");
@@ -327,7 +334,12 @@ contract ForkLiveTest is Test {
     ///      Everything a mock can get wrong about someone else's contract shows up here.
     function test_fork_writeOnFillAgainstLiveSeaportAndClear() public onlyFork {
         (uint256 optionId, uint256 strike, uint40 exTs,) = _ourOptionType(13);
-        if (!_dealBoth()) return;
+        if (!_dealBoth()) {
+            // SKIP, DO NOT RETURN. A bare return here reports PASSED having asserted nothing -- the exact
+            // shape T-CT5-01 was opened for, one layer down. See the note on {_dealBoth}.
+            vm.skip(true);
+            return;
+        }
 
         vm.startPrank(alice);
         IERC20(NVDA).approve(address(vault), 4e18);
@@ -403,7 +415,12 @@ contract ForkLiveTest is Test {
         assertEq(uint8(vault.phase()), 0, "still Idle");
 
         // A claim id (a write against a live type) is not an option type.
-        if (!_dealBoth()) return;
+        if (!_dealBoth()) {
+            // SKIP, DO NOT RETURN. A bare return here reports PASSED having asserted nothing -- the exact
+            // shape T-CT5-01 was opened for, one layer down. See the note on {_dealBoth}.
+            vm.skip(true);
+            return;
+        }
         (uint256 optionId,,,) = _ourOptionType(19);
         vm.startPrank(alice);
         IERC20(NVDA).approve(CLEAR, 1e18);
@@ -445,7 +462,12 @@ contract ForkLiveTest is Test {
     ///      here, on a fork, before they happen for real.
     function test_fork_assignedWeekSettlesOnLiveClear() public onlyFork {
         (uint256 optionId, uint256 strike, uint40 exTs, uint40 expTs) = _ourOptionType(23);
-        if (!_dealBoth()) return;
+        if (!_dealBoth()) {
+            // SKIP, DO NOT RETURN. A bare return here reports PASSED having asserted nothing -- the exact
+            // shape T-CT5-01 was opened for, one layer down. See the note on {_dealBoth}.
+            vm.skip(true);
+            return;
+        }
         uint256 key = _sellTwoOfThree(optionId, exTs, true); // open + top-up
         uint256 premium = 2 * UNIT_PRICE;
 
@@ -494,7 +516,12 @@ contract ForkLiveTest is Test {
     ///      claim to redeem. It must return to Idle with nothing locked and nothing stranded.
     function test_fork_unfilledWeekClosesFlatOnLiveClear() public onlyFork {
         (uint256 optionId,, uint40 exTs, uint40 expTs) = _ourOptionType(31);
-        if (!_dealBoth()) return;
+        if (!_dealBoth()) {
+            // SKIP, DO NOT RETURN. A bare return here reports PASSED having asserted nothing -- the exact
+            // shape T-CT5-01 was opened for, one layer down. See the note on {_dealBoth}.
+            vm.skip(true);
+            return;
+        }
         _depositArmAndList(optionId, 4e18, 3, exTs);
         assertTrue(vault.listingHash() != bytes32(0), "listed");
 
@@ -536,7 +563,12 @@ contract ForkLiveTest is Test {
     ///      the recovery has to return NVDA and USDG in one redeem.
     function test_fork_usdgFreezeStrandsTheCloseAndRetryRecoversIt() public onlyFork {
         (uint256 optionId, uint256 strike, uint40 exTs, uint40 expTs) = _ourOptionType(29);
-        if (!_dealBoth()) return;
+        if (!_dealBoth()) {
+            // SKIP, DO NOT RETURN. A bare return here reports PASSED having asserted nothing -- the exact
+            // shape T-CT5-01 was opened for, one layer down. See the note on {_dealBoth}.
+            vm.skip(true);
+            return;
+        }
         uint256 key = _sellTwoOfThree(optionId, exTs, false); // one fill of two
         uint256 premium = 2 * UNIT_PRICE;
 
@@ -700,6 +732,13 @@ contract ForkLiveTest is Test {
 
     /// @dev Fund alice with NVDA and the buyer with USDG through `deal`; false if either slot cannot
     ///      be located on the live token (then the test reports and skips).
+    /// @dev RETURNS FALSE WHEN THE PRECONDITION IS UNAVAILABLE, AND EVERY CALLER MUST `vm.skip` ON THAT,
+    ///      never a bare `return`. A returning test body reports PASSED having asserted nothing, which is
+    ///      indistinguishable from a test that verified the behaviour. MEASURED at 3ae5824a: with this helper
+    ///      forced false, all 20 tests in this file still reported `20 passed; 0 failed; 0 skipped` and the
+    ///      only trace was the gas column collapsing -- 3,511,755 -> 176,551 on
+    ///      {test_fork_usdgFreezeStrandsTheCloseAndRetryRecoversIt}, and comparably on the other four. Nobody
+    ///      reads the gas column. That is the T-CT5-01 defect shape exactly, one layer below where it was found.
     function _dealBoth() internal returns (bool) {
         try this.dealToken(NVDA, alice, 4e18) {}
         catch {
@@ -773,5 +812,17 @@ contract ForkLiveTest is Test {
             conduitKey: bytes32(0),
             counter: seaport.getCounter(address(vault))
         });
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `CLEAR`, an address this suite's own tests read.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_forkLiveExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(CLEAR, "ForkLive");
     }
 }

@@ -13,10 +13,47 @@ jobs:
     name: contracts (build + unit + invariant)
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 is load-bearing for the audit-response step below, not a default.
+      # check-audit-response.sh resolves every `fixed` finding's fixCommit with
+      # `git cat-file -e <sha>^{commit}`. actions/checkout defaults to fetch-depth: 1, so on a
+      # shallow clone every fixCommit that is not HEAD reports `fixcommit-unresolvable` -- a red
+      # that says the register is broken when the truth is that CI cannot see the history.
+      # The register is empty today, so the git path never fires and a shallow clone would look
+      # fine; it would start lying the first time a real finding is marked fixed.
       - uses: actions/checkout@v4
-        with: {submodules: recursive}
+        with: {submodules: recursive, fetch-depth: 0}
+      # Runs before the toolchain: it needs bash and jq only, so a malformed register fails in
+      # seconds instead of after a ten-minute build.
+      - name: audit response register
+        run: bash script/v2/check-audit-response.sh
+      # Two more static containment checks, same reasoning: bash and grep only, so they fail in
+      # seconds and before the toolchain. Both are guards whose subject is a file nobody else reads
+      # back -- a check that exists but runs nowhere is the false green they were written to close.
+      # No `|| true` here, deliberately: an unread env name means a deploy step sees address(0), and
+      # an unfloored fork suite means the fork job below can go green having run nothing.
+      - name: env-name seam (DeployV2Batch.sh -> V2DeployBase.sol)
+        run: bash script/v2/check-env-names.sh
+      - name: fork suites state their execution floor
+        run: bash script/v2/check-fork-floors.sh
+      # T-OP-112: the deploy-input preflight, twice. The self-test derives its fixtures from the repo's
+      # own registry-v8.json (one asserted edit each: a null input, a missing write-back key, a
+      # recorded set on a fresh run) and proves the check refuses each and accepts the clean pair.
+      # The second run is the fixture pair AS COMMITTED, with the rehearsal's own flags: it is RED
+      # until the fixture carries every input the wrapper reads (shared.token.poolKey is null there
+      # today, and the market rows lack registeredAt/registerTx), which is the point -- a rehearsal
+      # against that fixture stops at DeployV2Batch.sh:354 after a full build, and this says so in
+      # seconds. No cast on this runner yet, so --no-checksum here; the drivers check EIP-55.
+      - name: deploy inputs (check-deploy-inputs.sh --self-test)
+        run: bash script/v2/check-deploy-inputs.sh --self-test
+      - name: deploy inputs (the committed fixture pair, rehearsal flags)
+        run: bash script/v2/check-deploy-inputs.sh --registry script/v2/fixtures/registry-v8.json --sources script/v2/fixtures/v2-sources.json --mode rehearse --recorded none --no-checksum
+      # PINNED, NOT `stable` (T-OP-043). `stable` is a moving release channel: on 2026-09-21 it resolved
+      # to forge 1.5.1 (tag v1.5.1, commit b0a9dd9c) while the newest release was v1.8.3, and T-592
+      # measured that 1.5.1 and 1.6.0 format eight files differently with NO layout green under both.
+      # The tree is formatted for 1.5.1. Moving this pin re-formats the tree; do it in its own row,
+      # in BOTH jobs at once, and tell the lanes (HANDOFF.md "Gates").
       - uses: foundry-rs/foundry-toolchain@v1
-        with: {version: stable}
+        with: {version: v1.5.1}
       - name: forge fmt --check
         run: forge fmt --check
       - name: forge build --sizes
@@ -35,8 +72,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: {submodules: recursive}
+      # PINNED, NOT `stable` (T-OP-043). `stable` is a moving release channel: on 2026-09-21 it resolved
+      # to forge 1.5.1 (tag v1.5.1, commit b0a9dd9c) while the newest release was v1.8.3, and T-592
+      # measured that 1.5.1 and 1.6.0 format eight files differently with NO layout green under both.
+      # The tree is formatted for 1.5.1. Moving this pin re-formats the tree; do it in its own row,
+      # in BOTH jobs at once, and tell the lanes (HANDOFF.md "Gates").
       - uses: foundry-rs/foundry-toolchain@v1
-        with: {version: stable}
+        with: {version: v1.5.1}
       - name: fork tests
         env:
           RH_RPC: ${{ secrets.RH_RPC || 'https://rpc.mainnet.chain.robinhood.com' }}

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Managed} from "../access/Managed.sol";
 import {IPriceSource} from "../interfaces/IPriceSource.sol";
 import {V2Constants} from "../interfaces/V2Constants.sol";
 import {V2Errors} from "../interfaces/V2Errors.sol";
@@ -63,8 +63,8 @@ import {FullMath} from "./lib/FullMath.sol";
 ///      NEVER REVERTS FROM {latest} OR {windowPrice}. The pool is read with a raw `staticcall` and its reply decoded by
 ///      hand ({_parseObserve}), because `abi.decode` of a malformed reply reverts in the caller where try/catch cannot
 ///      catch it. {record} returns false instead of storing when the window cannot be priced.
-contract UniV3TwapSource is IPriceSource, AccessControl, ReentrancyGuardTransient {
-    /// @notice Per-underlying pool configuration (DEFAULT_ADMIN_ROLE).
+contract UniV3TwapSource is IPriceSource, Managed, ReentrancyGuardTransient {
+    /// @notice Per-underlying pool configuration (CONFIG_ADMIN in the v8 AccessManager, 24 h execution delay).
     struct PoolConfig {
         /// @dev Uniswap v3 pool of USDG and the underlying. Zero: unconfigured.
         address pool;
@@ -127,7 +127,7 @@ contract UniV3TwapSource is IPriceSource, AccessControl, ReentrancyGuardTransien
     event PoolSet(
         address indexed underlying, address indexed pool, bool usdgIsToken0, uint128 minLiquidity, uint32 window
     );
-    /// @notice DEFAULT_ADMIN_ROLE allowed or disallowed `oracle` to call {pin}.
+    /// @notice CONFIG_ADMIN allowed or disallowed `oracle` to call {pin}.
     event OracleSet(address indexed oracle, bool allowed);
     /// @notice {pin} fixed the pool {record} reads for `expiry`: `pool` and its harmonic-mean liquidity floor
     ///         `minLiquidity`, pool L units.
@@ -138,14 +138,11 @@ contract UniV3TwapSource is IPriceSource, AccessControl, ReentrancyGuardTransien
         address indexed underlying, uint40 indexed expiry, uint256 price, int24 meanTick, uint256 harmonicMeanLiquidity
     );
 
-    /// @param admin DEFAULT_ADMIN_ROLE holder (sets pools).
+    /// @param authority The `AccessManager` mapping this contract's selectors to roles (V8Roles).
     /// @param usdg_ USDG token address.
-    constructor(address admin, address usdg_) {
-        // A zero admin would leave the source permanently unconfigurable.
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
+    constructor(address authority, address usdg_) Managed(authority) {
         if (usdg_ == address(0)) revert V2Errors.UnsupportedAsset();
         usdg = usdg_;
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -153,21 +150,28 @@ contract UniV3TwapSource is IPriceSource, AccessControl, ReentrancyGuardTransien
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Sets or removes the pool of `underlying`.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). `pool == address(0)` removes the configuration (the other
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). `pool == address(0)` removes the configuration (the other
     ///      arguments are ignored); snapshots already recorded stay. Reverts V2Errors.UnsupportedAsset when the
     ///      underlying is zero or USDG, when the pool's {token0, token1} is not {USDG, underlying} in either order,
     ///      when the pool's `slot0().observationCardinality` is below V2Constants.MIN_POOL_OBSERVATION_CARDINALITY (2,401: a
     ///      shallower ring can be flooded past a snapshot's window inside the grace, see the contract NatSpec), or
     ///      when the underlying has more than MAX_ASSET_DECIMALS decimals; V2Errors.CeilingExceeded when `window` is
-    ///      outside [MIN_WINDOW, MAX_WINDOW]. `minLiquidity` may be 0 (no floor); the registry's `univ3MinLiquidity`
-    ///      is the intended value. Applies to {latest} and to every expiry not pinned; pinned expiries keep their
+    ///      outside [MIN_WINDOW, MAX_WINDOW] or when `minLiquidity` is 0. THE FLOOR IS THE GUARD (SEC-09): a zero
+    ///      floor turns off the harmonic-mean liquidity check in {_observeWindow}, so a manipulator's thin window
+    ///      would price a settlement; RegisterMarkets.s.sol refuses 0 in the script, and this refusal is the same
+    ///      rule inside the contract, so a later CONFIG_ADMIN call cannot disarm it either. No default is
+    ///      substituted -- the operator's value is refused, not repaired. The registry's `univ3MinLiquidity` is the
+    ///      intended value. Applies to {latest} and to every expiry not pinned; pinned expiries keep their
     ///      {pinnedPools} entry.
     /// @param underlying 18-dp Stock Token.
     /// @param pool Uniswap v3 pool of USDG and `underlying`, or zero to remove.
     /// @param minLiquidity Harmonic-mean liquidity floor, pool L units.
     /// @param window {latest} TWAP length, seconds; DEFAULT_WINDOW unless the market needs otherwise.
-    function setPool(address underlying, address pool, uint128 minLiquidity, uint32 window) external nonReentrant {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    function setPool(address underlying, address pool, uint128 minLiquidity, uint32 window)
+        external
+        nonReentrant
+        restricted
+    {
         if (underlying == address(0) || underlying == usdg) revert V2Errors.UnsupportedAsset();
         if (pool == address(0)) {
             delete pools[underlying];
@@ -175,6 +179,7 @@ contract UniV3TwapSource is IPriceSource, AccessControl, ReentrancyGuardTransien
             return;
         }
         if (window < MIN_WINDOW || window > MAX_WINDOW) revert V2Errors.CeilingExceeded();
+        if (minLiquidity == 0) revert V2Errors.CeilingExceeded();
         address t0 = IUniswapV3PoolOracle(pool).token0();
         address t1 = IUniswapV3PoolOracle(pool).token1();
         bool usdgIsToken0;
@@ -191,12 +196,11 @@ contract UniV3TwapSource is IPriceSource, AccessControl, ReentrancyGuardTransien
     }
 
     /// @notice Allows or disallows `oracle` to call {pin}.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). An allow-list for the reason ChainlinkFeedSource.setOracle
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). An allow-list for the reason ChainlinkFeedSource.setOracle
     ///      gives: two SettlementOracles may share this source while a market migrates.
     /// @param oracle SettlementOracle.
     /// @param allowed True to allow.
-    function setOracle(address oracle, bool allowed) external nonReentrant {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    function setOracle(address oracle, bool allowed) external nonReentrant restricted {
         isOracle[oracle] = allowed;
         emit OracleSet(oracle, allowed);
     }

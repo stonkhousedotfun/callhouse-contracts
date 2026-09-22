@@ -13,9 +13,11 @@ import {IAutoRoller} from "../../../src/v2/interfaces/IAutoRoller.sol";
 import {IClearinghouse} from "../../../src/v2/interfaces/IClearinghouse.sol";
 import {IOrderBook} from "../../../src/v2/interfaces/IOrderBook.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MockOraclePriceSource} from "../../../src/v2/mocks/MockOraclePriceSource.sol";
 import {MockRoundFeed} from "../../../src/v2/mocks/MockRoundFeed.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {ChainlinkFeedSource} from "../../../src/v2/oracle/ChainlinkFeedSource.sol";
 import {SettlementOracle} from "../../../src/v2/oracle/SettlementOracle.sol";
 
@@ -28,7 +30,7 @@ import {SettlementOracle} from "../../../src/v2/oracle/SettlementOracle.sol";
 ///        - Clearinghouse with NVDA registered (strikeTick 1.00 USDG, exercise fee 25 bps); TSLA is NOT registered;
 ///        - OrderBook at the registry's default fees;
 ///        - KeeperRewards registered for the Clearinghouse and the roller, paying SETTLE, REDEEM and ROLL bounties;
-///        - AutoRoller with `pricer` holding PRICER_ROLE and KeeperRewards set.
+///        - AutoRoller with `pricer` holding PRICER on the shared AccessManager, and KeeperRewards set.
 ///      `alice` is the writer: 10 NVDA in the ledger (1,000 units), payouts to the ledger, and the three approvals
 ///      (roller operator, book operator, roller as book delegate). `bob` and `carol` are buyers with a USDG allowance
 ///      for the book. Lifecycle calls are made by `keeper`, so bounties show up as its whole balance.
@@ -102,14 +104,20 @@ abstract contract AutoRollerTestBase is BaseV2Test {
     }
 
     function _deployCore() internal virtual override {
-        calendar = new ExpiryCalendar(admin, new uint32[](0));
-        cl = new ChainlinkFeedSource(admin);
+        calendar = _newCalendar(new uint32[](0), admin);
+        _deployManager();
+        cl = new ChainlinkFeedSource(address(manager));
+        _wire(address(cl), "ChainlinkFeedSource", admin, 0);
         second = new MockOraclePriceSource();
-        oracle = new SettlementOracle(admin, guardian);
-        ch = new Clearinghouse(admin, address(usdg), address(calendar), treasury, "");
-        rewards = new KeeperRewards(IERC20(address(usdg)), admin);
-        book = new OrderBook(IClearinghouse(address(ch)), admin, guardian, treasury, _fees());
-        roller = new AutoRoller(IOrderBook(address(book)), admin);
+        oracle = new SettlementOracle(address(manager));
+        _wire(address(oracle), "SettlementOracle", admin, 0);
+        _grant(V8Roles.GUARDIAN, guardian, 0);
+        ch = _newClearinghouse(address(usdg), address(calendar), treasury, "", admin);
+        rewards = new KeeperRewards(IERC20(address(usdg)), address(manager), treasury);
+        _wire(address(rewards), "KeeperRewards", admin, 0);
+        book = new OrderBook(IClearinghouse(address(ch)), address(manager), treasury, _fees());
+        _wire(address(book), "OrderBook", admin, 0);
+        roller = _newRoller(IOrderBook(address(book)), admin, pricer);
         vm.label(address(ch), "Clearinghouse");
         vm.label(address(book), "OrderBook");
         vm.label(address(roller), "AutoRoller");
@@ -123,18 +131,13 @@ abstract contract AutoRollerTestBase is BaseV2Test {
         cl.setOracle(address(oracle), true);
         oracle.setMarket(address(nvda), sources, 0, UNCORROBORATED_DELAY, 0);
         oracle.setClearinghouse(address(ch));
-        ch.grantRole(V2Constants.GUARDIAN_ROLE, guardian);
-        ch.registerMarket(
-            address(nvda),
-            V2Types.MarketConfig({
-                enabled: true,
-                mintPaused: false,
-                strikeTick: STRIKE_TICK,
-                exerciseFeeBps: 25,
-                oracle: address(oracle),
-                mintFeePpm: 0
-            })
-        );
+        ch.setMinter(address(this), true);
+        ch.setMinter(address(book), true);
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(25, 0);
+        ch.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch.setMarketOracle(address(nvda), address(oracle));
+        ch.setMarketFees(address(nvda), 25, 0);
         ch.setKeeperRewards(address(rewards));
         rewards.setCaller(address(ch), true);
         rewards.setCaller(address(roller), true);
@@ -144,7 +147,6 @@ abstract contract AutoRollerTestBase is BaseV2Test {
         rewards.setBounty(V2Constants.ACTION_CANCEL_STALE, CANCEL_STALE_BOUNTY);
         rewards.setDailyCap(100e6);
         roller.setKeeperRewards(address(rewards));
-        roller.grantRole(V2Constants.PRICER_ROLE, pricer);
         vm.stopPrank();
         usdg.mint(address(rewards), REWARDS_BUDGET);
 
@@ -319,7 +321,9 @@ abstract contract AutoRollerTestBase is BaseV2Test {
                 limitPrice: type(uint128).max,
                 writeToSell: false,
                 recipient: buyer,
-                deadline: NO_DEADLINE
+                deadline: NO_DEADLINE,
+                // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+                maxTotalFee: type(uint128).max
             })
         );
     }

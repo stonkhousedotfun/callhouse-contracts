@@ -9,6 +9,7 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {OrderBookBaseTest, BookActor} from "./OrderBookBase.t.sol";
 import {MockERC20} from "../../../src/mocks/MockERC20.sol";
 import {OrderBook} from "../../../src/v2/OrderBook.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {IClearinghouse} from "../../../src/v2/interfaces/IClearinghouse.sol";
 import {IMakerRegistry} from "../../../src/v2/interfaces/IMakerRegistry.sol";
 import {IOrderBook} from "../../../src/v2/interfaces/IOrderBook.sol";
@@ -38,15 +39,21 @@ contract OrderBookOrdersTest is OrderBookBaseTest {
         assertEq(f.takerFeeFlat, TAKER_FEE_FLAT, "taker flat");
         assertEq(f.takerFeeCapBps, TAKER_FEE_CAP_BPS, "taker cap");
         assertEq(f.makerRebateBps, MAKER_REBATE_BPS, "rebate");
-        assertTrue(book.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin), "admin");
-        assertTrue(book.hasRole(V2Constants.GUARDIAN_ROLE, guardian), "guardian");
-        assertFalse(book.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, guardian), "guardian is not admin");
+        assertEq(book.authority(), address(manager), "the AccessManager is the authority");
+        (bool isFeeManager,) = manager.hasRole(V8Roles.FEE_MANAGER, admin);
+        assertTrue(isFeeManager, "admin is FEE_MANAGER for the book");
+        (bool isTreasuryAdmin,) = manager.hasRole(V8Roles.TREASURY_ADMIN, admin);
+        assertTrue(isTreasuryAdmin, "admin is TREASURY_ADMIN for the book");
+        (bool isGuardian,) = manager.hasRole(V8Roles.GUARDIAN, guardian);
+        assertTrue(isGuardian, "guardian is GUARDIAN for the book");
+        (bool strangerAnything,) = manager.hasRole(V8Roles.FEE_MANAGER, stranger);
+        assertFalse(strangerAnything, "stranger holds nothing");
         assertFalse(ch.thirdPartyRedeemAllowed(address(book)), "book opted out of third-party redeem");
         assertFalse(book.tradingPaused(), "not paused");
         assertEq(book.lastOrderId(), 0, "no orders");
         assertEq(address(book.makerRegistry()), address(0), "no registry");
         assertTrue(book.supportsInterface(type(IERC1155Receiver).interfaceId), "IERC1155Receiver");
-        assertTrue(book.supportsInterface(type(IAccessControl).interfaceId), "IAccessControl");
+        assertFalse(book.supportsInterface(type(IAccessControl).interfaceId), "v8: roles live on the manager");
         assertTrue(book.supportsInterface(type(IERC165).interfaceId), "IERC165");
         assertFalse(book.supportsInterface(0xffffffff), "not everything");
     }
@@ -55,28 +62,36 @@ contract OrderBookOrdersTest is OrderBookBaseTest {
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectEmit(address(ch));
         emit IClearinghouse.ThirdPartyRedeemSet(predicted, false);
-        OrderBook fresh = new OrderBook(IClearinghouse(address(ch)), admin, address(0), treasury, _defaultFees());
+        OrderBook fresh = new OrderBook(IClearinghouse(address(ch)), address(manager), treasury, _defaultFees());
         assertEq(address(fresh), predicted, "predicted address");
-        assertFalse(fresh.hasRole(V2Constants.GUARDIAN_ROLE, address(0)), "zero guardian grants nothing");
+        assertEq(fresh.authority(), address(manager), "the fresh book points at the same manager");
     }
 
-    function test_constructor_rejectsZeroAdminAndBadRecipient() public {
+    function test_constructor_rejectsCodelessAuthorityAndBadRecipient() public {
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new OrderBook(IClearinghouse(address(ch)), address(0), treasury, _defaultFees());
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new OrderBook(IClearinghouse(address(ch)), makeAddr("eoa"), treasury, _defaultFees());
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        new OrderBook(IClearinghouse(address(ch)), address(0), guardian, treasury, _defaultFees());
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
-        new OrderBook(IClearinghouse(address(ch)), admin, guardian, address(0), _defaultFees());
+        new OrderBook(IClearinghouse(address(ch)), address(manager), address(0), _defaultFees());
     }
 
     function test_constructor_rejectsCodelessUsdg() public {
-        MockClearinghouse odd = new MockClearinghouse(admin, makeAddr("noCode"), address(calendar), chFees, "");
+        // T-488: the AUTHORITY must be a contract. `admin` is a code-less EOA (BaseV2Test), and MockClearinghouse
+        // forwards its first argument to Managed(authority_), which reverts NoSource() on a code-less authority
+        // (src/v2/access/Managed.sol). Passing `admin` here reverted on THIS line, before the expectRevert below was
+        // armed, so the UnsupportedAsset guard in OrderBook's constructor was proven by nothing. The code-less address
+        // this test actually needs is the usdg argument, and that is what makeAddr("noCode") is.
+        MockClearinghouse odd =
+            new MockClearinghouse(address(manager), makeAddr("noCode"), address(calendar), chFees, "");
         vm.expectRevert(V2Errors.UnsupportedAsset.selector);
-        new OrderBook(IClearinghouse(address(odd)), admin, guardian, treasury, _defaultFees());
+        new OrderBook(IClearinghouse(address(odd)), address(manager), treasury, _defaultFees());
     }
 
     function test_constructor_rejectsFeesAboveCeilings() public {
         for (uint256 field; field < 5; ++field) {
             vm.expectRevert(V2Errors.CeilingExceeded.selector);
-            new OrderBook(IClearinghouse(address(ch)), admin, guardian, treasury, _feesAbove(field));
+            new OrderBook(IClearinghouse(address(ch)), address(manager), treasury, _feesAbove(field));
         }
     }
 
@@ -146,11 +161,13 @@ contract OrderBookOrdersTest is OrderBookBaseTest {
         assertEq(address(book.makerRegistry()), address(0), "cleared");
     }
 
-    function test_setTradingPaused_guardianOrAdminOnly() public {
+    function test_setTradingPaused_guardianOnly() public {
         vm.prank(stranger);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         book.setTradingPaused(true);
 
+        // INTERFACE_VERSION 8: the pause is GUARDIAN's alone (v7 also accepted the admin). The fixture's admin holds
+        // GUARDIAN as a member, so its call below passes as a guardian call, not an admin one.
         vm.expectEmit(address(book));
         emit IOrderBook.TradingPausedSet(true);
         vm.prank(guardian);
@@ -159,7 +176,7 @@ contract OrderBookOrdersTest is OrderBookBaseTest {
 
         vm.prank(admin);
         book.setTradingPaused(false);
-        assertFalse(book.tradingPaused(), "admin resumed");
+        assertFalse(book.tradingPaused(), "a guardian member resumed");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -852,7 +869,7 @@ contract OrderBookOrdersTest is OrderBookBaseTest {
         ch.safeTransferFrom(alice, address(book), callId, 1, "");
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         ch.safeBatchTransferFrom(alice, address(book), _ids(callId), _ids(1), "");
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vm.expectRevert(V2Errors.NotMinter.selector);
         ch.mint(callId, 1, alice, address(book));
         vm.stopPrank();
 

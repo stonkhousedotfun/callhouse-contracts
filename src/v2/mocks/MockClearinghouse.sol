@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {ERC1155Supply} from "@openzeppelin/contracts/token/ERC1155/extensions/ERC1155Supply.sol";
@@ -19,6 +18,7 @@ import {V2Errors} from "../interfaces/V2Errors.sol";
 import {V2Ids} from "../interfaces/V2Ids.sol";
 import {V2Types} from "../interfaces/V2Types.sol";
 import {OptionMath} from "../lib/OptionMath.sol";
+import {Managed} from "../access/Managed.sol";
 
 /// @title MockClearinghouse
 /// @notice A behaviour-faithful IClearinghouse for the OrderBook suites (C2-06), written before the real Clearinghouse
@@ -44,7 +44,7 @@ import {OptionMath} from "../lib/OptionMath.sol";
 ///      Simplified, because the book never depends on it: no PayoutAdapter conversion (ITM call longs are paid in kind),
 ///      no keeper bounties, no metadata URI setter, and the payout-to-ledger preference is honoured but payout-in-kind
 ///      is only stored.
-contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, ReentrancyGuardTransient {
+contract MockClearinghouse is IClearinghouse, ERC1155Supply, Managed, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -81,19 +81,23 @@ contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reen
     mapping(uint256 longId => V2Types.Series) private _series;
     mapping(address account => Prefs) private _prefs;
 
-    /// @param admin Receives DEFAULT_ADMIN_ROLE (it grants GUARDIAN_ROLE with grantRole).
-    /// @param usdg_ USDG, 6 dp.
-    /// @param calendar_ IExpiryCalendar checked by {createSeries}.
-    /// @param feeRecipient_ Receiver of swept exercise fees.
-    /// @param baseUri_ ERC-1155 metadata URI.
-    constructor(address admin, address usdg_, address calendar_, address feeRecipient_, string memory baseUri_)
+    /// @inheritdoc IClearinghouse
+    /// @dev INTERFACE_VERSION 8, mirroring the real Clearinghouse. `OrderBookRealClearinghouse.t.sol` re-runs the
+    ///      book suites against both, so the mock must carry the same v8 surface with the same behaviour.
+    mapping(address minter => bool) public isMinter;
+    /// @inheritdoc IClearinghouse
+    address public defaultOracle;
+    uint16 private _defaultExerciseFeeBps;
+    uint32 private _defaultMintFeePpm;
+
+    constructor(address authority_, address usdg_, address calendar_, address feeRecipient_, string memory baseUri_)
         ERC1155(baseUri_)
+        Managed(authority_)
     {
-        if (admin == address(0) || feeRecipient_ == address(0)) revert V2Errors.NotAuthorized();
+        if (feeRecipient_ == address(0)) revert V2Errors.NotAuthorized();
         usdg = usdg_;
         calendar = calendar_;
         feeRecipient = feeRecipient_;
-        _grantRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -101,11 +105,7 @@ contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reen
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Registers a market. DEFAULT_ADMIN_ROLE. UnsupportedAsset when already registered or not 18 dp.
-    function registerMarket(address underlying, V2Types.MarketConfig calldata cfg)
-        external
-        nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
-    {
+    function registerMarket(address underlying, V2Types.MarketConfig calldata cfg) external nonReentrant restricted {
         if (_markets[underlying].strikeTick != 0) revert V2Errors.UnsupportedAsset();
         if (IERC20Metadata(underlying).decimals() != 18) revert V2Errors.UnsupportedAsset();
         _checkConfig(cfg);
@@ -113,25 +113,120 @@ contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reen
         emit MarketRegistered(underlying, cfg);
     }
 
-    /// @notice Replaces a registered market's configuration except its guardian-owned mintPaused. DEFAULT_ADMIN_ROLE.
-    function setMarketConfig(address underlying, V2Types.MarketConfig calldata cfg)
-        external
-        nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
-    {
-        V2Types.MarketConfig storage m = _markets[underlying];
-        if (m.strikeTick == 0) revert V2Errors.UnsupportedAsset();
-        _checkConfig(cfg);
-        m.enabled = cfg.enabled;
-        m.strikeTick = cfg.strikeTick;
-        m.exerciseFeeBps = cfg.exerciseFeeBps;
-        m.oracle = cfg.oracle;
-        m.mintFeePpm = cfg.mintFeePpm;
+    /*//////////////////////////////////////////////////////////////
+          MARKETS, INTERFACE_VERSION 8 -- mirrors the real contract
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IClearinghouse
+    function registerMarket(address underlying, uint64 strikeTick, bool enabled) external nonReentrant restricted {
+        if (_markets[underlying].strikeTick != 0) revert V2Errors.UnsupportedAsset();
+        if (IERC20Metadata(underlying).decimals() != 18) revert V2Errors.UnsupportedAsset();
+        V2Types.MarketConfig memory cfg = V2Types.MarketConfig({
+            enabled: enabled,
+            mintPaused: false,
+            strikeTick: strikeTick,
+            exerciseFeeBps: _defaultExerciseFeeBps,
+            oracle: defaultOracle,
+            mintFeePpm: _defaultMintFeePpm
+        });
+        if (cfg.strikeTick == 0 || cfg.strikeTick % V2Constants.PRICE_TICK != 0) revert V2Errors.BadStrike();
+        _checkFees(cfg.exerciseFeeBps, cfg.mintFeePpm);
+        if (cfg.oracle.code.length == 0) revert V2Errors.NoSource();
+        _markets[underlying] = cfg;
+        emit MarketRegistered(underlying, cfg);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setMarketListing(address underlying, bool enabled, uint64 strikeTick) external nonReentrant restricted {
+        V2Types.MarketConfig storage m = _registered(underlying);
+        if (strikeTick == 0 || strikeTick % V2Constants.PRICE_TICK != 0) revert V2Errors.BadStrike();
+        m.enabled = enabled;
+        m.strikeTick = strikeTick;
         emit MarketConfigSet(underlying, m);
     }
 
+    /// @inheritdoc IClearinghouse
+    function setMarketFees(address underlying, uint16 exerciseFeeBps, uint32 mintFeePpm)
+        external
+        nonReentrant
+        // v8-stub: C8-02 -> restricted (MARKET_FEE_MANAGER)
+        restricted
+    {
+        V2Types.MarketConfig storage m = _registered(underlying);
+        _checkFees(exerciseFeeBps, mintFeePpm);
+        m.exerciseFeeBps = exerciseFeeBps;
+        m.mintFeePpm = mintFeePpm;
+        emit MarketConfigSet(underlying, m);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setMarketOracle(address underlying, address oracle)
+        external
+        nonReentrant
+        // v8-stub: C8-02 -> restricted (CONFIG_ADMIN)
+        restricted
+    {
+        V2Types.MarketConfig storage m = _registered(underlying);
+        if (oracle.code.length == 0) revert V2Errors.NoSource();
+        m.oracle = oracle;
+        emit MarketConfigSet(underlying, m);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setDefaultMarketFees(uint16 exerciseFeeBps, uint32 mintFeePpm)
+        external
+        nonReentrant
+        // v8-stub: C8-02 -> restricted (MARKET_FEE_MANAGER)
+        restricted
+    {
+        _checkFees(exerciseFeeBps, mintFeePpm);
+        _defaultExerciseFeeBps = exerciseFeeBps;
+        _defaultMintFeePpm = mintFeePpm;
+        emit DefaultMarketFeesSet(exerciseFeeBps, mintFeePpm);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setDefaultOracle(address oracle)
+        external
+        nonReentrant
+        // v8-stub: C8-02 -> restricted (CONFIG_ADMIN)
+        restricted
+    {
+        if (oracle.code.length == 0) revert V2Errors.NoSource();
+        defaultOracle = oracle;
+        emit DefaultOracleSet(oracle);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function setMinter(address minter, bool allowed)
+        external
+        nonReentrant
+        // v8-stub: C8-02 -> restricted (CONFIG_ADMIN)
+        restricted
+    {
+        isMinter[minter] = allowed;
+        emit MinterSet(minter, allowed);
+    }
+
+    /// @inheritdoc IClearinghouse
+    function defaultMarketFees() external view returns (uint16 exerciseFeeBps, uint32 mintFeePpm) {
+        return (_defaultExerciseFeeBps, _defaultMintFeePpm);
+    }
+
+    /// @dev The market row of a registered underlying (UnsupportedAsset otherwise).
+    function _registered(address underlying) private view returns (V2Types.MarketConfig storage m) {
+        m = _markets[underlying];
+        if (m.strikeTick == 0) revert V2Errors.UnsupportedAsset();
+    }
+
+    /// @dev The fee half of {_checkConfig}.
+    function _checkFees(uint16 exerciseFeeBps, uint32 mintFeePpm) private pure {
+        if (exerciseFeeBps > V2Constants.EXERCISE_FEE_CEIL_BPS) revert V2Errors.CeilingExceeded();
+        if (mintFeePpm > V2Constants.MINT_FEE_CEIL_PPM) revert V2Errors.CeilingExceeded();
+    }
+
     /// @notice Pauses or resumes {mint} for one market. GUARDIAN_ROLE.
-    function setMintPaused(address underlying, bool paused) external nonReentrant onlyRole(V2Constants.GUARDIAN_ROLE) {
+    function setMintPaused(address underlying, bool paused) external nonReentrant restricted {
         V2Types.MarketConfig storage m = _markets[underlying];
         if (m.strikeTick == 0) revert V2Errors.UnsupportedAsset();
         m.mintPaused = paused;
@@ -139,13 +234,13 @@ contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reen
     }
 
     /// @notice Pauses or resumes {createSeries} for new ids. GUARDIAN_ROLE.
-    function setCreatePaused(bool paused) external nonReentrant onlyRole(V2Constants.GUARDIAN_ROLE) {
+    function setCreatePaused(bool paused) external nonReentrant restricted {
         createPaused = paused;
         emit CreatePausedSet(paused);
     }
 
     /// @notice Sets the fee recipient. DEFAULT_ADMIN_ROLE.
-    function setFeeRecipient(address recipient) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setFeeRecipient(address recipient) external nonReentrant restricted {
         if (recipient == address(0)) revert V2Errors.NotAuthorized();
         feeRecipient = recipient;
         emit FeeRecipientSet(recipient);
@@ -246,6 +341,7 @@ contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reen
 
     /// @inheritdoc IClearinghouse
     function mint(uint256 longId, uint64 units, address writer, address longTo) external nonReentrant {
+        if (!isMinter[msg.sender]) revert V2Errors.NotMinter();
         if (msg.sender != writer && !isOperator[writer][msg.sender]) revert V2Errors.NotAuthorized();
         V2Types.Series storage s = _series[longId];
         address underlying = s.underlying;
@@ -485,22 +581,13 @@ contract MockClearinghouse is IClearinghouse, ERC1155Supply, AccessControl, Reen
     }
 
     /// @inheritdoc IERC165
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(ERC1155, AccessControl, IERC165)
-        returns (bool)
-    {
+    function supportsInterface(bytes4 interfaceId) public view override(ERC1155, IERC165) returns (bool) {
         return interfaceId == type(IClearinghouse).interfaceId || super.supportsInterface(interfaceId);
     }
 
     /*//////////////////////////////////////////////////////////////
                                INTERNALS
     //////////////////////////////////////////////////////////////*/
-
-    function _checkRole(bytes32 role, address account) internal view override {
-        if (!hasRole(role, account)) revert V2Errors.NotAuthorized();
-    }
 
     /// @dev Burns the holder's whole balance and pays it in kind (to the ledger when preferred or when the transfer
     ///      fails). A zero balance returns (0, isPut) with no log, as in the real contract.

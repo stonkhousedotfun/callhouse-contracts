@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+/// @dev Fixture: the INHERITED case. Gamma declares no restricted selector of its own; it gets one
+///      from its base. A per-file or declaration-only check would miss this.
+abstract contract GammaBase {
+    function baseAdmin(address a) external restricted {}
+}
+
+contract Gamma is GammaBase {
+    function harmless() external {}
+}

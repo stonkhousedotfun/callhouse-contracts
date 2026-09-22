@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test, console2} from "forge-std/Test.sol";
+import {console2} from "forge-std/Test.sol";
+import {V8AccessTest} from "../lib/V8Access.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Clearinghouse} from "../../../src/v2/Clearinghouse.sol";
 import {ExpiryCalendar} from "../../../src/v2/ExpiryCalendar.sol";
@@ -9,14 +10,19 @@ import {KeeperRewards} from "../../../src/v2/KeeperRewards.sol";
 import {OrderBook} from "../../../src/v2/OrderBook.sol";
 import {IClearinghouse} from "../../../src/v2/interfaces/IClearinghouse.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Ids} from "../../../src/v2/interfaces/V2Ids.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {OptionMath} from "../../../src/v2/lib/OptionMath.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {ChainlinkFeedSource} from "../../../src/v2/oracle/ChainlinkFeedSource.sol";
 import {IUniswapV3PoolOracle} from "../../../src/v2/oracle/OracleDeps.sol";
+import {ISettlementOracle} from "../../../src/v2/interfaces/ISettlementOracle.sol";
 import {SettlementOracle} from "../../../src/v2/oracle/SettlementOracle.sol";
 import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
+
+import {ForkFloor} from "./ForkFloor.sol";
 
 /// @notice The v2 core deployed on a fork of chain 4663 over the REAL NVDA Stock Token, USDG, Chainlink NVDA feed and
 ///         NVDA/USDG Uniswap v3 pool. The first test writes a call series through the order book, has it bought and
@@ -24,8 +30,9 @@ import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
 ///         the same window, prunes the book's leftovers, redeems every holder in real NVDA, sweeps the fees, and checks
 ///         value is conserved in both tokens to the base unit. The second settles the most recent weekly close on the
 ///         feed alone, through the uncorroborated candidate and its 6 h veto window.
-/// @dev Run with:  FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC --match-path "test/v2/fork/V2Fork.t.sol" -vv
-///      Without a fork (chain id != 4663) every test logs and returns, as test/fork/ForkLive.t.sol does.
+/// @dev Run with:  FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC --fork-block-number <recorded> -j 1 --match-path "test/v2/fork/V2Fork.t.sol" -vv
+///      Without `--fork-url` (chain id != 4663) every test logs and returns, as test/fork/ForkLive.t.sol does —
+///      that is GREEN HAVING RUN NOTHING (`06-QUIRKS.md` §A.1). Record the block number; do not report a skip as a pass.
 ///
 ///      WHICH EXPIRY. The public RPC forks at its latest block and keeps no historical state, and warping backwards
 ///      past the pool's newest observation breaks v3's observation arithmetic (test/v2/fork/SourcesFork.t.sol), so the
@@ -45,11 +52,21 @@ import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
 ///      code path (`observeWindow` over [expiry - 1800, expiry] is `record` without the storage write, C2-03), and
 ///      checks it through the public getter. Everything after that, capture, corroboration, settlement and payouts,
 ///      runs unmodified on the production wiring: sources [ChainlinkFeedSource, UniV3TwapSource].
-contract V2ForkTest is Test {
+contract V2ForkTest is V8AccessTest {
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address internal constant NVDA = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
     address internal constant NVDA_FEED = 0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15;
     address internal constant NVDA_POOL = 0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3;
+    /// @dev The aggregator behind the NVDA feed proxy (callhouse `ops/markets/tier1.json` `feedAggregator`), cooled
+    ///      alongside the proxy so the T-OP-080 gas measurement is cold on every account a `trySpot` touches.
+    address internal constant NVDA_AGGREGATOR = 0xC9d16E4f2569b9E3ea0468fD85844953713DC2a2;
+    /// @dev MIRROR of `Clearinghouse.SPOT_READ_GAS` (private there). The T-OP-080 tests below assert every measured
+    ///      `trySpot` fits under it with the stated headroom, so a cap lowered under the need goes red here by name.
+    uint256 internal constant SPOT_READ_GAS = 240_000;
+    /// @dev The registry's launch spotMaxAge (`registry-v8.json` `v2.defaults.spotMaxAgeS` 90000): the after-close
+    ///      state -- a print older than SPOT_CORROBORATION_AGE but well inside the market's bound -- needs it; the
+    ///      contract default (1 h) would call the same print stale.
+    uint32 internal constant LAUNCH_SPOT_MAX_AGE = 90_000;
 
     /// @dev Registry values (callhouse ops/markets/tier1.json): NVDA strike grid 2.50 USDG, 25 bps exercise fee.
     uint64 internal constant NVDA_STRIKE_TICK = 2_500_000;
@@ -87,6 +104,7 @@ contract V2ForkTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -96,21 +114,30 @@ contract V2ForkTest is Test {
         if (block.chainid != 4663) return;
         forkNow = block.timestamp;
 
-        calendar = new ExpiryCalendar(admin, _nyseClosures());
-        clSource = new ChainlinkFeedSource(admin);
-        poolSource = new UniV3TwapSource(admin, USDG);
-        oracle = new SettlementOracle(admin, guardian);
-        rewards = new KeeperRewards(usdg, admin);
-        ch = new Clearinghouse(admin, USDG, address(calendar), chFees, "https://app.stonkhouse.fun/api/token/");
+        calendar = _newCalendar(_nyseClosures(), admin);
+        _deployManager();
+        clSource = new ChainlinkFeedSource(address(manager));
+        _wire(address(clSource), "ChainlinkFeedSource", admin, 0);
+        poolSource = new UniV3TwapSource(address(manager), USDG);
+        _wire(address(poolSource), "UniV3TwapSource", admin, 0);
+        oracle = new SettlementOracle(address(manager));
+        _wire(address(oracle), "SettlementOracle", admin, 0);
+        _grant(V8Roles.GUARDIAN, guardian, 0);
+        rewards = new KeeperRewards(usdg, address(manager), treasury);
+        _wire(address(rewards), "KeeperRewards", admin, 0);
+        ch = new Clearinghouse(
+            address(manager), USDG, address(calendar), chFees, "https://app.stonkhouse.fun/api/token/"
+        );
+        _wire(address(ch), "Clearinghouse", admin, 0);
         book = new OrderBook(
             IClearinghouse(address(ch)),
-            admin,
-            guardian,
+            address(manager),
             treasury,
             V2Types.FeeParams({
                 premiumFeeBps: 500, resaleFeeBps: 0, takerFeeFlat: 100_000, takerFeeCapBps: 1000, makerRebateBps: 5000
             })
         );
+        _wire(address(book), "OrderBook", admin, 0);
 
         address[] memory sources = new address[](2);
         (sources[0], sources[1]) = (address(clSource), address(poolSource));
@@ -122,19 +149,13 @@ contract V2ForkTest is Test {
         oracle.setMarket(NVDA, sources, 0, 0, 0);
         oracle.setClearinghouse(address(ch));
         oracle.setKeeperRewards(address(rewards));
-        ch.grantRole(V2Constants.GUARDIAN_ROLE, guardian);
         ch.setKeeperRewards(address(rewards));
-        ch.registerMarket(
-            NVDA,
-            V2Types.MarketConfig({
-                enabled: true,
-                mintPaused: false,
-                strikeTick: NVDA_STRIKE_TICK,
-                exerciseFeeBps: EXERCISE_FEE_BPS,
-                oracle: address(oracle),
-                mintFeePpm: 0
-            })
-        );
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(EXERCISE_FEE_BPS, 0);
+        ch.registerMarket(NVDA, NVDA_STRIKE_TICK, true);
+        ch.setMarketOracle(NVDA, address(oracle));
+        ch.setMarketFees(NVDA, EXERCISE_FEE_BPS, 0);
+        ch.setMinter(address(book), true);
         rewards.setCaller(address(oracle), true);
         rewards.setCaller(address(ch), true);
         rewards.setBounty(V2Constants.ACTION_SNAPSHOT, 50_000);
@@ -166,7 +187,15 @@ contract V2ForkTest is Test {
             vm.skip(true);
             return;
         }
-        if (!_fund()) return;
+        // T-OP-045. Statically a post-assertion-return (the calendar check above ran), at runtime already a
+        // skip: `_deal` calls `vm.skip(true)` in its catch, which halts the test before `_fund` can return
+        // false. The one assertion before this line is a fork-state precondition (the chosen expiry is a
+        // calendar expiry), not the settlement result this test exists for, so SKIPPED is the honest report
+        // when the fork cannot fund the actors. The call site now says so in the shape the sweep can see.
+        if (!_fund()) {
+            vm.skip(true);
+            return;
+        }
         // An in-the-money call: strike 3 % under the window price, on the 2.50 grid.
         uint128 strike = uint128(OptionMath.roundDownToTick(feedPrice * 97 / 100, NVDA_STRIKE_TICK));
         console2.log("feed window price, strike (USDG 6dp):", feedPrice, strike);
@@ -219,8 +248,17 @@ contract V2ForkTest is Test {
             vm.skip(true);
             return;
         }
-        if (!_deal(NVDA, writer, 10e18)) return;
-        if (!_deal(USDG, address(rewards), 100e6)) return;
+        // T-OP-045. Same as above: `_deal` already skips in its catch, so these never returned at runtime; the
+        // `assertGt(expiry, 0)` before them is a fork-state precondition (a weekly close in the last 10 days),
+        // not this test's result. The shape now matches what happens.
+        if (!_deal(NVDA, writer, 10e18)) {
+            vm.skip(true);
+            return;
+        }
+        if (!_deal(USDG, address(rewards), 100e6)) {
+            vm.skip(true);
+            return;
+        }
         uint128 strike = uint128(OptionMath.roundUpToTick(feedPrice * 102 / 100, NVDA_STRIKE_TICK)); // out of the money
 
         vm.warp(expiry - 2 hours);
@@ -324,7 +362,9 @@ contract V2ForkTest is Test {
                 limitPrice: ASK,
                 writeToSell: false,
                 recipient: buyer,
-                deadline: type(uint40).max
+                deadline: type(uint40).max,
+                // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+                maxTotalFee: type(uint128).max
             })
         );
         vm.stopPrank();
@@ -503,5 +543,143 @@ contract V2ForkTest is Test {
         for (uint256 i; i < closures.length; ++i) {
             days_[i] = closures[i];
         }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        SPOT_READ_GAS (T-OP-080): trySpot COLD, IN EVERY STATE T-OP-061 DEFINES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev WHY THIS IS MEASURED AND NOT REASONED. `Clearinghouse._floorPrice` reads the series oracle with
+    ///      `staticcall{gas: SPOT_READ_GAS}` and treats running out of gas as "no ok spot" (bounded trust). The cap was
+    ///      sized when `trySpot` read ONE source. T-OP-061's accuracy rule makes an old Chainlink print -- the state
+    ///      every launch redemption after the close is in -- ALSO read the pool source's `latest` (a UniV3 `observe`
+    ///      over the window), so the two-source read must fit under the cap or the accuracy rule is silently
+    ///      unreachable from the one consumer that matters most for holders. The four states below are T-OP-061's
+    ///      three plus the single-source market; each measurement cools every account the read touches first, so the
+    ///      number is the worst case a redemption can meet, and each asserts the mirrored cap holds it with headroom.
+    ///      The numbers, the block and the SHA they were read at are written into `Clearinghouse.sol`'s comment on
+    ///      `SPOT_READ_GAS`; a re-run at a later block is expected to move them by the pool's observation
+    ///      cardinality and the feed's round layout, not by more than the headroom.
+    function _coolSpotStack() internal {
+        vm.cool(address(oracle));
+        vm.cool(address(clSource));
+        vm.cool(address(poolSource));
+        vm.cool(NVDA_FEED);
+        vm.cool(NVDA_AGGREGATOR);
+        vm.cool(NVDA_POOL);
+    }
+
+    /// @dev The exact read `_floorPrice` makes -- a raw staticcall of `trySpot` -- capped at the mirrored constant,
+    ///      measured from the caller's side (so the number includes the call's own cold-account cost and is the upper
+    ///      bound of what the callee can have used). Returns what `_floorPrice` would decode.
+    function _measureTrySpot() internal returns (uint256 gasUsed, bool ok, uint256 price) {
+        _coolSpotStack();
+        bytes memory data = abi.encodeCall(ISettlementOracle.trySpot, (NVDA));
+        uint256 before = gasleft();
+        (bool success, bytes memory ret) = address(oracle).staticcall{gas: SPOT_READ_GAS}(data);
+        gasUsed = before - gasleft();
+        // The callee frame alone, which is what the cap actually bounds; `gasUsed` above adds the caller's cold
+        // account access, the call base cost and the return copy.
+        console2.log("T-OP-080 gas: callee frame (vm.lastCallGas.gasTotalUsed)", vm.lastCallGas().gasTotalUsed);
+        assertTrue(success, "trySpot must not revert or run out of gas under the mirrored cap");
+        assertEq(ret.length, 96, "three words");
+        (uint256 okWord, uint256 p,) = abi.decode(ret, (uint256, uint256, uint256));
+        ok = okWord == 1;
+        price = p;
+    }
+
+    /// @dev The real print's age at this fork head, from the source the oracle reads.
+    function _printAge() internal view returns (uint256 age, uint256 updatedAt) {
+        (bool ok,, uint256 t) = clSource.latest(NVDA);
+        assertTrue(ok, "the NVDA feed answers on this fork");
+        return (block.timestamp - t, t);
+    }
+
+    /// @notice State 1 -- a print at most SPOT_CORROBORATION_AGE old: one source read, no witness.
+    /// @dev The block is warped BACK to just after the print if the real print is older; no pool read happens in this
+    ///      state, so moving time before the pool's last observation cannot bite.
+    function test_fork_spotReadGas_youngPrint_oneSourceRead() public onlyFork {
+        (uint256 age, uint256 t) = _printAge();
+        if (age > oracle.SPOT_CORROBORATION_AGE()) vm.warp(t + 60);
+        (uint256 gasUsed, bool ok, uint256 price) = _measureTrySpot();
+        console2.log("T-OP-080 gas: trySpot cold, young print (one source read)", gasUsed);
+        assertTrue(ok && price != 0, "a young print is ok without a witness");
+        assertLe(gasUsed * 3 / 2, SPOT_READ_GAS, "young print fits under the cap with 1.5x headroom");
+    }
+
+    /// @notice State 2 -- the after-close launch state: the print is older than SPOT_CORROBORATION_AGE, the pool
+    ///         witnesses it, they agree. TWO source reads. This is the number the cap exists for.
+    function test_fork_spotReadGas_oldPrintPoolAgrees_twoSourceReads() public onlyFork {
+        _enterAfterCloseState(0);
+        (uint256 gasUsed, bool ok, uint256 price) = _measureTrySpot();
+        console2.log("T-OP-080 gas: trySpot cold, old print + pool agrees (two source reads)", gasUsed);
+        assertTrue(ok && price != 0, "the pool corroborates the real print, so the spot is ok");
+        assertLe(gasUsed * 3 / 2, SPOT_READ_GAS, "the launch state fits under the cap with 1.5x headroom");
+    }
+
+    /// @notice State 3 -- old print, pool disagrees. The same two reads; only `_agree`'s answer differs, so the gas
+    ///         must match state 2 within noise. Disagreement is forced by a 1 bp band on the market, not by moving the
+    ///         pool: the code path, and therefore the gas, is the one a real disagreement takes.
+    function test_fork_spotReadGas_oldPrintPoolDisagrees_twoSourceReads() public onlyFork {
+        _enterAfterCloseState(1);
+        (uint256 gasUsed, bool ok,) = _measureTrySpot();
+        console2.log("T-OP-080 gas: trySpot cold, old print + pool disagrees (two source reads)", gasUsed);
+        assertFalse(ok, "a 1 bp band cannot be met by a TWAP against a print: STALE, not ok");
+        assertLe(gasUsed * 3 / 2, SPOT_READ_GAS, "the disagree state fits under the cap with 1.5x headroom");
+    }
+
+    /// @notice State 4 -- a single-source market with an old print: one read, then the pre-T-OP-061 rule.
+    function test_fork_spotReadGas_singleSourceOldPrint_oneSourceRead() public onlyFork {
+        address[] memory one = new address[](1);
+        one[0] = address(clSource);
+        vm.prank(admin);
+        oracle.setMarket(NVDA, one, 0, 0, LAUNCH_SPOT_MAX_AGE);
+        (uint256 age,) = _printAge();
+        if (age <= oracle.SPOT_CORROBORATION_AGE()) vm.warp(block.timestamp + oracle.SPOT_CORROBORATION_AGE() + 1);
+        (uint256 gasUsed, bool ok, uint256 price) = _measureTrySpot();
+        console2.log("T-OP-080 gas: trySpot cold, single source, old print (one source read)", gasUsed);
+        assertTrue(ok && price != 0, "a single-source market keeps the pre-T-OP-061 rule: ok inside spotMaxAge");
+        assertLe(gasUsed * 3 / 2, SPOT_READ_GAS, "single source fits under the cap with 1.5x headroom");
+    }
+
+    /// @notice AC4. In the after-close state the REAL oracle's `trySpot` answers ok inside `_floorPrice`'s cap: the
+    ///         accuracy rule is reachable from the redemption floor, which is the whole point of re-sizing the cap.
+    function test_fork_floorPriceRead_afterClose_realOracleAnswersOkUnderTheCap() public onlyFork {
+        _enterAfterCloseState(0);
+        _coolSpotStack();
+        (bool success, bytes memory ret) =
+            address(oracle).staticcall{gas: SPOT_READ_GAS}(abi.encodeCall(ISettlementOracle.trySpot, (NVDA)));
+        assertTrue(success && ret.length >= 96, "the capped read completes");
+        (uint256 okWord, uint256 spot,) = abi.decode(ret, (uint256, uint256, uint256));
+        assertEq(okWord, 1, "and it is an ok spot, so _floorPrice takes the spot branch after the close");
+        assertGt(spot, 0);
+    }
+
+    /// @dev Puts the fixture in T-OP-061's step-2 state against the REAL feed and pool: the market carries the launch
+    ///      spotMaxAge (so an hours-old print is inside the bound) and `band` as its maxDeviationBps (0 = the 150 bps
+    ///      default, 1 = a band nothing can meet); time moves FORWARD only, to just past SPOT_CORROBORATION_AGE if the
+    ///      real print is younger than that, so the pool's `observe` never sees a block before its last observation.
+    function _enterAfterCloseState(uint16 band) internal {
+        address[] memory sources = new address[](2);
+        (sources[0], sources[1]) = (address(clSource), address(poolSource));
+        vm.prank(admin);
+        oracle.setMarket(NVDA, sources, band, 0, LAUNCH_SPOT_MAX_AGE);
+        (uint256 age,) = _printAge();
+        if (age <= oracle.SPOT_CORROBORATION_AGE()) vm.warp(block.timestamp + oracle.SPOT_CORROBORATION_AGE() + 1);
+        (uint256 after_,) = _printAge();
+        assertGt(after_, oracle.SPOT_CORROBORATION_AGE(), "the print is older than the corroboration age");
+        assertLe(after_, LAUNCH_SPOT_MAX_AGE, "and inside the launch spotMaxAge, so the pool is consulted");
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `USDG`, an address this suite's own tests read.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_v2ForkExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(USDG, "V2Fork");
     }
 }

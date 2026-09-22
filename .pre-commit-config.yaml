@@ -38,6 +38,16 @@ repos:
         entry: bash script/hooks/check-bash-syntax.sh
         language: system
         files: ^script/.*\.sh$
+      # The audit-response register is data the launch verification pass and C8-14 both read, so a
+      # half-filled record has to be refused at commit time rather than discovered later. Green on
+      # the empty register it ships as ("0 findings registered"), so this costs nothing until the
+      # audit starts.
+      - id: audit-response
+        name: audit response register (docs/audit-findings-v8.json)
+        entry: bash script/v2/check-audit-response.sh
+        language: system
+        pass_filenames: false
+        files: ^(docs/audit-findings-v8\.json|script/v2/check-audit-response\.sh)$
       # Checked-in, offline rules keep commit-time scans quick. Run the
       # broader Semgrep and Slither rulesets in CI/release review.
       - id: semgrep-v2

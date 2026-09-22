@@ -298,6 +298,96 @@ contract SoloAccountTest is Test {
         assertEq(nvda.balanceOf(carol), 5e18);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                        P4 BATCH (SEC-24, SEC-25, SEC-26)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev SEC-26. {WriterAccount.initialize} approves SEAPORT for the Clear ERC-1155 and nothing else, so a
+    ///      non-zero conduit key produces an account that can list and can never be filled: Seaport would move the
+    ///      offer through a conduit address this account never approved. Until this row only the deploy verifier
+    ///      said so, off chain. The factory deploys the implementation in its own constructor, so the refusal
+    ///      lands there -- a misconfigured factory cannot be deployed at all. The positive control is `setUp`
+    ///      itself, which builds the same factory with a zero key.
+    function test_factoryRefusesANonZeroConduitKey() public {
+        vm.expectRevert(WriterAccount.ConduitNotSupported.selector);
+        new AccountFactory(
+            IERC20(address(nvda)),
+            IERC20(address(usdg)),
+            IValoremClear(address(mockClear)),
+            ISeaport(address(mockSeaport)),
+            IChainlinkFeed(address(feed)),
+            6 hours,
+            keccak256("some conduit"),
+            admin,
+            feeSafe,
+            20e18
+        );
+    }
+
+    /// @dev SEC-24. The per-account expiry is `baseExpiryTs + index` narrowed to the uint40 a Valorem option type
+    ///      is keyed by. The addition is done in uint256 and cannot wrap; the DOWNCAST could, and a truncated
+    ///      expiry keys a different option type, so the account would write against terms nobody agreed to instead
+    ///      of refusing. Unreachable at any plausible timestamp -- uint40 runs to the year 36812 -- so the week is
+    ///      set at the very top of the range to reach it at all. The control below it: one second lower, with the
+    ///      same account and the same index, lists fine.
+    function test_listRefusesAnExpiryThatWouldNotFitInUint40() public {
+        _open(alice);
+        _open(bob);
+
+        // Positive control FIRST, through the same path: at an ordinary week this account lists.
+        _week();
+        WriterAccount a = _list(alice, 1);
+        assertGt(a.optionId(), 0, "control: an ordinary week lists");
+
+        // Now the top of the uint40 range, where `baseExpiryTs + index` no longer fits. Bob's account carries a
+        // non-zero index, which is the whole reason the sum leaves the range.
+        WriterAccount b = factory.accountOf(bob);
+        assertGt(b.index(), 0, "the index is what pushes the sum over");
+        vm.prank(keeper);
+        factory.setWeek(STRIKE, type(uint40).max - 1 days, type(uint40).max, ASK);
+        vm.prank(bob);
+        b.requestWrite(1);
+        vm.expectRevert(WriterAccount.ExpiryOutOfRange.selector);
+        vm.prank(keeper);
+        factory.listFor(bob);
+    }
+
+    /// @dev SEC-25, and it is the opposite of what the finding assumed. A live listing's consideration recipient
+    ///      is fixed in the signed order, so after {transferOwnership} it still names the OLD owner -- but every
+    ///      listing is FULL_RESTRICTED with this account as its zone, and {authorizeOrder} refuses a fill whose
+    ///      `consideration[0].recipient` is not the CURRENT owner. The old order is therefore UNFILLABLE, not a
+    ///      leak. What it costs instead is pinned here too: there is no cancel path, so the new owner cannot
+    ///      re-list until the listing's own week ends.
+    function test_transferOwnershipMakesALiveListingUnfillableNotPayableToTheOldOwner() public {
+        address carol = makeAddr("carol");
+        _open(alice);
+        _week();
+        WriterAccount a = _list(alice, 1);
+        uint256 aliceBefore = usdg.balanceOf(alice);
+
+        // The order as it was SIGNED, captured before the transfer. {lotOrder} is a view that rebuilds from
+        // current storage, so reading it afterwards returns the new owner and proves nothing about the live one.
+        OrderComponents memory signed = a.lotOrder(0);
+        assertEq(signed.consideration[0].recipient, alice, "the live order pays the owner who listed it");
+
+        vm.prank(alice);
+        a.transferOwnership(carol);
+        assertEq(a.owner(), carol);
+        assertEq(a.lotOrder(0).consideration[0].recipient, carol, "a NEW order would name the new owner");
+
+        vm.startPrank(buyer);
+        usdg.approve(address(mockSeaport), type(uint256).max);
+        vm.expectRevert(WriterAccount.BadLot.selector);
+        mockSeaport.fulfil(signed, 1);
+        vm.stopPrank();
+        assertEq(usdg.balanceOf(alice), aliceBefore, "the old owner is paid nothing");
+
+        // The cost of failing closed without a cancel path: the account is stuck listed for the week.
+        vm.expectRevert(WriterAccount.AlreadyListed.selector);
+        vm.prank(carol);
+        a.requestWrite(1);
+    }
+
     function test_ownerCanList() public {
         _open(alice);
         _week();
@@ -308,5 +398,86 @@ contract SoloAccountTest is Test {
         vm.stopPrank();
         assertEq(a.listedLots(), 1);
         assertEq(factory.liveCount(), 1);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    SEC-03: A FAILED REDEEM IS RECOVERABLE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev THE ok == false BRANCH HAD NO COVERAGE AT ALL BEFORE THIS ROW, which is why the dead end survived:
+    ///      `ValoremLib.tryRedeemClaim` CATCHES a reverting `redeem` and returns `false`, so `settle` completed
+    ///      and looked successful while leaving the claim open forever.
+    ///
+    ///      THE FAILURE IS INJECTED WITH `vm.mockCallRevert` ON `redeem` ALONE, deliberately, rather than by
+    ///      swapping in a fake Clear. `src/mocks/MockClear.sol` is outside this row's scope, and intercepting the
+    ///      one function keeps every other part of the real mock -- the position accounting `settle` and
+    ///      `lockedAssets` read -- genuinely in play. A wholesale fake would have made the assertions below agree
+    ///      with a stub instead of with the contract.
+    function test_settle_failedRedeemStrandsTheClaimAndIsRecoverable() public {
+        _open(alice);
+        _week();
+        WriterAccount a = _list(alice, 1);
+        // The claim only exists once a lot is FILLED -- `claimKey` is written in the fill path
+        // (`Account.sol:315`), not at listing time.
+        _fillLot(a, 0);
+        vm.warp(uint256(expiryTs) + a.index());
+
+        // USDG paused, or this account frozen on either token: the documented F-02 scenario.
+        vm.mockCallRevert(address(mockClear), abi.encodeWithSelector(IValoremClear.redeem.selector), "paused");
+        a.settle();
+
+        assertTrue(a.isStranded(), "a caught redeem failure must leave the account stranded");
+        assertTrue(a.claimKey() != 0, "the claim is still open");
+        assertEq(a.listedExpiryTs(), 0, "settle cleared the listing even though the redeem failed");
+
+        // THE DEAD END ITSELF. Before this fix these two were the whole story: no entry point redeemed.
+        vm.expectRevert(WriterAccount.TooEarly.selector);
+        a.settle();
+        vm.prank(alice);
+        vm.expectRevert(WriterAccount.StillOpen.selector);
+        a.list();
+
+        // The recovery path exists, and refuses while the cause persists rather than reporting success.
+        vm.expectRevert(WriterAccount.StillStranded.selector);
+        a.retryStrandedClaim();
+
+        // The pause lifts. PERMISSIONLESS: called with no prank, so not as the owner.
+        vm.clearMockedCalls();
+        a.retryStrandedClaim();
+
+        assertFalse(a.isStranded(), "the account is no longer stranded");
+        assertEq(a.claimKey(), 0, "the claim was redeemed");
+        assertEq(a.optionId(), 0, "optionId cleared, so the account can list again");
+        assertEq(a.contractsWritten(), 0, "contractsWritten cleared");
+    }
+
+    /// @dev The gate is {isStranded}, not `claimKey != 0`. A live listing also has a claim open, and if the
+    ///      recovery path keyed on the claim alone then ANYONE could redeem a writer's position out from under
+    ///      them before expiry. This is the assertion that would catch that mistake.
+    function test_retryStrandedClaim_refusesWhileTheListingIsStillLive() public {
+        _open(alice);
+        _week();
+        WriterAccount a = _list(alice, 1);
+        _fillLot(a, 0);
+
+        assertTrue(a.claimKey() != 0, "a filled, live listing does have an open claim");
+        assertFalse(a.isStranded(), "but a live listing is NOT stranded");
+        vm.expectRevert(WriterAccount.NotStranded.selector);
+        a.retryStrandedClaim();
+    }
+
+    /// @dev And a settled account, where the redeem succeeded, is not stranded either.
+    function test_retryStrandedClaim_refusesAfterACleanSettle() public {
+        _open(alice);
+        _week();
+        WriterAccount a = _list(alice, 1);
+        _fillLot(a, 0);
+        vm.warp(uint256(expiryTs) + a.index());
+        a.settle();
+
+        assertEq(a.claimKey(), 0, "a clean settle redeemed the claim");
+        assertFalse(a.isStranded());
+        vm.expectRevert(WriterAccount.NotStranded.selector);
+        a.retryStrandedClaim();
     }
 }

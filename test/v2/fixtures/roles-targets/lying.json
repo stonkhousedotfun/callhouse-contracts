@@ -1,0 +1,12 @@
+{
+  "targets": {
+    "Gamma": {
+      "baseAdmin(address)": "ADMIN"
+    }
+  },
+  "unmanagedTargets": {
+    "_comment": "fixture",
+    "Alpha": "fixture: claims Alpha is unmanaged, which is false",
+    "Beta": "fixture reason"
+  }
+}

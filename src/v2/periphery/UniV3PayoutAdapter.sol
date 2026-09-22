@@ -163,14 +163,14 @@ contract UniV3PayoutAdapter is IPayoutAdapter, AccessControl, ReentrancyGuardTra
         IUniV3SwapRouter02(router)
             .exactInputSingle(
                 IUniV3SwapRouter02.ExactInputSingleParams({
-                tokenIn: asset,
-                tokenOut: address(dollar),
-                fee: fee,
-                recipient: to,
-                amountIn: amountIn,
-                amountOutMinimum: minOut,
-                sqrtPriceLimitX96: 0
-            })
+                    tokenIn: asset,
+                    tokenOut: address(dollar),
+                    fee: fee,
+                    recipient: to,
+                    amountIn: amountIn,
+                    amountOutMinimum: minOut,
+                    sqrtPriceLimitX96: 0
+                })
             );
 
         // Full consumption: exactly `amountIn` left again, so nothing of the caller's stays here and the exact

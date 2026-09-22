@@ -190,7 +190,7 @@ contract OrderBookTakeTest is OrderBookBaseTest {
         uint256 w2 = _place(carol, callId, WRITE, P2_50, 20);
 
         vm.prank(alice);
-        (uint64 qUnits, uint256 qPremium, uint256 qFee) = book.quoteTake(_buy(callId, _ids(w1, w2), 40, alice));
+        (uint64 qUnits, uint256 qPremium, uint256 qFee,) = book.quoteTake(_buy(callId, _ids(w1, w2), 40, alice));
         assertEq(qUnits, 20, "quote: second order would need 20 of the 10 left");
         assertEq(qPremium, 400_000, "quote premium");
         assertEq(qFee, 40_000, "quote fee (10 % cap)");
@@ -219,11 +219,11 @@ contract OrderBookTakeTest is OrderBookBaseTest {
         V2Types.MarketConfig memory m = _market();
         m.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), m);
+        _reconfigure(ch, address(nvda), m);
         (filled,,) = _take(alice, _buy(callId, _ids(ask), 10, alice));
         assertEq(filled, 0, "market disabled");
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), _market());
+        _reconfigure(ch, address(nvda), _market());
 
         (filled,,) = _take(alice, _buy(callId, _ids(ask), 10, alice));
         assertEq(filled, 10, "fills once minting is open");
@@ -386,7 +386,7 @@ contract OrderBookTakeTest is OrderBookBaseTest {
         uint256 mmAsk = _place(mm, callId, WRITE, P3_00, 10);
 
         vm.prank(alice);
-        (uint64 quoted,,) = book.quoteTake(_buy(callId, _ids(refused, carolAsk, mmAsk), 20, alice));
+        (uint64 quoted,,,) = book.quoteTake(_buy(callId, _ids(refused, carolAsk, mmAsk), 20, alice));
         assertEq(quoted, 20, "the quote cannot foresee the refusal");
 
         vm.recordLogs();
@@ -793,7 +793,10 @@ contract OrderBookTakeTest is OrderBookBaseTest {
     //////////////////////////////////////////////////////////////*/
 
     function test_escrow_settledSeries_thirdPartyCannotRedeemTheBook_pruneReturnsLongs_makerRedeemed() public {
-        vm.prank(carol);
+        if (!ch.isOperator(carol, address(this))) {
+            vm.prank(carol);
+            ch.setOperator(address(this), true);
+        }
         ch.mint(callId, 30, carol, bob); // bob holds longs written by carol
         uint256 ask = _place(bob, callId, RESALE, P2_00, 30);
 
@@ -852,7 +855,7 @@ contract OrderBookTakeTest is OrderBookBaseTest {
         uint256 write = _place(carol, callId, WRITE, P2_50, 100);
         V2Types.TakeParams memory buy = _buy(callId, _ids(resale, write), 120, keeper);
         vm.prank(alice);
-        (uint64 qu, uint256 qp, uint256 qf) = book.quoteTake(buy);
+        (uint64 qu, uint256 qp, uint256 qf,) = book.quoteTake(buy);
         (uint64 tu, uint256 tp, uint256 tf) = _take(alice, buy);
         assertEq(qu, tu, "buy units");
         assertEq(qp, tp, "buy premium");
@@ -862,7 +865,7 @@ contract OrderBookTakeTest is OrderBookBaseTest {
         uint256 bid2 = _place(bob, callId, BID, P2_50, 30);
         V2Types.TakeParams memory sell = _sell(callId, _ids(bid1, bid2), 45, true, keeper);
         vm.prank(alice);
-        (qu, qp, qf) = book.quoteTake(sell);
+        (qu, qp, qf,) = book.quoteTake(sell);
         (tu, tp, tf) = _take(alice, sell);
         assertEq(qu, tu, "sell units");
         assertEq(qp, tp, "sell premium");
@@ -873,10 +876,10 @@ contract OrderBookTakeTest is OrderBookBaseTest {
     function test_quoteTake_skipsTheCallersOwnOrders() public {
         uint256 own = _place(alice, callId, WRITE, P2_00, 10);
         vm.prank(alice);
-        (uint64 units,,) = book.quoteTake(_buy(callId, _ids(own), 10, alice));
+        (uint64 units,,,) = book.quoteTake(_buy(callId, _ids(own), 10, alice));
         assertEq(units, 0, "self order skipped for the caller");
         vm.prank(bob);
-        (units,,) = book.quoteTake(_buy(callId, _ids(own), 10, bob));
+        (units,,,) = book.quoteTake(_buy(callId, _ids(own), 10, bob));
         assertEq(units, 10, "fillable for someone else");
     }
 

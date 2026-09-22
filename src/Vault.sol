@@ -1596,7 +1596,13 @@ contract Vault is ERC20, AccessControl, ReentrancyGuard, Distributor, AdapterVal
         // Measured against the supply BEFORE the burn below, which still counts the escrow.
         if (claimKey != 0) {
             uint256 remaining = strandedRemainingWad;
-            uint256 share = remaining.mulDiv(q, totalSupply());
+            // SEC-45. `+ 1` to match the virtual-share denominator the idle leg above prices with. Without it the
+            // two legs of the SAME exit used different denominators -- `q / supply` here against
+            // `q / (supply + 1)` there -- and the stranded slice came out marginally LARGER than the convention
+            // the rest of this function defends with. The gap is fractions of a wei and it favoured the queuer,
+            // which is the direction that turns a rounding difference into an edge worth taking at scale. One
+            // denominator, one rule.
+            uint256 share = remaining.mulDiv(q, totalSupply() + 1);
             if (share != 0) {
                 strandedRemainingWad = remaining - share;
                 uint256 gen = strandGen;

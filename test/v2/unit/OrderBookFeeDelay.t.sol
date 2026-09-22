@@ -8,8 +8,8 @@ import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 
-/// @notice OrderBook fee changes wait V2Constants.FEE_CHANGE_DELAY (24 h): {OrderBook.setFeeParams} schedules a change
-///         with effectiveAt = now + 24 h and logs FeeParamsScheduled; feeParams(), quoteTake and every take use the
+/// @notice OrderBook fee changes wait V2Constants.FEE_CHANGE_DELAY (48 h from INTERFACE_VERSION 8): {OrderBook.setFeeParams} schedules a change
+///         with effectiveAt = now + 48 h and logs FeeParamsScheduled; feeParams(), quoteTake and every take use the
 ///         fees in effect, which are the scheduled change once block.timestamp >= effectiveAt; pendingFeeParams()
 ///         shows a change that is not in effect yet. A second schedule before the first is due replaces it and
 ///         restarts the delay; one after it is due keeps the first in effect until the second is due; scheduling the
@@ -34,7 +34,7 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
                                SCHEDULING
     //////////////////////////////////////////////////////////////*/
 
-    function test_setFeeParams_schedulesTwentyFourHoursAhead_inEffectAtExactlyEffectiveAt() public {
+    function test_setFeeParams_schedulesFortyEightHoursAhead_inEffectAtExactlyEffectiveAt() public {
         V2Types.FeeParams memory next = _newFees();
         vm.recordLogs();
         _schedule(next);
@@ -44,7 +44,7 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
         assertEq(logs[0].topics[0], IOrderBook.FeeParamsScheduled.selector, "FeeParamsScheduled, not FeeParamsSet");
         (V2Types.FeeParams memory logged, uint40 effectiveAt) = abi.decode(logs[0].data, (V2Types.FeeParams, uint40));
         assertEq(abi.encode(logged), abi.encode(next), "logged params");
-        assertEq(uint256(effectiveAt), START + 86_400, "effectiveAt = now + 24 h");
+        assertEq(uint256(effectiveAt), START + 172_800, "effectiveAt = now + 48 h");
 
         _assertFees(_defaultFees(), "just scheduled: the old fees stay in effect");
         _assertPending(next, DUE40, "pendingFeeParams shows the change");
@@ -103,31 +103,31 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
     }
 
     function test_setFeeParams_rescheduleBeforeDue_replacesAndRestartsTheDelay() public {
-        _schedule(_newFees()); // due START + 24 h
+        _schedule(_newFees()); // due START + 48 h
         vm.warp(START + 12 hours);
         vm.expectEmit(address(book));
         emit IOrderBook.FeeParamsScheduled(_otherFees(), START40 + 12 hours + V2Constants.FEE_CHANGE_DELAY);
-        _schedule(_otherFees()); // due START + 36 h
+        _schedule(_otherFees()); // due START + 60 h
         _assertFees(_defaultFees(), "neither change in effect");
-        _assertPending(_otherFees(), START + 36 hours, "replaced; the delay restarted from the second call");
+        _assertPending(_otherFees(), START + 60 hours, "replaced; the delay restarted from the second call");
 
         vm.warp(START + DELAY);
         _assertFees(_defaultFees(), "the replaced change never takes effect");
-        vm.warp(START + 36 hours - 1);
+        vm.warp(START + 60 hours - 1);
         _assertFees(_defaultFees(), "one second before the restarted delay ends");
-        vm.warp(START + 36 hours);
+        vm.warp(START + 60 hours);
         _assertFees(_otherFees(), "the replacement, at its own effectiveAt");
         _assertNothingPending("in effect");
     }
 
     function test_setFeeParams_afterTheChangeIsDue_keepsItInEffectUntilTheNextIsDue() public {
         uint256 ask = _place(carol, callId, WRITE, P2_00, 50); // resting, 1.00 USDG of premium
-        _schedule(_newFees()); // due START + 24 h
-        vm.warp(START + 30 hours);
+        _schedule(_newFees()); // due START + 48 h
+        vm.warp(START + 50 hours);
         _assertFees(_newFees(), "first change in effect");
-        _schedule(_otherFees()); // due START + 54 h
+        _schedule(_otherFees()); // due START + 98 h
         _assertFees(_newFees(), "between the two schedules: the first change");
-        _assertPending(_otherFees(), START + 54 hours, "second change pending");
+        _assertPending(_otherFees(), START + 98 hours, "second change pending");
 
         // The take path agrees. _newFees: taker fee min(50_000, 1.00 USDG x 900 bps = 90_000) = 50_000; primary
         // seller fee 1_000_000 x 800 bps = 80_000; rebate 50_000 x 2500 bps = 12_500.
@@ -138,33 +138,33 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
         assertEq(f.sellerFee, 80_000, "seller fee at the first change");
         assertEq(f.makerRebate, 12_500, "rebate at the first change");
 
-        vm.warp(START + 54 hours - 1);
+        vm.warp(START + 98 hours - 1);
         _assertFees(_newFees(), "until one second before the second is due");
-        vm.warp(START + 54 hours);
+        vm.warp(START + 98 hours);
         _assertFees(_otherFees(), "then the second");
         _assertNothingPending("second in effect");
     }
 
     function test_setFeeParams_schedulingTheFeesInEffect_cancelsAPendingChange() public {
-        _schedule(_newFees()); // due START + 24 h
+        _schedule(_newFees()); // due START + 48 h
         vm.warp(START + 1 hours);
         _schedule(_defaultFees()); // the fees in effect
-        _assertPending(_defaultFees(), START + 25 hours, "the cancel is a scheduled change to the same fees");
+        _assertPending(_defaultFees(), START + 49 hours, "the cancel is a scheduled change to the same fees");
         vm.warp(START + DELAY);
         _assertFees(_defaultFees(), "the cancelled change never takes effect");
-        vm.warp(START + 25 hours);
+        vm.warp(START + 49 hours);
         _assertFees(_defaultFees(), "nothing changed");
         _assertNothingPending("nothing pending");
 
         // The same once a change is in effect: A in effect, B scheduled, A scheduled again.
-        _schedule(_newFees()); // A, due START + 49 h
-        vm.warp(START + 49 hours);
-        _schedule(_otherFees()); // B, due START + 73 h
-        vm.warp(START + 50 hours);
-        _schedule(_newFees()); // A again, the fees in effect: due START + 74 h
-        vm.warp(START + 73 hours);
+        _schedule(_newFees()); // A, due START + 97 h
+        vm.warp(START + 97 hours);
+        _schedule(_otherFees()); // B, due START + 145 h
+        vm.warp(START + 98 hours);
+        _schedule(_newFees()); // A again, the fees in effect: due START + 146 h
+        vm.warp(START + 145 hours);
         _assertFees(_newFees(), "B never takes effect");
-        vm.warp(START + 74 hours);
+        vm.warp(START + 146 hours);
         _assertFees(_newFees(), "still A");
         _assertNothingPending("nothing pending");
     }
@@ -189,7 +189,7 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
         uint256[4] memory before = _wallets();
         V2Types.TakeParams memory p = _buy(callId, _ids(w1, r1), 100, alice);
         vm.prank(alice);
-        (,, uint256 quoted) = book.quoteTake(p);
+        (,, uint256 quoted,) = book.quoteTake(p);
         vm.recordLogs();
         (uint64 filled, uint256 premium, uint256 takerFee) = _take(alice, p);
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -216,7 +216,7 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
         before = _wallets();
         p = _buy(callId, _ids(w2, r2), 100, alice);
         vm.prank(alice);
-        (,, quoted) = book.quoteTake(p);
+        (,, quoted,) = book.quoteTake(p);
         vm.recordLogs();
         (filled, premium, takerFee) = _take(alice, p);
         logs = vm.getRecordedLogs();
@@ -242,23 +242,25 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
                     THE DAPP'S DEADLINE RULE (ACCEPTED RISK)
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev TakeParams has no maximum fee (SECURITY.md, "Accepted risks"). The dapp's two rules make a take execute at
-    ///      the fees it was quoted or not at all: (1) while a change is pending, deadline = effectiveAt - 1; (2) with
-    ///      nothing pending, a deadline under 24 h after the block it read, which no change scheduled later can reach.
+    /// @dev v7's "no maximum fee" accepted risk is CLOSED in INTERFACE_VERSION 8 by `TakeParams.maxTotalFee` (the
+    ///      cap's own suite lives in OrderBookFeeCap.t.sol, including the cap and this window working together). What
+    ///      stays true here: the deadline rules still make a take execute at the fees it was quoted or not at all.
+    ///      (1) while a change is pending, deadline = effectiveAt - 1; (2) with nothing pending, a deadline under
+    ///      FEE_CHANGE_DELAY (48 h) after the block it read, which no change scheduled later can reach.
     function test_take_dappDeadlineRule_paysTheQuotedFeesOrReverts() public {
         uint256 w1 = _place(carol, callId, WRITE, P2_00, 50);
         uint256 w2 = _place(carol, callId, WRITE, P2_00, 50);
         uint256 w3 = _place(carol, callId, WRITE, P2_00, 50);
         uint256 w4 = _place(carol, callId, WRITE, P2_00, 50);
-        _schedule(_newFees()); // due START + 24 h
+        _schedule(_newFees()); // due START + 48 h
 
-        // Rule 1, built at START + 23 h: the quote is the old taker fee min(100_000, 1.00 USDG x 1000 bps) = 100_000.
-        vm.warp(START + 23 hours);
+        // Rule 1, built at START + 47 h: the quote is the old taker fee min(100_000, 1.00 USDG x 1000 bps) = 100_000.
+        vm.warp(START + 47 hours);
         (, uint40 effectiveAt) = book.pendingFeeParams();
         V2Types.TakeParams memory p = _buy(callId, _ids(w1), 50, alice);
         p.deadline = effectiveAt - 1;
         vm.prank(alice);
-        (,, uint256 quoted) = book.quoteTake(p);
+        (,, uint256 quoted,) = book.quoteTake(p);
         assertEq(quoted, 100_000, "quoted at the fees in effect");
         vm.warp(effectiveAt - 1); // mined in the last second before the change
         (,, uint256 takerFee) = _take(alice, p);
@@ -272,22 +274,22 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
         book.take(late);
         assertEq(_order(w2).filled, 0, "nothing filled");
 
-        // Rule 2, built at START + 25 h with nothing pending: _newFees in effect, taker fee min(50_000, 90_000).
-        vm.warp(START + 25 hours);
+        // Rule 2, built at START + 49 h with nothing pending: _newFees in effect, taker fee min(50_000, 90_000).
+        vm.warp(START + 49 hours);
         _assertNothingPending("the first change is in effect");
         p = _buy(callId, _ids(w3), 50, alice);
-        p.deadline = START40 + 25 hours + V2Constants.FEE_CHANGE_DELAY - 1;
+        p.deadline = START40 + 49 hours + V2Constants.FEE_CHANGE_DELAY - 1;
         vm.prank(alice);
-        (,, quoted) = book.quoteTake(p);
+        (,, quoted,) = book.quoteTake(p);
         assertEq(quoted, 50_000, "quoted at the fees in effect");
-        _schedule(_otherFees()); // right after the read, in the same second: due START + 49 h
+        _schedule(_otherFees()); // right after the read, in the same second: due START + 97 h
         vm.warp(p.deadline);
         (,, takerFee) = _take(alice, p);
         assertEq(takerFee, quoted, "a change scheduled after the read cannot reach the deadline");
 
         late = _buy(callId, _ids(w4), 50, alice);
         late.deadline = p.deadline;
-        vm.warp(START + 49 hours); // _otherFees due now
+        vm.warp(START + 97 hours); // _otherFees due now
         vm.prank(alice);
         vm.expectRevert(V2Errors.DeadlinePassed.selector);
         book.take(late);
@@ -297,9 +299,10 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
                                   FUZZ
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Four schedules, each 0 to 36 h after the previous one (the first 0 to 36 h after START, so two can share a
-    ///      second), of random fees under the ceilings; after each schedule one take at a random time up to the next
-    ///      schedule (or up to 36 h after the last). Each take fills a resting write-on-fill ask and a resting resale ask
+    /// @dev Four schedules, each 0 to 120 h after the previous one (the first 0 to 120 h after START, so two can share
+    ///      a second and, at the 48 h delay, a schedule can both come due and be replaced), of random fees under the
+    ///      ceilings; after each schedule one take at a random time up to the next
+    ///      schedule (or up to 120 h after the last). Each take fills a resting write-on-fill ask and a resting resale ask
     ///      of 1.00 USDG premium each, placed before any schedule. The fees it pays must be those of the most recent
     ///      schedule with effectiveAt <= the fill time that no later schedule replaced before its effectiveAt, or the
     ///      constructor's fees when there is none.
@@ -310,26 +313,33 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
     ) public {
         uint256[4] memory writes;
         uint256[4] memory resales;
-        _mintLongs(bob, callId, 200);
+        // T-488. NOT `callId`. This walk reaches START + 480 h (four gaps of up to 120 h), and callId expires at
+        // FRI_2026_09_18, START + 211.56 h. An order placed with a `validUntil` of 0 is NOT open-ended: OrderBook
+        // clamps it to the series' limit - `mintCutoff` for AskWrite, `mintCutoff + SETTLEMENT_WINDOW` (the expiry)
+        // for AskResale - so past that every resting ask here is dead and the take filled 0 of 100. The series is
+        // DERIVED from the calendar rather than typed: the first weekly close after the walk's furthest reach.
+        uint40 farExpiry = calendar.nextExpiry(uint40(START + 480 hours), true);
+        uint256 farId = ch.createSeries(address(nvda), false, CALL_STRIKE, farExpiry);
+        _mintLongs(bob, farId, 200);
         for (uint256 i; i < 4; ++i) {
-            writes[i] = _place(carol, callId, WRITE, P2_00, 50);
-            resales[i] = _place(bob, callId, RESALE, P2_00, 50);
+            writes[i] = _place(carol, farId, WRITE, P2_00, 50);
+            resales[i] = _place(bob, farId, RESALE, P2_00, 50);
         }
 
         V2Types.FeeParams[4] memory scheduled;
         uint256[4] memory at;
-        uint256 t = START + uint256(gapSeeds[0]) % (36 hours + 1);
+        uint256 t = START + uint256(gapSeeds[0]) % (120 hours + 1);
         for (uint256 i; i < 4; ++i) {
             vm.warp(t);
             at[i] = t;
             scheduled[i] = _feesFrom(seeds[i]);
             _schedule(scheduled[i]);
-            _assertPending(scheduled[i], t + DELAY, "scheduled with effectiveAt = now + 24 h");
+            _assertPending(scheduled[i], t + DELAY, "scheduled with effectiveAt = now + 48 h");
 
-            uint256 next = t + (i < 3 ? uint256(gapSeeds[i + 1]) % (36 hours + 1) : 36 hours);
+            uint256 next = t + (i < 3 ? uint256(gapSeeds[i + 1]) % (120 hours + 1) : 120 hours);
             uint256 fillAt = t + uint256(fillSeeds[i]) % (next - t + 1);
             vm.warp(fillAt);
-            _assertFill(writes[i], resales[i], _expectedFees(scheduled, at, i, fillAt));
+            _assertFill(farId, writes[i], resales[i], _expectedFees(scheduled, at, i, fillAt));
             t = next;
         }
     }
@@ -416,14 +426,14 @@ contract OrderBookFeeDelayTest is OrderBookBaseTest {
 
     /// @dev Takes `write` then `resale` (1.00 USDG of premium each) and checks every fee against `want`: taker fee
     ///      min(flat, 2.00 USDG x cap), seller fees by kind, rebates on shares floor(fee / 2) and the rest.
-    function _assertFill(uint256 write, uint256 resale, V2Types.FeeParams memory want) internal {
+    function _assertFill(uint256 longId, uint256 write, uint256 resale, V2Types.FeeParams memory want) internal {
         _assertFees(want, "feeParams() at the fill");
         uint256 byCap = 2_000_000 * uint256(want.takerFeeCapBps) / 10_000;
         uint256 fee = byCap < want.takerFeeFlat ? byCap : want.takerFeeFlat;
         uint256 treasuryBefore = usdg.balanceOf(treasury);
 
         vm.recordLogs();
-        (uint64 filled, uint256 premium, uint256 takerFee) = _take(alice, _buy(callId, _ids(write, resale), 100, alice));
+        (uint64 filled, uint256 premium, uint256 takerFee) = _take(alice, _buy(longId, _ids(write, resale), 100, alice));
         Vm.Log[] memory fills = _filledLogs(vm.getRecordedLogs());
         assertEq(filled, 100, "both orders filled");
         assertEq(premium, 2_000_000, "premium");

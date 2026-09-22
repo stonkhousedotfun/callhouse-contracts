@@ -95,6 +95,14 @@ contract AutoRollerStaleHandler is Test {
     uint256 public maxStaleCancels;
     /// @notice Cranker sweeps that left a tracked live ask overtaken at an ok spot with the delegate still in place.
     uint256 public crankLeftOvertaken;
+    /// @notice T-OP-036. Buyer takes of a writer's live ask: those that FILLED, those the book REFUSED, and fills
+    ///         that left the ask partly open. Campaign coverage -- both arms of the take are counted so a campaign
+    ///         whose fills silently stop (a lost minter grant, for one) goes red at the floor instead of staying
+    ///         green with every S1-S6 counter untouched. {MakerVaultOutflowInvariantTest.test_handlerExercisesEveryLeg}
+    ///         is the pattern.
+    uint256 public fills;
+    uint256 public fillReverts;
+    uint256 public partialFills;
     /// @notice Model of who revoked the roller as OrderBook delegate.
     mapping(address writer => bool) public delegateOff;
     /// @notice Names the last violation, for the failure message.
@@ -351,12 +359,22 @@ contract AutoRollerStaleHandler is Test {
                 limitPrice: type(uint128).max,
                 writeToSell: false,
                 recipient: buyers[seed % buyers.length],
-                deadline: NO_DEADLINE
+                deadline: NO_DEADLINE,
+                // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+                maxTotalFee: type(uint128).max
             })
         ) returns (
-            uint64, uint256, uint256
-        ) {}
-            catch {}
+            uint64 filled, uint256, uint256
+        ) {
+            // MEASURED ON THE ORDER, not on the return: a partial fill is an ask that is still live with units left
+            // after this take, which is the state the `o.units == o.filled` gate above never lets the campaign
+            // revisit unless fills of less than the whole remainder actually happen.
+            if (filled != 0) ++fills;
+            V2Types.Order memory after_ = _order(orderId);
+            if (filled != 0 && !after_.cancelled && after_.filled < after_.units) ++partialFills;
+        } catch {
+            ++fillReverts;
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -369,14 +387,17 @@ contract AutoRollerStaleHandler is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint16 otmBps = uint16(bound(otm, 100, 2500));
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint16 askBps = uint16(bound(ask, 5, 1000));
+        // T-OP-063 / SEC-13: the compiled floor is MIN_ASK_BPS = 50. A fuzzed ask or a minAskBps below it makes
+        // setStrategy revert CeilingExceeded, and this handler would then run its whole campaign with NO strategy
+        // set -- every invariant green over nothing, the T-OP-036 shape. The bound mirrors the constant.
+        uint16 askBps = uint16(bound(ask, 50, 1000));
         V2Types.Strategy memory s = V2Types.Strategy({
             active: true,
             weekly: weekly,
             smartPricing: true,
             otmBps: otmBps,
             askBps: askBps,
-            minAskBps: 5,
+            minAskBps: 50,
             maxAskBps: 1000,
             maxUnits: 0
         });

@@ -8,6 +8,7 @@ import {OrderBookFuzzTest} from "../unit/OrderBookFuzz.t.sol";
 import {OrderBookLogsTest} from "../unit/OrderBookLogs.t.sol";
 import {OrderBookMintFeeTest} from "../unit/OrderBookMintFee.t.sol";
 import {OrderBookOrdersTest} from "../unit/OrderBookOrders.t.sol";
+import {OrderBookPreFundTest} from "../unit/OrderBookPreFund.t.sol";
 import {OrderBookTakeTest} from "../unit/OrderBookTake.t.sol";
 
 /// @notice Every OrderBook suite of C2-06 again, over the REAL Clearinghouse instead of MockClearinghouse.
@@ -30,43 +31,72 @@ import {OrderBookTakeTest} from "../unit/OrderBookTake.t.sol";
 ///      on top of the collateral, which the book's budget must predict to the base unit ({OrderBookMintFeeTest}); the
 ///      mock's `mintFee` / `mintFeesHeld` mirror it, and this run is what proves the mirror honest.
 contract OrderBookOrdersRealClearinghouseTest is OrderBookOrdersTest {
-    function _newClearinghouse() internal override returns (MockClearinghouse) {
-        return MockClearinghouse(address(new Clearinghouse(admin, address(usdg), address(calendar), chFees, "")));
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
     }
 }
 
 /// @notice OrderBookTakeTest over the real Clearinghouse (see {OrderBookOrdersRealClearinghouseTest}).
 contract OrderBookTakeRealClearinghouseTest is OrderBookTakeTest {
-    function _newClearinghouse() internal override returns (MockClearinghouse) {
-        return MockClearinghouse(address(new Clearinghouse(admin, address(usdg), address(calendar), chFees, "")));
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
     }
 }
 
 /// @notice OrderBookLogsTest over the real Clearinghouse (see {OrderBookOrdersRealClearinghouseTest}).
 contract OrderBookLogsRealClearinghouseTest is OrderBookLogsTest {
-    function _newClearinghouse() internal override returns (MockClearinghouse) {
-        return MockClearinghouse(address(new Clearinghouse(admin, address(usdg), address(calendar), chFees, "")));
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
     }
 }
 
 /// @notice OrderBookFuzzTest over the real Clearinghouse (see {OrderBookOrdersRealClearinghouseTest}).
 contract OrderBookFuzzRealClearinghouseTest is OrderBookFuzzTest {
-    function _newClearinghouse() internal override returns (MockClearinghouse) {
-        return MockClearinghouse(address(new Clearinghouse(admin, address(usdg), address(calendar), chFees, "")));
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
     }
 }
 
 /// @notice OrderBookFeeDelayTest over the real Clearinghouse (see {OrderBookOrdersRealClearinghouseTest}).
 contract OrderBookFeeDelayRealClearinghouseTest is OrderBookFeeDelayTest {
-    function _newClearinghouse() internal override returns (MockClearinghouse) {
-        return MockClearinghouse(address(new Clearinghouse(admin, address(usdg), address(calendar), chFees, "")));
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
     }
 }
 
 /// @notice OrderBookMintFeeTest over the real Clearinghouse (see {OrderBookOrdersRealClearinghouseTest}): the c05
 ///         budget is planned against the contract that actually charges the rent, not against the mock's copy of it.
 contract OrderBookMintFeeRealClearinghouseTest is OrderBookMintFeeTest {
-    function _newClearinghouse() internal override returns (MockClearinghouse) {
-        return MockClearinghouse(address(new Clearinghouse(admin, address(usdg), address(calendar), chFees, "")));
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
+    }
+}
+
+/// @notice OrderBookPreFundTest over the real Clearinghouse: the feature is "money arrives in the real ledger
+///         before planning", and the mock's `free` is a plain mapping.
+contract OrderBookPreFundRealClearinghouseTest is OrderBookPreFundTest {
+    function _deployClearinghouse() internal override returns (MockClearinghouse) {
+        return
+            MockClearinghouse(
+                address(new Clearinghouse(address(manager), address(usdg), address(calendar), chFees, ""))
+            );
     }
 }

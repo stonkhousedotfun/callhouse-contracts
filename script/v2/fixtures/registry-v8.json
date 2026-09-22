@@ -1,0 +1,1045 @@
+{
+  "_readme": "INTERFACE_VERSION 8 fixture for script/v2/DeployV2Batch.sh, batch-refusals.sh and the O8-10 registration-only rehearsal. O8-01 owns the real app-repo registry; this copy tracks its shape. Principals are anvil stand-ins. premium 500 / resale 0 / mintFeePpm 0. waves.wave1 is the owner D5 19 additions (NVDA stays canary/live). Compact rows carry only what market_row/RegisterMarkets read; payoutRoute is null except NVDA and TSLA (O8-03 pins). T-OP-109: shared.token (address, symbol, decimals, poolKey, poolId) is MIRRORED byte-for-byte from callhouse ops/markets/tier1.json at 349ef637724da5a32d85b5313c6cfc6520e8d2d5 (T-OP-108's landed integration SHA; the values are chain-4663 reads made by T-OP-108, not stand-ins), so this is no longer the null-pool-key registry and batch-refusals.sh derives that case by NULLING a copy. Every markets[].v2 row carries registeredAt/registerTx (null) because DeployV2Batch.sh write_back market sets them and check-deploy-inputs.sh refuses a skeleton lacking a write-back key (T-OP-112 finding 2). The six EXTERNAL_KEYS of script/v2/lib/registry-env.sh (houseVault, houseVaultFactory, hedger, rewardsDistributorLender, earnVault, stockVenueAdapter) are homed null under v2.contracts.* -- contract_of reads .v2.contracts.<key>, export_contracts unsets the V2_* name when null, and check-deploy-inputs.sh reports them null-ok instead of unhomed (T-OP-112 finding 4). Which script constructs each, re-derived at contracts 0124b58e: earnVault and stockVenueAdapter -- script/v2/DeployEarnVault.s.sol (:104, :115); rewardsDistributorLender -- script/v2/DeployLenderRewards.s.sol (the second RewardsDistributor instance); houseVaultFactory and houseVault -- no production script yet, only script/v2/DevDeploy.s.sol:670/:689 (new HouseVaultFactory + createVault); hedger -- no deploy script at this base at all. None is deployed by DeployV8 (DeployV8.s.sol _externallySupplied lists the six on purpose); the launch-driver step that runs their scripts and writes the addresses back here is T-OP-116.",
+  "generatedAt": "2026-09-16T02:30:56.707Z",
+  "verifiedAtBlock": 64151977,
+  "rpc": "https://rpc.mainnet.chain.robinhood.com",
+  "feedsSource": {
+    "source": "local snapshot: feeds-fresh.json",
+    "total": 57,
+    "equity": 35
+  },
+  "tokensSource": {
+    "file": "ops/recon/R6-stock-tokens-list.json",
+    "total": 204
+  },
+  "shared": {
+    "chainId": 4663,
+    "usdg": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "clearinghouse": "0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6",
+    "seaport": "0x0000000000000068F116a894984e2DB1123eB395",
+    "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11",
+    "admin": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "guardian": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "feeRecipient": null,
+    "opsWallet": null,
+    "safes": {
+      "admin": "0x5afE00000000000000000000000000000000a1a1",
+      "treasury": "0x5aFe00000000000000000000000000000000B2b2"
+    },
+    "token": {
+      "address": "0xc2525b7c68b6d66dE5AABFEDC7B13314F389D5C4",
+      "symbol": "STONKHOUSE",
+      "decimals": 18,
+      "poolKey": {
+        "currency0": "0x0000000000000000000000000000000000000000",
+        "currency1": "0xc2525b7c68b6d66dE5AABFEDC7B13314F389D5C4",
+        "fee": 0,
+        "tickSpacing": 200,
+        "hooks": "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"
+      },
+      "poolId": "0x17ce8a5fccf32a6b7c7ab3a1c1d3663d6396614384661e9779cdb68c4541dddc"
+    }
+  },
+  "defaults": {
+    "depositCapUsd": 10000,
+    "strikeOtmBps": 500,
+    "minAskUsdg6": "100000",
+    "targetDelta": 0.15,
+    "priceEdgeBps": 1000,
+    "premiumMarginBps": 100,
+    "maxPriceAgeS": 345600,
+    "maxSpotDivergenceBps": 300
+  },
+  "waves": {
+    "live": [
+      "NVDA"
+    ],
+    "canary": [
+      "NVDA"
+    ],
+    "wave1": [
+      "SPCX",
+      "SPY",
+      "MU",
+      "QQQ",
+      "SNDK",
+      "AAPL",
+      "MSFT",
+      "INTC",
+      "TSLA",
+      "META",
+      "AMD",
+      "GOOGL",
+      "AMZN",
+      "MSTR",
+      "PLTR",
+      "DELL",
+      "ORCL",
+      "TSM",
+      "CRWV"
+    ]
+  },
+  "launchSet": {
+    "note": "The v8 launch set, owner ruling 2026-09-21: launch is NVDA and SPCX only. This is the AUTHORITATIVE list and it is deliberately NOT derived from `wave` or `status`. Waves mean rollout ORDER and no market moves bucket for this; the two fields answer different questions and a tool that infers the launch set from either gets a different answer. `markets` names tickers that must exist in `markets[]`; build-markets.mjs validates that and preserves this block across a rebuild.",
+    "markets": [
+      "NVDA",
+      "SPCX"
+    ]
+  },
+  "v2": {
+    "interfaceVersion": 8,
+    "deployBlock": null,
+    "contracts": {
+      "clearinghouse": null,
+      "orderBook": null,
+      "settlementOracle": null,
+      "expiryCalendar": null,
+      "keeperRewards": null,
+      "autoRoller": null,
+      "payoutAdapter": null,
+      "makerVault": null,
+      "makerRegistry": null,
+      "rewardsDistributor": null,
+      "accessManager": null,
+      "houseVault": null,
+      "houseVaultFactory": null,
+      "hedger": null,
+      "rewardsDistributorLender": null,
+      "earnVault": null,
+      "stockVenueAdapter": null,
+      "sources": {
+        "chainlink": null,
+        "univ3": null,
+        "dataStreams": null
+      }
+    },
+    "externalDeployBlocks": {
+      "houseVault": null,
+      "houseVaultFactory": null,
+      "hedger": null,
+      "rewardsDistributorLender": null,
+      "earnVault": null,
+      "stockVenueAdapter": null
+    },
+    "bots": {
+      "cranker": null,
+      "pricer": null,
+      "quoter": null,
+      "guardian": null
+    },
+    "protocolAddresses": {
+      "accessManager": null,
+      "makerVault": null,
+      "autoRoller": null,
+      "admin": null,
+      "guardian": null,
+      "feeRecipient": null,
+      "opsWallet": null,
+      "cranker": null,
+      "pricer": null,
+      "quoter": null,
+      "feeSplitter": null,
+      "buybackExecutor": null,
+      "treasury": null,
+      "distributors": {
+        "maker": null,
+        "user": null
+      }
+    },
+    "flywheel": {
+      "feeSplitter": null,
+      "buybackExecutor": null,
+      "deployBlock": null
+    },
+    "uniswapV3": {
+      "factory": "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+      "swapRouter02": "0xCaf681a66D020601342297493863E78C959E5cb2",
+      "quoterV2": "0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7"
+    },
+    "fees": {
+      "premiumFeeBps": 500,
+      "mintFeePpm": 0,
+      "allowRent": false,
+      "resaleFeeBps": 0,
+      "takerFeeFlat": "100000",
+      "takerFeeCapBps": 1000,
+      "makerRebateBps": 5000,
+      "exerciseFeeBps": 25
+    },
+    "vault": {
+      "maxSeriesUnits": "10000",
+      "maxTotalNotional": "250000000000",
+      "askToleranceBps": 100,
+      "maxBidBpsOfSpot": 1000,
+      "maxOrderLifetime": 0,
+      "maxDailyOutflow": "2500000000"
+    },
+    "defaults": {
+      "maxDeviationBps": 150,
+      "uncorroboratedDelayS": 21600,
+      "spotMaxAgeS": 90000,
+      "ladder": {
+        "weekly": {
+          "rungs": 5,
+          "firstOtmBps": 200,
+          "stepBps": 200,
+          "cardTargetBps": 400
+        },
+        "daily": {
+          "rungs": 5,
+          "firstOtmBps": 100,
+          "stepBps": 100,
+          "cardTargetBps": 200
+        }
+      },
+      "expiriesAhead": {
+        "weekly": 2,
+        "daily": 3
+      }
+    }
+  },
+  "skipped": [],
+  "summary": {
+    "markets": 35,
+    "verified": 35,
+    "failing": [],
+    "vol": [
+      "AAPL",
+      "AMD",
+      "AMZN",
+      "ASML",
+      "BABA",
+      "CLSK",
+      "COIN",
+      "CRCL",
+      "CRWV",
+      "DELL",
+      "EWY",
+      "GME",
+      "GOOGL",
+      "INTC",
+      "IONQ",
+      "META",
+      "MSFT",
+      "MSTR",
+      "MU",
+      "NBIS",
+      "NVDA",
+      "ORCL",
+      "PLTR",
+      "QQQ",
+      "RGTI",
+      "RKLB",
+      "SLV",
+      "SNDK",
+      "SPCX",
+      "SPY",
+      "TSLA",
+      "TSM",
+      "USAR",
+      "USO"
+    ],
+    "fixed": [
+      "SGOV"
+    ],
+    "live": [
+      "NVDA"
+    ]
+  },
+  "markets": [
+    {
+      "ticker": "NVDA",
+      "name": "NVIDIA \u2022 Robinhood Token",
+      "asset": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+      "assetSymbol": "NVDA",
+      "assetDeployBlock": 45898,
+      "feed": "0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15",
+      "feedSvr": "0xCF169363636D73dbBf77733629CB38919d14232d",
+      "feedAggregator": "0xC9d16E4f2569b9E3ea0468fD85844953713DC2a2",
+      "feedName": "Robinhood NVDA / USD",
+      "feedDescription": "RHNVDA / USD",
+      "feedHeartbeatS": 86400,
+      "feedThresholdPct": 0.5,
+      "cboe": {
+        "root": "NVDA",
+        "url": "https://cdn.cboe.com/api/global/delayed_quotes/options/NVDA.json",
+        "checkedAt": "2026-09-16T02:26:28.130Z",
+        "http": 200,
+        "rows": 4052,
+        "expiries": [
+          "260916",
+          "260918",
+          "260921",
+          "260923",
+          "260925",
+          "260928",
+          "260930",
+          "261002",
+          "261009",
+          "261016",
+          "261023",
+          "261030",
+          "261120",
+          "261218",
+          "270115",
+          "270219",
+          "270319",
+          "270416",
+          "270617",
+          "270917",
+          "271217",
+          "280121",
+          "280616",
+          "281215",
+          "290119"
+        ],
+        "weekly": true,
+        "currentPrice": 212.3899,
+        "spotDivergenceBps": 22,
+        "underlyingMatches": true,
+        "symbol": "NVDA"
+      },
+      "mode": "vol",
+      "modeReason": "weekly chain, 4052 rows, spot divergence 22 bps",
+      "depositCapUsd": null,
+      "depositCap": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "strikeOtmBps": 500,
+      "minAskUsdg6": "100000",
+      "targetDelta": 0.15,
+      "priceEdgeBps": 1000,
+      "premiumMarginBps": 100,
+      "wave": "live",
+      "status": "live",
+      "v2": {
+        "status": "live",
+        "wave": "canary",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": "0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3",
+        "univ3MinLiquidity": "1700000000000000000",
+        "dataStreamsFeedId": "0x000b6aa036224454037bab103184565f6aa9ea589c3b349f6d8471ee753524b9",
+        "payoutRoute": {
+          "venue": "v4",
+          "fee": 375,
+          "tickSpacing": 4,
+          "poolId": "0xdf5c0bcd967d54774c139a4ef803ec994779736346fb4c21b50ed241b1fd2682"
+        },
+        "overrides": {},
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      },
+      "verification": {
+        "block": 64151977,
+        "ok": true,
+        "feedDecimals": 8,
+        "feedRoundId": "18446744073709552655",
+        "feedAnswer": "21192474816",
+        "feedUpdatedAt": 1789483955,
+        "feedAgeS": 41881,
+        "spotUsd": 211.92474816,
+        "feedDescription": "RHNVDA / USD",
+        "tokenDecimals": 18,
+        "tokenSymbol": "NVDA",
+        "uiMultiplier": "1000775159164630595",
+        "oraclePaused": false,
+        "issues": []
+      },
+      "deployment": {
+        "factory": "0xc4A5Cd0DE91CaB7F5Ebe2114bc63Fbb43E642BBb",
+        "implementation": "0xe412A596B000f73ad19B39f51dfd0B17A15F45EC",
+        "deployBlock": 64038234,
+        "deployTx": "0x8ef58643dc5d47e737ad62fcfc5499c591bb04ee3d98f897525c14ed5784f2e5",
+        "keeper": "0x06c131cfEd73A56893f5eB52D17252856FAFC1d2",
+        "keeperKeyIndex": 1,
+        "guardian": "0x29741A8d283a253E8Ce10aDfd04C6507438b6F39",
+        "admin": "0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b",
+        "feeRecipient": "0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b",
+        "sourcify": null,
+        "configuredAt": "2026-09-15"
+      },
+      "explorer": {
+        "asset": "https://robinhoodchain.blockscout.com/address/0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+        "feed": "https://robinhoodchain.blockscout.com/address/0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15"
+      },
+      "notes": "Live since 2026-09-15 (factory deploy block 64038234). depositCap() is type(uint256).max on chain; policy() (300,1200,40,9500,500,50). Keeper key = mnemonic account 1, the original single-market keeper; it is not moved. The pooled cNVDA vault 0x88a98931\u2026 is closed and is not this market."
+    },
+    {
+      "ticker": "SPCX",
+      "name": "SpaceX \u2022 Robinhood Token",
+      "asset": "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa",
+      "assetSymbol": "SPCX",
+      "feed": "0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb",
+      "feedDescription": "Robinhood SPCX / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "SPY",
+      "name": "SPDR S&P 500 ETF Trust \u2022 Robinhood Token",
+      "asset": "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C",
+      "assetSymbol": "SPY",
+      "feed": "0x319724394D3A0e3669269846abE664Cd621f9f6A",
+      "feedDescription": "RHSPY / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "MU",
+      "name": "Micron Technology \u2022 Robinhood Token",
+      "asset": "0xfF080c8ce2E5feadaCa0Da81314Ae59D232d4afD",
+      "assetSymbol": "MU",
+      "feed": "0x425EEFdCf05ed6526C3cE61Af99429A228a6d596",
+      "feedDescription": "RHMU / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "QQQ",
+      "name": "Invesco QQQ \u2022 Robinhood Token",
+      "asset": "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68",
+      "assetSymbol": "QQQ",
+      "feed": "0x80901d846d5D7B030F26B480776EE3b29374C2ae",
+      "feedDescription": "Robinhood QQQ / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "SNDK",
+      "name": "Sandisk Corporation \u2022 Robinhood Token",
+      "asset": "0xB90A19fF0Af67f7779afF50A882A9CfF42446400",
+      "assetSymbol": "SNDK",
+      "feed": "0xfb133Fa4B7b385802B693a293606682Df47109A3",
+      "feedDescription": "RHSNDK / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "AAPL",
+      "name": "Apple \u2022 Robinhood Token",
+      "asset": "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9",
+      "assetSymbol": "AAPL",
+      "feed": "0x6B22A786bAa607d76728168703a39Ea9C99f2cD0",
+      "feedDescription": "Robinhood AAPL / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "MSFT",
+      "name": "Microsoft \u2022 Robinhood Token",
+      "asset": "0xe93237C50D904957Cf27E7B1133b510C669c2e74",
+      "assetSymbol": "MSFT",
+      "feed": "0x45C3C877C15E6BA2EBB19eA114Ea508d14C1Af2E",
+      "feedDescription": "RHMSFT / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "INTC",
+      "name": "Intel \u2022 Robinhood Token",
+      "asset": "0xc72b96e0E48ecd4DC75E1e45396e26300BC39681",
+      "assetSymbol": "INTC",
+      "feed": "0x3f390C5C24628Ac7C489515402235FeAD71D1913",
+      "feedDescription": "RHINTC / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "TSLA",
+      "name": "Tesla \u2022 Robinhood Token",
+      "asset": "0x322F0929c4625eD5bAd873c95208D54E1c003b2d",
+      "assetSymbol": "TSLA",
+      "assetDeployBlock": 34767,
+      "feed": "0x4A1166a659A55625345e9515b32adECea5547C38",
+      "feedSvr": "0xE4479F01738B4e8C428CD8eB72D47AB9BC3c7de6",
+      "feedAggregator": "0x7A6b81ba7FbCB90104d8C496158Cf383cD7233b1",
+      "feedName": "Robinhood TSLA / USD",
+      "feedDescription": "RHTSLA / USD",
+      "feedHeartbeatS": 86400,
+      "feedThresholdPct": 0.5,
+      "cboe": {
+        "root": "TSLA",
+        "url": "https://cdn.cboe.com/api/global/delayed_quotes/options/TSLA.json",
+        "checkedAt": "2026-09-16T02:26:35.062Z",
+        "http": 200,
+        "rows": 4962,
+        "expiries": [
+          "260916",
+          "260918",
+          "260921",
+          "260923",
+          "260925",
+          "260928",
+          "260930",
+          "261002",
+          "261009",
+          "261016",
+          "261023",
+          "261030",
+          "261120",
+          "261218",
+          "270115",
+          "270219",
+          "270319",
+          "270617",
+          "270917",
+          "271217",
+          "280121",
+          "280616",
+          "281215",
+          "290119"
+        ],
+        "weekly": true,
+        "currentPrice": 355.85,
+        "spotDivergenceBps": 61,
+        "underlyingMatches": true,
+        "symbol": "TSLA"
+      },
+      "mode": "vol",
+      "modeReason": "weekly chain, 4962 rows, spot divergence 61 bps",
+      "depositCapUsd": 10000,
+      "depositCap": "27000000000000000000",
+      "strikeOtmBps": 500,
+      "minAskUsdg6": "100000",
+      "targetDelta": 0.15,
+      "priceEdgeBps": 1000,
+      "premiumMarginBps": 100,
+      "wave": "canary",
+      "status": "superseded-by-v2",
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": "0x000b2dbed1640ead18d37338b75e4755630a900649261baf4ed79d9a749be13d",
+        "payoutRoute": {
+          "venue": "v4",
+          "fee": 3000,
+          "tickSpacing": 60,
+          "poolId": "0x8517f8071ae5b831b738052f12125e8e3d6c158b78728aa44ce3b25e5104d32e"
+        },
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      },
+      "verification": {
+        "block": 64151977,
+        "ok": true,
+        "feedDecimals": 8,
+        "feedRoundId": "18446744073709552842",
+        "feedAnswer": "35803999999",
+        "feedUpdatedAt": 1789516877,
+        "feedAgeS": 8974,
+        "spotUsd": 358.03999999,
+        "feedDescription": "RHTSLA / USD",
+        "tokenDecimals": 18,
+        "tokenSymbol": "TSLA",
+        "uiMultiplier": "1000000000000000000",
+        "oraclePaused": false,
+        "issues": []
+      },
+      "deployment": {
+        "factory": null,
+        "implementation": null,
+        "deployBlock": null,
+        "deployTx": null,
+        "keeper": "0xb500858e725e34751A32E3956F42e2B3b2051Cdc",
+        "keeperKeyIndex": 40,
+        "guardian": "0x29741A8d283a253E8Ce10aDfd04C6507438b6F39",
+        "admin": "0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b",
+        "feeRecipient": "0xEb82c3D0F89d47453F94f0C2b2a2752e27a19d9b",
+        "sourcify": null,
+        "configuredAt": null
+      },
+      "explorer": {
+        "asset": "https://robinhoodchain.blockscout.com/address/0x322F0929c4625eD5bAd873c95208D54E1c003b2d",
+        "feed": "https://robinhoodchain.blockscout.com/address/0x4A1166a659A55625345e9515b32adECea5547C38"
+      }
+    },
+    {
+      "ticker": "META",
+      "name": "Meta Platforms \u2022 Robinhood Token",
+      "asset": "0xc0D6457C16Cc70d6790Dd43521C899C87ce02f35",
+      "assetSymbol": "META",
+      "feed": "0x7C38C00C30BEe9378381E7B6135d7283356D71b1",
+      "feedDescription": "Robinhood META / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "AMD",
+      "name": "AMD \u2022 Robinhood Token",
+      "asset": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+      "assetSymbol": "AMD",
+      "feed": "0x943A29E7ae51A4798823ca9eEd2ed533B2A22C72",
+      "feedDescription": "RHAMD / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "GOOGL",
+      "name": "Alphabet Class A \u2022 Robinhood Token",
+      "asset": "0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3",
+      "assetSymbol": "GOOGL",
+      "feed": "0xF6f373a037c30F0e5010d854385cA89185AE638b",
+      "feedDescription": "Robinhood GOOGL / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "AMZN",
+      "name": "Amazon \u2022 Robinhood Token",
+      "asset": "0x12f190a9F9d7D37a250758b26824B97CE941bF54",
+      "assetSymbol": "AMZN",
+      "feed": "0xD5a1508ceD74c084eBf3cBe853e2C968fB2a651C",
+      "feedDescription": "Robinhood AMZN / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "MSTR",
+      "name": "Strategy Inc. \u2022 Robinhood Token",
+      "asset": "0xec262a75e413fAfD0dF80480274532C79D42da09",
+      "assetSymbol": "MSTR",
+      "feed": "0x396118bdFB181e6240E74D243F266B061c0edc3D",
+      "feedDescription": "Robinhood MSTR / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "PLTR",
+      "name": "Palantir Technologies \u2022 Robinhood Token",
+      "asset": "0x894E1EC2D74FFE5AEF8Dc8A9e84686acCB964F2A",
+      "assetSymbol": "PLTR",
+      "feed": "0x820ABedFF239034956B7A9d2F0a331f9F075eB4c",
+      "feedDescription": "Robinhood PLTR / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "DELL",
+      "name": "Dell \u2022 Robinhood Token",
+      "asset": "0x941AE714EC6D8130c7B75d67160Ca08f1e7d11Dd",
+      "assetSymbol": "DELL",
+      "feed": "0x1C6c8cADBe02E19129c39dDB92281cE4c0bf206b",
+      "feedDescription": "Robinhood DELL-USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "ORCL",
+      "name": "Oracle \u2022 Robinhood Token",
+      "asset": "0xb0992820E760d836549ba69BC7598b4af75dEE03",
+      "assetSymbol": "ORCL",
+      "feed": "0x0e6a64a2B58A6693a531E6c555f3A5d042eEA844",
+      "feedDescription": "Robinhood ORCL / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "TSM",
+      "name": "Taiwan Semiconductor Manufacturing \u2022 Robinhood Token",
+      "asset": "0x58FfE4a942d3885bAa22D7520691F611EF09e7AA",
+      "assetSymbol": "TSM",
+      "feed": "0x874cF94aa8eC88Fd9560094dD065f2fB3E41Fc2F",
+      "feedDescription": "Robinhood TSM / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    },
+    {
+      "ticker": "CRWV",
+      "name": "CoreWeave \u2022 Robinhood Token",
+      "asset": "0x5f10A1C971B69e47e059e1dC91901B59b3fB49C3",
+      "assetSymbol": "CRWV",
+      "feed": "0xe1b3aABCAFAd1c94708dc1367dcfF8Aa4407487C",
+      "feedDescription": "Robinhood CRWV / USD",
+      "status": "superseded-by-v2",
+      "wave": "wave1",
+      "verification": {
+        "ok": true,
+        "issues": []
+      },
+      "v2": {
+        "status": "planned",
+        "wave": "wave1",
+        "strikeTick": "2500000",
+        "puts": false,
+        "mintFeePpm": 0,
+        "univ3Pool": null,
+        "univ3MinLiquidity": null,
+        "dataStreamsFeedId": null,
+        "payoutRoute": null,
+        "overrides": {
+          "uncorroboratedDelayS": 3600
+        },
+        "houseVault": null,
+        "registeredAt": null,
+        "registerTx": null
+      }
+    }
+  ]
+}

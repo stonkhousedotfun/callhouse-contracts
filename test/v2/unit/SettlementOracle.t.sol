@@ -4,7 +4,9 @@ pragma solidity 0.8.28;
 import {Vm} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {BaseV2Test} from "../BaseV2.t.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {SettlementOracle} from "../../../src/v2/oracle/SettlementOracle.sol";
+import {ChainlinkFeedSource} from "../../../src/v2/oracle/ChainlinkFeedSource.sol";
 import {KeeperRewards} from "../../../src/v2/KeeperRewards.sol";
 import {IKeeperRewards} from "../../../src/v2/interfaces/IKeeperRewards.sol";
 import {ISettlementOracle} from "../../../src/v2/interfaces/ISettlementOracle.sol";
@@ -37,11 +39,15 @@ abstract contract SettlementOracleFixture is BaseV2Test {
     MockOraclePriceSource internal s2;
 
     function _deployCore() internal virtual override {
-        oracle = new SettlementOracle(admin, guardian);
+        _deployManager();
+        oracle = new SettlementOracle(address(manager));
+        _wire(address(oracle), "SettlementOracle", admin, 0);
+        _grant(V8Roles.GUARDIAN, guardian, 0);
         s0 = new MockOraclePriceSource();
         s1 = new MockOraclePriceSource();
         s2 = new MockOraclePriceSource();
-        rewards = new KeeperRewards(IERC20(address(usdg)), admin);
+        rewards = new KeeperRewards(IERC20(address(usdg)), address(manager), treasury);
+        _wire(address(rewards), "KeeperRewards", admin, 0);
         ch = new MockOpenInterestClearinghouse();
         vm.label(address(oracle), "SettlementOracle");
         vm.label(address(s0), "source0");
@@ -317,6 +323,73 @@ contract SettlementOracleChainTest is SettlementOracleFixture {
         (bool finalized, uint256 price) = _finalize();
         assertTrue(finalized, "corroboration wins over the veto");
         assertEq(price, P, "source 0");
+    }
+
+    /// The D20 retraction, pinned: corroboration is read BEFORE Held, and finalize is permissionless, so a vetoed
+    /// expiry that later corroborates settles on the next call by anyone.
+    /// @dev The contract NatSpec (the HELD note and the T-223 paragraph) states this ordering as the reason audit
+    ///      finding D20 was retracted; prose does not fail when the code moves under it. {_advance} tests
+    ///      `corroborated` and finalizes at SettlementOracle.sol:724-727, ahead of `if (s.status == Held) return
+    ///      false;` at :728, and {finalize} at :448 carries no access control and no Held check of its own. The test
+    ///      names the ORDER by holding everything else fixed -- the same Held expiry, the same unprivileged caller,
+    ///      one call before corroboration and one after. The first call proves the Held check is live and blocking,
+    ///      so the second cannot pass because the veto was somehow absent; the second proves corroboration is read
+    ///      first. Swap :724-727 with :728 and the second call returns (false, 0) with the expiry still Held.
+    function test_d20_corroborationIsReadBeforeHeld_soAnyoneFinalizesAVetoedExpiry() public {
+        _useTwo();
+        s0.setWindow(true, P);
+        vm.warp(FINALIZABLE);
+        _finalize(); // one ok source: Pending with an uncorroborated candidate
+
+        vm.prank(guardian);
+        oracle.veto(address(nvda), E);
+        assertEq(uint8(_status()), uint8(V2Types.SettlementStatus.Held), "vetoed");
+
+        // Control: while the candidate is uncorroborated the Held check blocks, however late the call is.
+        vm.warp(FINALIZABLE + 30 days);
+        vm.prank(stranger);
+        (bool heldFinalized, uint256 heldPrice) = oracle.finalize(address(nvda), E);
+        assertFalse(heldFinalized, "uncorroborated Held does not settle");
+        assertEq(heldPrice, 0, "no price while Held");
+        assertEq(uint8(_status()), uint8(V2Types.SettlementStatus.Held), "the veto is in force");
+
+        // Same expiry, same veto, same unprivileged caller: corroboration is the only thing added.
+        s1.setWindow(true, 220_100_000); // 4.5 bps from P: agrees
+        assertEq(uint8(_status()), uint8(V2Types.SettlementStatus.Held), "still Held at the moment of the call");
+        vm.recordLogs();
+        vm.prank(stranger);
+        (bool finalized, uint256 price) = oracle.finalize(address(nvda), E);
+
+        // The return value is asserted before the event, so a swap of :724-727 and :728 fails on the fact itself
+        // rather than on a missing log.
+        assertTrue(finalized, "corroboration is read before Held: the vetoed expiry settles");
+        assertEq(price, P, "source 0, priority order");
+        (V2Types.SettlementStatus status, uint256 stored, uint8 idx, bool corroborated,,) =
+            oracle.settlementInfo(address(nvda), E);
+        assertEq(uint8(status), uint8(V2Types.SettlementStatus.Finalized), "Held -> Finalized in one call");
+        assertEq(stored, P, "stored price");
+        assertEq(idx, 0, "source 0");
+        assertTrue(corroborated, "final through corroborating sources, not through the veto path");
+
+        (uint256 loggedPrice, uint8 loggedIndex, bool loggedCorroborated) = _finalizedLog();
+        assertEq(loggedPrice, P, "SettlementFinalized price");
+        assertEq(loggedIndex, 0, "SettlementFinalized source index");
+        assertTrue(loggedCorroborated, "SettlementFinalized corroborated flag");
+    }
+
+    /// @dev The single {ISettlementOracle.SettlementFinalized} the oracle emitted since vm.recordLogs(), decoded.
+    function _finalizedLog() private view returns (uint256 price, uint8 sourceIndex, bool corroborated) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(oracle)) continue;
+            if (logs[i].topics[0] != ISettlementOracle.SettlementFinalized.selector) continue;
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), address(nvda), "finalized underlying");
+            assertEq(uint256(logs[i].topics[2]), uint256(E), "finalized expiry");
+            (price, sourceIndex, corroborated) = abi.decode(logs[i].data, (uint256, uint8, bool));
+            ++seen;
+        }
+        assertEq(seen, 1, "exactly one SettlementFinalized");
     }
 
     /// unveto restores the single-source path with the delay restarted from the unveto.
@@ -854,7 +927,8 @@ contract SettlementOracleBountyTest is SettlementOracleFixture {
         assertEq(usdg.balanceOf(keeper), 0, "no clearinghouse pointer");
     }
 
-    /// A reverting open-interest read, a reverting reward and a code-less rewards pointer never break the call.
+    /// A reverting open-interest read, a reverting reward and a rewards pointer that answers nothing never break the
+    /// call. A pointer with no code at all can no longer be set (SEC-31): see test_setKeeperRewards_refusesCodeless.
     function test_bounty_failuresNeverRevert() public {
         _useTwo();
         _pinE();
@@ -872,12 +946,36 @@ contract SettlementOracleBountyTest is SettlementOracleFixture {
         _finalize();
         assertEq(uint8(_status()), uint8(V2Types.SettlementStatus.Pending), "advanced despite the revert");
 
+        // One STOP byte: the raw reward call succeeds and returns nothing.
+        address silent = makeAddr("silent payer");
+        vm.etch(silent, hex"00");
         vm.prank(admin);
-        oracle.setKeeperRewards(makeAddr("no code"));
+        oracle.setKeeperRewards(silent);
         vm.warp(FINALIZABLE + 1 minutes + 6 hours);
         (bool finalized,) = _finalize();
-        assertTrue(finalized, "code-less rewards pointer is harmless");
+        assertTrue(finalized, "a payer that answers nothing is harmless");
         assertEq(usdg.balanceOf(keeper), 0, "never paid");
+    }
+
+    /// SEC-31. The reward is a raw call whose failure only means "no bounty", so a code-less pointer would switch every
+    /// bounty off without a revert or a log. The setter refuses it; zero stays the one way to switch bounties off.
+    function test_setKeeperRewards_refusesCodeless() public {
+        address codeless = makeAddr("no code");
+        vm.prank(admin);
+        vm.expectRevert(V2Errors.NoSource.selector);
+        oracle.setKeeperRewards(codeless);
+        assertEq(oracle.keeperRewards(), address(rewards), "pointer unchanged");
+
+        // Positive control: the same address is accepted once it has code, so the refusal above is the code check and
+        // not the role gate or anything else about the address.
+        vm.etch(codeless, hex"00");
+        vm.prank(admin);
+        oracle.setKeeperRewards(codeless);
+        assertEq(oracle.keeperRewards(), codeless, "accepted with code");
+
+        vm.prank(admin);
+        oracle.setKeeperRewards(address(0));
+        assertEq(oracle.keeperRewards(), address(0), "zero still disables");
     }
 
     /// @dev Sweep contracts-c11, part 1. The open-interest gate reads the Clearinghouse's open interest of the whole
@@ -1121,6 +1219,31 @@ contract SettlementOracleResolveTest is SettlementOracleFixture {
         assertEq(price, 1, "any price");
     }
 
+    /// @dev T-479 kept this fallback on purpose. A SINGLE-source market (BUG-04 F3's shape) whose only source is
+    ///      legitimately down for the window never finalizes, and still resolves through adminResolve after
+    ///      RESOLVE_DELAY with no band, because no observed price exists to bound it. F3 is closed at the calendar
+    ///      (ExpiryCalendar.setSpecialExpiry refuses an instant no session can price), not here: the oracle cannot
+    ///      tell this expiry from an F3 one, and bounding it would strand a legitimate one forever.
+    function test_adminResolve_singleSourceAllDown_theFallbackStillResolves() public {
+        address[] memory one = new address[](1);
+        one[0] = address(s0);
+        vm.prank(admin);
+        oracle.setMarket(address(nvda), one, 0, 0, 0);
+        s0.setWindow(false, 0);
+
+        vm.warp(FINALIZABLE);
+        (bool finalized,) = _finalize();
+        assertFalse(finalized, "the only source is down, so nothing finalizes");
+
+        vm.warp(RESOLVABLE);
+        (bool bounded,,) = oracle.resolveBand(address(nvda), E);
+        assertFalse(bounded, "no observed price, so no band");
+        vm.prank(admin);
+        oracle.adminResolve(address(nvda), E, P);
+        (, uint256 price) = oracle.settlementPrice(address(nvda), E);
+        assertEq(price, P, "the admin fallback settled it");
+    }
+
     /// Nobody finalized, but a source answers: adminResolve captures first, so the band still applies.
     function test_adminResolve_capturesBeforeBand() public {
         _useTwo();
@@ -1149,10 +1272,8 @@ contract SettlementOracleResolveTest is SettlementOracleFixture {
         oracle.adminResolve(address(nvda), E, P);
     }
 
-    function test_veto_onlyGuardian_andAlreadyFinal() public {
-        vm.prank(admin);
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
-        oracle.veto(address(nvda), E);
+    function test_veto_strangerRejected_andAlreadyFinal() public {
+        // v8: the fixture wires the admin with GUARDIAN on the manager, so only an unwired stranger is rejected.
         vm.prank(stranger);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         oracle.veto(address(nvda), E);
@@ -1200,13 +1321,11 @@ contract SettlementOracleResolveTest is SettlementOracleFixture {
         assertEq(uint8(_status()), uint8(V2Types.SettlementStatus.Pending), "unchanged");
     }
 
-    function test_constructor_zeroAdminReverts_zeroGuardianGrantsNothing() public {
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
-        new SettlementOracle(address(0), guardian);
-        SettlementOracle o = new SettlementOracle(admin, address(0));
-        assertTrue(o.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin), "admin");
-        assertFalse(o.hasRole(V2Constants.GUARDIAN_ROLE, address(0)), "no zero guardian");
-        assertTrue(oracle.hasRole(V2Constants.GUARDIAN_ROLE, guardian), "fixture guardian");
+    function test_constructor_codelessAuthorityReverts_guardianOnTheManager() public {
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new SettlementOracle(address(0));
+        (bool isGuardian,) = manager.hasRole(V8Roles.GUARDIAN, guardian);
+        assertTrue(isGuardian, "guardian holds GUARDIAN through the manager");
         assertEq(oracle.SETTLEMENT_WINDOW(), 1800, "window");
     }
 }
@@ -1297,12 +1416,36 @@ contract SettlementOracleConfigTest is SettlementOracleFixture {
         emit SettlementOracle.ClearinghouseSet(address(1));
         vm.prank(admin);
         oracle.setClearinghouse(address(1));
+        // A non-zero rewards pointer needs code (SEC-31); this test contract has some.
         vm.expectEmit(address(oracle));
-        emit SettlementOracle.KeeperRewardsSet(address(2));
+        emit SettlementOracle.KeeperRewardsSet(address(this));
         vm.prank(admin);
-        oracle.setKeeperRewards(address(2));
+        oracle.setKeeperRewards(address(this));
         assertEq(oracle.clearinghouse(), address(1), "clearinghouse");
-        assertEq(oracle.keeperRewards(), address(2), "keeperRewards");
+        assertEq(oracle.keeperRewards(), address(this), "keeperRewards");
+    }
+
+    /// SEC-31, closed with a finding rather than a change. A code-less clearinghouse pointer is accepted on purpose,
+    /// unlike {setKeeperRewards}'s: this one is loud where that one was silent. While the pointer has no code the real
+    /// Clearinghouse's pin reverts, so no series of this oracle can be created at all, and nothing degrades quietly.
+    /// POSITIVE CONTROL: restoring the pointer makes the same call pin, so the revert is the pointer and nothing else
+    /// about the expiry or its sources.
+    function test_setClearinghouse_codelessIsAcceptedAndFailsLoud() public {
+        _useTwo();
+        address codeless = makeAddr("clearinghouse with no code");
+        vm.prank(admin);
+        oracle.setClearinghouse(codeless);
+        assertEq(oracle.clearinghouse(), codeless, "accepted: no code check on this setter");
+
+        vm.prank(address(ch));
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        oracle.pin(address(nvda), E);
+        assertEq(oracle.pinnedBy(address(nvda), E), address(0), "nothing pinned while the pointer is wrong");
+
+        vm.prank(admin);
+        oracle.setClearinghouse(address(ch));
+        _pinE();
+        assertEq(oracle.pinnedBy(address(nvda), E), address(ch), "pins once the pointer is a Clearinghouse again");
     }
 
     /// A captured expiry keeps its maxDeviationBps: widening it cannot force a pending disagreement to corroborate, nor
@@ -1381,6 +1524,253 @@ contract SettlementOracleConfigTest is SettlementOracleFixture {
         assertTrue(ok, "within 2 days");
     }
 
+    /*------------------ T-OP-061 (owner ruling SEC-08b/c): past 30 minutes, accuracy is agreement ------------------*/
+
+    /// @dev The default band is 150 bps of the lower price. P +- 1 % is inside it; P +- 2 % is outside it.
+    uint256 internal constant P_AGREES = P + P / 100;
+    uint256 internal constant P_DISAGREES = P + (P * 2) / 100;
+
+    /// @dev A two-source NVDA with a 25 h spotMaxAge, the live rows' shape (heartbeat 24 h + 1 h), so a print that is
+    ///      hours old is inside the OUTER bound and the inner accuracy rule is what decides.
+    function _useTwoLiveAge() internal {
+        vm.prank(admin);
+        oracle.setMarket(address(nvda), _list(address(s0), address(s1)), 0, 0, 25 hours);
+    }
+
+    /// (i) An old print the pool agrees with is spot, and the answer is the PRINT, not the pool. The precondition that
+    ///     the print is past the corroboration bound is asserted, so this cannot pass through step 1.
+    function test_spot_oldPrint_poolAgrees_isOk_andReturnsThePrint() public {
+        _useTwoLiveAge();
+        uint256 printedAt = block.timestamp - 6 hours;
+        assertGt(block.timestamp - printedAt, oracle.SPOT_CORROBORATION_AGE(), "precondition: past the bound");
+        s0.setLatest(true, P, printedAt);
+        s1.setLatest(true, P_AGREES, block.timestamp);
+
+        (uint256 price, uint256 updatedAt) = oracle.spot(address(nvda));
+        assertEq(price, P, "the Chainlink print, corroborated -- never the pool's number");
+        assertEq(updatedAt, printedAt, "the print's own timestamp");
+        (bool ok, uint256 p, uint256 t) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "trySpot ok");
+        assertEq(p, P, "trySpot price is the print");
+        assertEq(t, printedAt, "trySpot timestamp is the print's");
+    }
+
+    /// (ii) An old print the pool disagrees with beyond maxDeviationBps is STALE, whatever the clock says: the market has
+    ///      moved and the print has not. StaleSpot carries the print's timestamp so a caller can see how old it was.
+    function test_spot_oldPrint_poolDisagrees_isStale() public {
+        _useTwoLiveAge();
+        uint256 printedAt = block.timestamp - 6 hours;
+        s0.setLatest(true, P, printedAt);
+        s1.setLatest(true, P_DISAGREES, block.timestamp);
+
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, printedAt));
+        oracle.spot(address(nvda));
+        (bool ok, uint256 p, uint256 t) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "trySpot not ok");
+        assertEq(p + t, 0, "zeros");
+
+        // The band is the market's own maxDeviationBps and it is symmetric: the pool BELOW the print by the same
+        // margin is refused too, and a custom band moves the edge.
+        s1.setLatest(true, P - (P * 2) / 100, block.timestamp);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "below by 2 % is refused under the 150 bps default");
+        vm.prank(admin);
+        oracle.setMarket(address(nvda), _list(address(s0), address(s1)), 300, 0, 25 hours);
+        (ok, p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "the same 2 % agrees under a 300 bps band -- one band, the market's");
+        assertEq(p, P, "still the print");
+    }
+
+    /// (iii) A single-source market keeps today's rule: age against spotMaxAge and nothing else. Both sides of the
+    ///       outer bound, and the boundary itself.
+    function test_spot_oldPrint_singleSource_keepsTheAgeRule() public {
+        vm.prank(admin);
+        oracle.setMarket(address(nvda), _list(address(s0)), 0, 0, 25 hours);
+        uint256 printedAt = block.timestamp - 6 hours;
+        s0.setLatest(true, P, printedAt);
+        (bool ok, uint256 p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "6 h old, within 25 h, no witness needed");
+        assertEq(p, P, "the print");
+
+        s0.setLatest(true, P, block.timestamp - 25 hours);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "exactly spotMaxAge old is fresh");
+
+        uint256 stale = block.timestamp - 25 hours - 1;
+        s0.setLatest(true, P, stale);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, stale));
+        oracle.spot(address(nvda));
+    }
+
+    /// (iii') A two-source market whose source 1 is NOT ok (down, malformed, or simply not answering) falls back to the
+    ///        age rule as well: an unusable witness is the same as no witness, and never a refusal on its own.
+    function test_spot_oldPrint_poolNotOk_fallsBackToTheAgeRule() public {
+        _useTwoLiveAge();
+        uint256 printedAt = block.timestamp - 6 hours;
+        s0.setLatest(true, P, printedAt);
+
+        s1.setLatest(false, P_DISAGREES, block.timestamp);
+        (bool ok, uint256 p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "witness not ok: age rule, 6 h within 25 h");
+        assertEq(p, P, "the print");
+
+        MockOraclePriceSource.Mode[3] memory modes = [
+            MockOraclePriceSource.Mode.Reverts,
+            MockOraclePriceSource.Mode.ShortReply,
+            MockOraclePriceSource.Mode.DirtyOk
+        ];
+        for (uint256 i; i < 3; ++i) {
+            s1.setMode(modes[i]);
+            (ok,,) = oracle.trySpot(address(nvda));
+            assertTrue(ok, "a malformed witness is no witness");
+        }
+        s1.setMode(MockOraclePriceSource.Mode.Normal);
+
+        // But the OUTER bound still holds with no witness: past spotMaxAge is stale.
+        s0.setLatest(true, P, block.timestamp - 25 hours - 1);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "past spotMaxAge with no usable witness is stale");
+    }
+
+    /// (iv) A print within SPOT_CORROBORATION_AGE needs no witness: the pool may disagree, be down, or be absent.
+    function test_spot_youngPrint_isOkRegardlessOfThePool() public {
+        _useTwoLiveAge();
+        uint256 printedAt = block.timestamp - oracle.SPOT_CORROBORATION_AGE();
+        s0.setLatest(true, P, printedAt);
+        s1.setLatest(true, P_DISAGREES, block.timestamp);
+        (bool ok, uint256 p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "exactly 30 min old needs no witness, even a disagreeing one");
+        assertEq(p, P, "the print");
+
+        s1.setMode(MockOraclePriceSource.Mode.Reverts);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "a reverting pool is irrelevant to a young print");
+        s1.setMode(MockOraclePriceSource.Mode.Normal);
+
+        // One second past the bound the witness starts to matter: the same disagreeing pool now refuses it.
+        s0.setLatest(true, P, printedAt - 1);
+        s1.setLatest(true, P_DISAGREES, block.timestamp);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "30 min + 1 s with a disagreeing pool is stale");
+    }
+
+    /*------- T-OP-087: the corroborated path has its own ceiling (MAX_SPOT_MAX_AGE), the uncorroborated one keeps spotMaxAge -------*/
+
+    /// @dev The live rows' shape: spotMaxAgeS 90,000 (25 h) on a dual-source market. A weekend is ~65.5 h.
+    function _useTwoLiveRows() internal {
+        vm.prank(admin);
+        oracle.setMarket(address(nvda), _list(address(s0), address(s1)), 0, 0, 90_000);
+    }
+
+    /// (i) THE WEEKEND CASE the owner ruled on (SEC-21c): a Friday print read on Sunday, 60 h old, past the 25 h
+    ///     spotMaxAge, is spot while the pool agrees with it -- and the answer is the print. Under T-OP-061 as landed
+    ///     this was StaleSpot, which is what T-OP-066's weekend unwind died on.
+    function test_spot_weekendPrint_poolAgrees_isOk_pastSpotMaxAge() public {
+        _useTwoLiveRows();
+        uint256 printedAt = block.timestamp - 60 hours;
+        assertGt(block.timestamp - printedAt, 90_000, "precondition: past the market's spotMaxAge");
+        assertLt(block.timestamp - printedAt, oracle.MAX_SPOT_MAX_AGE(), "precondition: inside the compiled ceiling");
+        s0.setLatest(true, P, printedAt);
+        s1.setLatest(true, P_AGREES, block.timestamp);
+
+        (uint256 price, uint256 updatedAt) = oracle.spot(address(nvda));
+        assertEq(price, P, "the Friday print, corroborated by the pool on Sunday");
+        assertEq(updatedAt, printedAt, "the print's own timestamp");
+        (bool ok, uint256 p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "trySpot ok");
+        assertEq(p, P, "trySpot price is the print");
+    }
+
+    /// (ii) The same 60 h print with a pool that disagrees is stale: the corroborated path is a real test, not a bypass.
+    function test_spot_weekendPrint_poolDisagrees_isStale() public {
+        _useTwoLiveRows();
+        uint256 printedAt = block.timestamp - 60 hours;
+        s0.setLatest(true, P, printedAt);
+        s1.setLatest(true, P_DISAGREES, block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, printedAt));
+        oracle.spot(address(nvda));
+        (bool ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "60 h old and contradicted");
+    }
+
+    /// (iii) THE ABSOLUTE CEILING. A print older than MAX_SPOT_MAX_AGE (4 days) is stale even when the pool agrees:
+    ///       a months-old print must never pass on a coincidental agreement. Exactly 4 days is inside; one second past
+    ///       is outside. The ceiling is the compiled constant, not the market's spotMaxAge.
+    function test_spot_ancientPrint_poolAgrees_isStale_atTheCompiledCeiling() public {
+        _useTwoLiveRows();
+        uint256 ceiling = oracle.MAX_SPOT_MAX_AGE();
+        s1.setLatest(true, P, block.timestamp);
+
+        s0.setLatest(true, P, block.timestamp - ceiling);
+        (bool ok, uint256 p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "exactly MAX_SPOT_MAX_AGE old, corroborated: ok");
+        assertEq(p, P, "the print");
+
+        uint256 ancient = block.timestamp - ceiling - 1;
+        s0.setLatest(true, P, ancient);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, ancient));
+        oracle.spot(address(nvda));
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "one second past the compiled ceiling, however hard the pool agrees");
+
+        s0.setLatest(true, P, block.timestamp - 5 days);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "5 days old with an agreeing pool is stale");
+    }
+
+    /// (iv) UNCHANGED: a single-source market keeps the spotMaxAge clock -- 26 h is stale, 24 h is fresh under the live
+    ///      25 h row -- and no pool can extend it because there is none.
+    function test_spot_singleSource_keepsSpotMaxAge_26hStale_24hOk() public {
+        vm.prank(admin);
+        oracle.setMarket(address(nvda), _list(address(s0)), 0, 0, 90_000);
+        s0.setLatest(true, P, block.timestamp - 24 hours);
+        (bool ok, uint256 p,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "24 h < 25 h: ok");
+        assertEq(p, P, "the print");
+
+        uint256 stale = block.timestamp - 26 hours;
+        s0.setLatest(true, P, stale);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, stale));
+        oracle.spot(address(nvda));
+    }
+
+    /// (iv') UNCHANGED for a dual-source market whose pool is DOWN: the uncorroborated path keeps spotMaxAge, so a
+    ///       60 h print with an unusable witness is stale (c01: the 25 h uncorroborated window is what the owner signed).
+    function test_spot_weekendPrint_poolDown_isStale_theUncorroboratedWindowIsUnchanged() public {
+        _useTwoLiveRows();
+        uint256 printedAt = block.timestamp - 60 hours;
+        s0.setLatest(true, P, printedAt);
+        s1.setLatest(false, P, block.timestamp);
+        (bool ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "pool not ok: 60 h > 25 h, stale");
+        s1.setMode(MockOraclePriceSource.Mode.Reverts);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertFalse(ok, "pool reverting: same");
+        s1.setMode(MockOraclePriceSource.Mode.Normal);
+
+        // and a 24 h print with the pool down is still fine: that is the pre-T-OP-061 rule, byte for byte.
+        s0.setLatest(true, P, block.timestamp - 24 hours);
+        s1.setLatest(false, P, block.timestamp);
+        (ok,,) = oracle.trySpot(address(nvda));
+        assertTrue(ok, "24 h with no witness: the old age rule");
+    }
+
+    /// The pinned value the corroborated ceiling rests on: MAX_SPOT_MAX_AGE is four days, and it sits above the live
+    /// rows' 25 h and above a weekend plus a Monday holiday (~89 h).
+    function test_spot_compiledCeiling_isFourDays_andCoversALongWeekend() public view {
+        assertEq(oracle.MAX_SPOT_MAX_AGE(), 4 days, "the compiled ceiling");
+        assertGt(oracle.MAX_SPOT_MAX_AGE(), 90_000, "above the live rows' spotMaxAgeS");
+        assertGt(oracle.MAX_SPOT_MAX_AGE(), 89 hours, "above a weekend plus a Monday holiday");
+    }
+
+    /// Consumers read the same function: the strike band at series creation and the AutoRoller's plan both go through
+    /// trySpot, so an old-but-corroborated print prices a roll and an old-and-contradicted one does not. Pinned here
+    /// on the oracle's own surface; the consumers are named in the ledger entry.
+    function test_spot_corroborationAge_isThirtyMinutes_theOwnersNumber() public view {
+        assertEq(oracle.SPOT_CORROBORATION_AGE(), 30 minutes, "SEC-08c: the owner's number");
+        assertLt(oracle.SPOT_CORROBORATION_AGE(), oracle.DEFAULT_SPOT_MAX_AGE(), "inner bound sits inside the outer");
+    }
+
     function test_spot_pausedFlag() public {
         _useTwo();
         s0.setLatest(true, P, block.timestamp);
@@ -1403,7 +1793,8 @@ contract SettlementOracleConfigTest is SettlementOracleFixture {
         oracle.spot(address(usdg));
     }
 
-    /// Only source 0 serves spot; not ok, malformed, zero, future-stamped answers have no source.
+    /// Only source 0 serves spot's PRICE (source 1 can only corroborate an old print, T-OP-061, and never replaces a
+    /// missing or bad source 0); not ok, malformed, zero, future-stamped answers have no source.
     function test_spot_sourceZeroOnly_andBadAnswers() public {
         _useTwo();
         vm.expectRevert(V2Errors.NoSource.selector);
@@ -1614,5 +2005,128 @@ contract SettlementOraclePropertyTest is SettlementOracleFixture {
             assertFalse(anyPairAgrees, "uncorroborated only when nothing agrees");
             assertEq(idx, firstOk, "uncorroborated candidate is the first ok source");
         }
+    }
+}
+
+/// @notice T-502. Pins the two configuration properties the half-day settlement argument silently depends on.
+/// @dev WHAT THIS ROW IS ABOUT. T-479 refused a special expiry whose settlement window falls outside a regular
+///      session, which closed the weekend/holiday/off-hours surface. T-495 then established that the remaining
+///      half-day residual is NOT an unbounded {SettlementOracle.adminResolve} today, for two reasons that are
+///      CONFIGURATION rather than code: every market's `maxStale` is {ChainlinkFeedSource.DEFAULT_MAX_STALE}, which
+///      is far wider than the half-day gap, so the Chainlink source is still "ok" on a half-day window and the band
+///      at {SettlementOracle._band} stays bounded; and no registered market is single-source, so one stale source
+///      cannot empty the ok set on its own. What remains is a settlement priced from a flat pre-close print - bad,
+///      bounded, and the accepted-risk half that {test_doc_whatRemainsUnfixed} states in terms.
+///
+///      THE UNBOUNDED CASE RETURNS under either of two config changes, and NEITHER IS GUARDED:
+///        (A) `maxStale` lowered below the half-day gap. {ChainlinkFeedSource.MIN_MAX_STALE} is the only floor and it
+///            sits BELOW the gap, so this is reachable by a CONFIG_ADMIN {ChainlinkFeedSource.setFeed}.
+///        (B) a single-source market. {SettlementOracle.setMarket} sets no minimum source count.
+///      These two tests are the guards that do not otherwise exist. They assert the PROPERTY, never the current
+///      values, so adding a market cannot silently pass them and changing a default cannot silently break them.
+///
+///      THE GAP IS DERIVED, NOT TYPED, because getting it wrong is the whole risk. An early close is 13:00 New York;
+///      {ExpiryCalendar} has no early-close concept and anchors every expiry at the 16:00 close, so a half-day
+///      expiry's window is [16:00 - SETTLEMENT_WINDOW, 16:00] = [15:30, 16:00] while the last print is at 13:00.
+///      {ChainlinkFeedSource} records not-ok when `r.updatedAt + maxStale < start`, so the staleness a market must
+///      tolerate to stay ok is start - updatedAt = (16:00 - 13:00) - SETTLEMENT_WINDOW = 2.5 h.
+contract SettlementOracleHalfDayConfigTest is SettlementOracleFixture {
+    /// @dev New York local time of day of an NYSE early close and of the regular close, seconds.
+    uint256 internal constant EARLY_CLOSE_LOCAL = 13 hours;
+    uint256 internal constant REGULAR_CLOSE_LOCAL = 16 hours;
+
+    ChainlinkFeedSource internal chainlink;
+    address internal feedA = makeAddr("chainlinkFeedA");
+    address internal feedB = makeAddr("chainlinkFeedB");
+
+    /// @dev The staleness a market's feed must tolerate for its half-day window to hold an ok price. Derived from
+    ///      the session times and {V2Constants.SETTLEMENT_WINDOW}; never a literal, so a change to the window moves
+    ///      this with it.
+    function _halfDayGap() internal pure returns (uint256) {
+        return (REGULAR_CLOSE_LOCAL - EARLY_CLOSE_LOCAL) - V2Constants.SETTLEMENT_WINDOW;
+    }
+
+    /// @dev The markets this suite treats as the registered set, each with the ticker its failure message names.
+    function _tickers() internal view returns (string[2] memory names, address[2] memory assets) {
+        names = ["NVDA", "TSLA"];
+        assets = [address(nvda), address(tsla)];
+    }
+
+    function setUp() public override {
+        super.setUp();
+        chainlink = new ChainlinkFeedSource(address(manager));
+        _wire(address(chainlink), "ChainlinkFeedSource", admin, 0);
+        vm.etch(feedA, hex"00");
+        vm.etch(feedB, hex"00");
+
+        // Registered the way script/v2/RegisterMarkets.s.sol registers: maxStale is the contract default, never a
+        // registry value, and a market lists the pool source alongside Chainlink whenever it has a pool.
+        vm.startPrank(admin);
+        chainlink.setFeed(address(nvda), feedA, chainlink.DEFAULT_MAX_STALE(), chainlink.DEFAULT_MAX_ROUND_JUMP_BPS());
+        chainlink.setFeed(address(tsla), feedB, chainlink.DEFAULT_MAX_STALE(), chainlink.DEFAULT_MAX_ROUND_JUMP_BPS());
+        oracle.setMarket(address(nvda), _list(address(s0), address(s1)), 0, 0, 0);
+        oracle.setMarket(address(tsla), _list(address(s0), address(s1)), 0, 0, 0);
+        vm.stopPrank();
+    }
+
+    /// @dev PIN (A). No registered market tolerates less staleness than a half-day window demands. Break this and a
+    ///      half-day expiry on that market has no ok source, {SettlementOracle._band} returns unbounded, and
+    ///      {SettlementOracle.adminResolve} accepts any price in (0, MAX_PRICE].
+    function test_pin_noMarketMaxStaleBelowTheHalfDayGap() public view {
+        (string[2] memory names, address[2] memory assets) = _tickers();
+        for (uint256 i; i < assets.length; ++i) {
+            (, uint32 stale,) = chainlink.feeds(assets[i]);
+            assertGe(
+                uint256(stale),
+                _halfDayGap(),
+                string.concat(names[i], ": maxStale is below the half-day gap, so its half-day window has no ok price")
+            );
+        }
+    }
+
+    /// @dev PIN (B). No registered market is single-source. Break this and one stale feed empties the ok set by
+    ///      itself, with the same unbounded result.
+    function test_pin_noMarketIsSingleSource() public view {
+        (string[2] memory names, address[2] memory assets) = _tickers();
+        for (uint256 i; i < assets.length; ++i) {
+            (address[] memory sources,,,) = oracle.marketConfig(assets[i]);
+            assertGe(
+                sources.length,
+                2,
+                string.concat(names[i], ": single-source market, so one stale feed leaves no ok price at all")
+            );
+        }
+    }
+
+    /// @dev CRITERIA 4 AND 5, executable so they cannot rot out of the file. States what the two pins DO NOT fix and
+    ///      the bound nobody has closed. This test asserts the arithmetic of the accepted risk, not a guard: with both
+    ///      pins green a half-day expiry still settles from a print taken at the 13:00 early close, which is
+    ///      REGULAR_CLOSE_LOCAL - EARLY_CLOSE_LOCAL = 3 h old at the 16:00 expiry and _halfDayGap() = 2.5 h old at the
+    ///      window start. That price is BOUNDED - the source is still ok, so {SettlementOracle._band} bounds
+    ///      {SettlementOracle.adminResolve} - it is simply stale. Bounded and stale is the accepted-risk half and it
+    ///      must not read as fixed because two tests above are green.
+    ///
+    ///      THE BOUND NOBODY HAS CLOSED, carried forward from T-479 and T-495 verbatim in substance: nobody has shown
+    ///      that a live Chainlink Stock Token feed actually goes stale between 13:00 and 14:30 on a half day. Every
+    ///      statement here about what a feed does in that interval is an inference from {ChainlinkFeedSource}'s rule,
+    ///      not an observation of a live feed. Do not let it read as established.
+    function test_doc_whatRemainsUnfixed() public pure {
+        assertEq(
+            REGULAR_CLOSE_LOCAL - EARLY_CLOSE_LOCAL,
+            3 hours,
+            "a half-day settlement still prices from a print 3 h old at expiry: stale, bounded, and NOT fixed here"
+        );
+        assertEq(_halfDayGap(), 2.5 hours, "and 2.5 h old at the window start, which is what the pins keep ok");
+    }
+
+    /// @dev The floor is BELOW the gap, which is why pin (A) is a pin and not a restatement of a guard that exists.
+    ///      Asserted rather than described so that raising {ChainlinkFeedSource.MIN_MAX_STALE} - an owner decision,
+    ///      and the forbidden fix on this row - cannot happen without this test saying so.
+    function test_theStalenessFloorDoesNotCoverTheHalfDayGap() public view {
+        assertLt(
+            uint256(chainlink.MIN_MAX_STALE()),
+            _halfDayGap(),
+            "MIN_MAX_STALE now covers the half-day gap: pin (A) is unreachable and this row's premise has changed"
+        );
     }
 }

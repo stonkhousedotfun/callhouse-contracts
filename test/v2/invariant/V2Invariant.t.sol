@@ -3,6 +3,8 @@ pragma solidity 0.8.28;
 
 import {V2IntegrationBase} from "../integration/V2IntegrationBase.t.sol";
 import {V2Handler} from "./V2Handler.sol";
+import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
+import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Ids} from "../../../src/v2/interfaces/V2Ids.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MockOraclePriceSource} from "../../../src/v2/mocks/MockOraclePriceSource.sol";
@@ -10,10 +12,13 @@ import {MockRoundFeed} from "../../../src/v2/mocks/MockRoundFeed.sol";
 import {MockUniV3Pool} from "../../../src/v2/mocks/MockUniV3Pool.sol";
 
 /// @notice An oracle that went down right after its series were created: {pin} (which createSeries needs) is a no-op,
-///         every other call reverts. The handler points NEW series at it to show that a series whose oracle never
-///         answers still closes, and that nothing else depends on it.
+///         {SETTLEMENT_WINDOW} mirrors the real oracle so the Clearinghouse accepts its shape, and every price call
+///         reverts. The handler points NEW series at it to show that a series whose oracle never answers still closes,
+///         and that nothing else depends on it.
 contract RevertingOracle {
     error OracleDown();
+
+    uint32 public constant SETTLEMENT_WINDOW = V2Constants.SETTLEMENT_WINDOW;
 
     function pin(address, uint40) external pure {}
 
@@ -102,7 +107,7 @@ contract V2InvariantTest is V2IntegrationBase {
         V2Types.MarketConfig memory cfg = _nvdaMarket();
         cfg.mintFeePpm = MINT_FEE_PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
         traders = [alice, bob, carol, mm];
         for (uint256 i; i < 4; ++i) {
             _onboard(traders[i]);
@@ -150,8 +155,17 @@ contract V2InvariantTest is V2IntegrationBase {
         handler.place(2, 5, 2, 99, 200, 0, 0); // carol AskWrite, Fri call 230 at 1.00
         handler.place(1, 1, 0, 149, 100, 0, 0); // bob Bid, Thu call 220 at 1.50
         handler.place(3, 7, 0, 49, 100, 0, 0); // mm Bid, Mon put 210 at 0.50
-        handler.mint(3, 5, 50, 3, 0); // mm writes 50 Fri calls 230 to itself
-        handler.place(3, 5, 1, 119, 50, 0, 0); // and resells them at 1.20
+        // mm writes 50 Fri calls 230 and ALICE buys them: `to = 3` is odd, so the buyer is actor (3 + 1) % 4 = alice
+        // (the v7 comment said "to itself"; the book cannot mint a pair to its own writer). Pinned by
+        // {test_fixture_everyMintGoesThroughTheBookAndBothGatesAreLive}: alice holds the 50 longs, mm the 50 shorts.
+        handler.mint(3, 5, 50, 3, 0);
+        // T-OP-016: this line is a NO-OP and always was. It asks mm to rest an AskResale of the 50 longs, but mm holds
+        // none -- alice does -- so {V2Handler.place} returns at its `have == 0` check before any call is made. No resting
+        // AskResale exists when a campaign starts; resale fills come only from asks the campaign itself places (the walk
+        // still reaches them: 14 fills at c851f8f3). Left as it was rather than re-seeded as `place(0, ...)`, because
+        // changing the starting world changes every campaign's trajectory and that is a decision for a full run, not
+        // for a row about the mint gate.
+        handler.place(3, 5, 1, 119, 50, 0, 0);
 
         targetContract(address(handler));
         bytes4[] memory selectors = new bytes4[](29);
@@ -237,8 +251,103 @@ contract V2InvariantTest is V2IntegrationBase {
     }
 
     /*//////////////////////////////////////////////////////////////
+                   INTERFACE_VERSION 8 (V8-DESIGN §12)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev V8-DESIGN §12: no path moves LOCKED collateral except settle, redeem and close. The campaign's own
+    ///      backing and solvency assertions are what prove it -- locked collateral that leaked would show up as a
+    ///      series no longer fully backed -- so this names the design clause and delegates rather than inventing a
+    ///      second, weaker measurement of the same thing.
+    function invariant_v8_lockedCollateralMovesOnlyOnSettleRedeemOrClose() public view {
+        _assertBacked();
+        _assertSolvent();
+    }
+
+    /// @dev V8-DESIGN §12: protocol-owned funds exit only to `treasury`. In v8 the fee lanes do not pay an EOA at
+    ///      all -- both the Clearinghouse and the book pay the FeeSplitter -- so the check is that no EOA fee
+    ///      recipient of the v7 shape has been paid anything across the whole campaign. `chFees` is kept in the
+    ///      fixture for exactly this assertion.
+    function invariant_v8_noEoaIsAFeeRecipient() public view {
+        assertEq(usdg.balanceOf(chFees), 0, "an EOA was paid a USDG fee");
+        assertEq(nvda.balanceOf(chFees), 0, "an EOA was paid an NVDA fee");
+        assertEq(ch.free(chFees, address(usdg)), 0, "an EOA holds a USDG fee credit");
+        assertEq(ch.free(chFees, address(nvda)), 0, "an EOA holds an NVDA fee credit");
+    }
+
+    /// @dev V8-DESIGN §12: `mint` reverts for any caller outside the minter allowlist. The handler's {attack}
+    ///      probe calls `ch.mint` directly as a non-minter on every campaign it runs, and invariant 5 requires every
+    ///      one of those attempts to have reverted without moving the victim's balances.
+    function invariant_v8_mintRevertsOutsideTheMinterAllowlist() public view {
+        assertEq(handler.inv5Violations(), 0, handler.lastInv5());
+        assertFalse(ch.isMinter(address(handler)), "the handler must never be a minter");
+    }
+
+    /// @dev V8-DESIGN §12: with no discount module and no payout adapter, behaviour is byte-identical to the base
+    ///      path. The fixture starts with both seams empty. The handler may attach its own 10% {MockFeeDiscount}
+    ///      (so the book-fee invariant can see a discounted take); any OTHER module, or any payout adapter, is a
+    ///      violation -- that is the pin that the campaign has not quietly grown a second path.
+    function invariant_v8_noDiscountModuleAndNoAdapterIsTheBasePath() public view {
+        address dm = book.discountModule();
+        assertTrue(dm == address(0) || dm == address(handler.discount()), "unknown fee-discount module");
+        assertEq(ch.payoutAdapter(), address(0), "a payout adapter is configured");
+    }
+
+    /*//////////////////////////////////////////////////////////////
                          THE SUITE IS NOT VACUOUS
     //////////////////////////////////////////////////////////////*/
+
+    /// T-OP-016. THE ONE ROUTE EVERY MINT IN THIS CAMPAIGN TAKES, AND THE TWO FIXTURE FACTS IT LIVES ON. The handler
+    /// never calls `ch.mint` itself (its {V2Handler.attack} probe does, as a non-minter, to be refused): an actor rests
+    /// an AskWrite, another takes it, and the BOOK calls `Clearinghouse.mint` -- which is gated twice, `isMinter[msg.sender]`
+    /// at `Clearinghouse.sol:641` and `msg.sender == writer || isOperator[writer][msg.sender]` at `:642`. So the whole
+    /// campaign mints only because `V2IntegrationBase.t.sol:172` put the book on the allowlist and `_onboard` had every
+    /// actor name the book its operator, and neither fact is stated anywhere in this file.
+    ///
+    /// WHY THAT NEEDS A TEST OF ITS OWN, MEASURED RATHER THAN ARGUED: drop either grant and NOTHING IN THE CAMPAIGN
+    /// REVERTS. The book delivers a mint inside `try`/`catch` (`OrderBook.sol:1171`), so a `NotMinter()` or
+    /// `NotAuthorized()` from the Clearinghouse is swallowed, the fill is undone, and `take` returns normally having
+    /// filled nothing; the handler's `_expect("mint", true, ok, ret)` sees `ok` and records no surprise. With
+    /// `setMinter(book)` flipped to false at c851f8f3, ALL FOURTEEN invariant campaigns passed at 256 runs, 16384
+    /// calls, `reverts: 0` -- backing, solvency, rent, settlement, the v8 mint-allowlist invariant included -- over a
+    /// world that never minted once. The only thing that went red was {test_handler_walkReachesEveryStage}, and it went
+    /// red at "fills: 0", four stages away from the gate that had moved. So a NotMinter in this suite is not a red to
+    /// repair; it is structurally invisible, and the campaign's answer to it is fourteen greens. This pins both gates,
+    /// in the order the contract checks them, so that rewiring reds HERE with the error's name and the fixture line,
+    /// and pins that the setUp mint was a real mint and not a silent no-op.
+    ///
+    /// The row that produced this was cut on a phantom: a tree-wide log parse charged forge's closing recap to this suite
+    /// and reported 35 `NotMinter()` reds in a file that has 16 tests. At c851f8f3 all 16 pass with `reverts: 0` on every
+    /// campaign. There was never a NotMinter red here to repair; this is the guard that keeps it that way.
+    function test_fixture_everyMintGoesThroughTheBookAndBothGatesAreLive() public {
+        // Gate 1, `:641`: the book is a minter; no actor is, and the handler never is.
+        assertTrue(ch.isMinter(address(book)), "the book must be a minter or the campaign cannot mint");
+        assertFalse(ch.isMinter(address(handler)), "the handler must never be a minter");
+        for (uint256 i; i < 4; ++i) {
+            assertFalse(ch.isMinter(traders[i]), "no actor is a minter");
+            // Gate 2, `:642`: every actor named the book its operator, in `_onboard`.
+            assertTrue(ch.isOperator(traders[i], address(book)), "every actor must have named the book its operator");
+        }
+
+        // Both gates probed directly, in the order the contract checks them. An actor is refused at the FIRST gate before
+        // the second is consulted. This test contract IS a minter (`V2IntegrationBase.t.sol:171`) and is refused at the
+        // SECOND, because no actor ever named it. Swap the two expectations and both probes go red.
+        uint256 longId = handler.seriesAt(2); // Fri 09-11 call 230, the series the setUp mint used
+        vm.prank(alice);
+        vm.expectRevert(V2Errors.NotMinter.selector);
+        ch.mint(longId, 1, alice, alice);
+        assertFalse(ch.isOperator(alice, address(this)), "the second probe needs a minter alice has NOT authorised");
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        ch.mint(longId, 1, alice, alice);
+
+        // And the route is live: the setUp's `handler.mint(3, 5, 50, 3, 0)` was a REAL book mint. mm (actor 3) wrote,
+        // alice (actor (3 + 1) % 4) bought, and the book minted the pair out of mm's free collateral. A fixture that
+        // silently stopped minting would leave `nMints` at 0 and both balances at 0 without a single revert.
+        assertEq(handler.nMints(), 1, "the setUp mint did not mint");
+        assertEq(handler.unexpectedReverts(), 0, handler.lastSurprise());
+        assertEq(ch.balanceOf(alice, longId), 50, "the buyer holds the 50 longs the setUp minted");
+        assertEq(ch.balanceOf(mm, V2Ids.shortIdOf(longId)), 50, "the writer holds the 50 shorts");
+        assertEq(ch.balanceOf(mm, longId), 0, "the writer holds no longs, so the setUp's resale line rests nothing");
+    }
 
     /// A fixed pseudo-random walk through the same selectors: 16 episodes of 64 calls, each from the setUp state like
     /// one fuzz run, with every invariant checked every 16 calls. It must reach every stage the invariants are
@@ -566,10 +675,32 @@ contract V2InvariantTest is V2IntegrationBase {
                 if (o.kind == BID && !o.cancelled) escrow += uint256(o.price) * (o.units - o.filled) / 100;
             }
         }
+        // WHO CAN HOLD `owed`, DERIVED FROM THE CONTRACT RATHER THAN LISTED FROM MEMORY. Every credit goes through
+        // `OrderBook._payOrOwe` (src/v2/OrderBook.sol:1211-1213), and its callers pass exactly four kinds of
+        // address: a maker (:323, :363, :395), `ex.payees[i]` which is also a maker (:471), the take's
+        // `p.recipient` (:468), and `feeRecipient` (:473). The first three are always one of `traders`. The
+        // FOURTH IS THE BOOK'S OWN FEE RECIPIENT AND THIS SUM DID NOT INCLUDE IT.
+        //
+        // T-INV5 FOUND THIS THE HARD WAY. Once the handler walk got past the mint stage it reached fills whose
+        // protocol fee could not be transferred, and B1 failed 4433400 != 4272565 -- the book holding 160_835 base
+        // units that this assertion could not attribute. The handler's own `_owedTotal` (V2Handler.sol:1516-1521)
+        // ALREADY summed `ch.feeRecipient()` alongside the actors, so two checks over the same quantity disagreed
+        // about who could hold it, and the shorter one was here.
+        //
+        // AND THE STRUCTURAL POINT, because this will happen again: `owed` is a plain mapping and is NOT
+        // ENUMERABLE, so this assertion can only ever compare against a HAND-LISTED set of addresses. Anything
+        // credited to an address missing from that list is invisible to it. That is the same "a check that cannot
+        // see its subject" shape this suite exists to catch, sitting inside the check. It fails loudly rather than
+        // silently only because the balance side of the equality is total. Any new payee address added to
+        // `_payOrOwe`'s callers must be added here and to `_owedTotal` in the same change.
         uint256 owed = book.owed(treasury) + book.owed(keeper);
         for (uint256 i; i < 4; ++i) {
             owed += book.owed(traders[i]);
         }
+        address bookFees = book.feeRecipient();
+        if (bookFees != treasury && bookFees != keeper) owed += book.owed(bookFees);
+        address houseFees = ch.feeRecipient();
+        if (houseFees != treasury && houseFees != keeper && houseFees != bookFees) owed += book.owed(houseFees);
         assertEq(usdg.balanceOf(address(book)), escrow + owed, "B1: book USDG == bid escrow + owed");
     }
 

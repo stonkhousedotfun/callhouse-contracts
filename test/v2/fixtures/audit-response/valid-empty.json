@@ -1,0 +1,6 @@
+{
+  "interfaceVersion": 8,
+  "auditor": null,
+  "packetShas": { "contracts": null, "app": null, "site": null, "docs": null },
+  "findings": []
+}

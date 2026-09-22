@@ -8,7 +8,7 @@ pragma solidity ^0.8.28;
 ///      and pays in kind on any failure. The route fee is this adapter's own {routeFeeBps} answer, read with a gas-capped staticcall and
 ///      clamped to MAX_ROUTE_FEE_BPS (a failed or short read counts as 0), so a bad adapter can cost a holder at most
 ///      min(maxPayoutSlippageBps + MAX_ROUTE_FEE_BPS, MAX_PAYOUT_SLIPPAGE_CEIL_BPS) of one payout (INTERFACE_VERSION
-///      6). Per-asset routes are DEFAULT_ADMIN_ROLE implementation surface.
+///      6). Per-asset routes are CONFIG_ADMIN (24 h) and are frozen in IPayoutRouter from INTERFACE_VERSION 8; this interface itself is unchanged, which is why the Clearinghouse needs no edit to route over Uniswap v4.
 interface IPayoutAdapter {
     /// @notice Pulls `amountIn` of `asset` from the caller, swaps it to USDG and sends the USDG to `to`.
     /// @dev Anyone (the Clearinghouse is the intended caller; ERC-20 approval to the adapter). Uses the configured

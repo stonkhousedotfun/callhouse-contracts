@@ -9,6 +9,7 @@ import {IUiMultiplier} from "../../../src/v2/oracle/DataStreamsDeps.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {IPriceSource} from "../../../src/v2/interfaces/IPriceSource.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {MockVerifierProxy} from "../../../src/v2/mocks/MockVerifierProxy.sol";
 
 /// @notice DataStreamsSource: v11 decoding (against Solidity's own decoder), every submit rule (verification, feed id,
@@ -58,7 +59,9 @@ contract DataStreamsSourceTest is BaseV2Test {
     }
 
     function _deployCore() internal override {
-        src = new DataStreamsSource(admin, address(proxy));
+        _deployManager();
+        src = new DataStreamsSource(address(manager), address(proxy));
+        _wire(address(src), "DataStreamsSource", admin, 0);
         vm.startPrank(admin);
         src.setFeed(address(nvda), NVDA_FEED_ID);
         src.setFeed(address(tsla), TSLA_FEED_ID);
@@ -576,9 +579,18 @@ contract DataStreamsSourceTest is BaseV2Test {
         assertEq(price, 322_685_184);
     }
 
-    /// The multiplier is read when each report is submitted: a decrease (2.0 -> 1.0, as WEEK did on chain) changes new
-    /// observations only, and a window spanning it averages the two token prices.
-    function test_multiplier_decreaseMidWindow() public {
+    /// SEC-20. The multiplier is read when each report is submitted, so a decrease (2.0 -> 1.0, as WEEK did on
+    /// chain) changes new observations only -- and a window spanning it holds prices in TWO denominations.
+    ///
+    /// THIS TEST ASSERTED THE DEFECT UNTIL SEC-20. It previously ended `assertTrue(ok)` and `assertEq(price,
+    /// 150e6)`: the mean of 200.00 and 100.00, a number that is neither the pre-action price nor the post-action
+    /// price and that would have finalised silently. The blend is not a rounding artefact -- it is half the
+    /// multiplier change -- and nothing downstream could tell it from an ordinary price. The window now refuses.
+    ///
+    /// WHAT DID NOT CHANGE, and is still asserted below: stored observations keep the multiplier they were
+    /// submitted with, and {latest} still answers with the newest regime's price. The fix is at the window, not
+    /// at the observation.
+    function test_multiplier_decreaseMidWindow_nowRefusesInsteadOfBlending() public {
         nvda.setUiMultiplier(2e18);
         _observeSeries(S, 5, 180, 100e6); // S .. S+720 at 200.00 per token
         (, uint256 before,) = src.latest(address(nvda));
@@ -593,10 +605,45 @@ contract DataStreamsSourceTest is BaseV2Test {
         assertEq(after_, 100e6);
 
         _seal(E);
-        // 200.00 over [S, S+900) = 900 s, 100.00 over [S+900, E] = 900 s -> 150.00
+        // WAS: 200.00 over [S, S+900) and 100.00 over [S+900, E] -> 150.00, returned as ok.
         (bool ok, uint256 price) = _window();
-        assertTrue(ok);
-        assertEq(price, 150e6);
+        assertFalse(ok, "a window that straddles a multiplier change must refuse, not blend");
+        assertEq(price, 0, "a refused window carries no price");
+
+        // AND THE REFUSAL REACHES THE THING THAT MATTERS: nothing is recorded for the expiry, so this source
+        // produces no settlement price at all rather than a plausible wrong one.
+        assertFalse(src.record(address(nvda), E), "record must decline a mixed window");
+        (uint128 recorded,,) = src.snapshots(address(nvda), E);
+        assertEq(recorded, 0, "no snapshot was written");
+    }
+
+    /// THE CONTROL. A window entirely inside one multiplier regime still prices exactly as before.
+    /// @dev Without this, the refusal above is satisfied by a window that refuses EVERYTHING, which is the
+    ///      failure mode of a guard that over-fires -- and the one that would quietly stop settlement working.
+    function test_multiplier_windowInsideOneRegimeStillPrices() public {
+        nvda.setUiMultiplier(2e18);
+        _observeSeries(S, 11, 180, 100e6); // the whole window at 200.00 per token, one regime throughout
+        _seal(E);
+
+        (bool ok, uint256 price) = _window();
+        assertTrue(ok, "one regime, one denomination, an ordinary window");
+        assertEq(price, 200e6, "and the price is the regime's price, unchanged by SEC-20");
+    }
+
+    /// A multiplier that is READ AGAIN but has not moved is not a new regime.
+    /// @dev The epoch is bumped on a CHANGE, not on a read. A guard that treated every submit as a new regime
+    ///      would refuse every window with more than one observation -- i.e. all of them.
+    function test_multiplier_unchangedAcrossTheWindowIsOneRegime() public {
+        nvda.setUiMultiplier(1.05e18);
+        _observeSeries(S, 5, 180, 100e6);
+        nvda.setUiMultiplier(1.05e18); // set again, same value
+        _observeSeries(S + 900, 6, 180, 100e6);
+        _seal(E);
+
+        (bool ok,) = _window();
+        assertTrue(ok, "re-reading the same multiplier is not a corporate action");
+        (, uint16 epoch) = src.multiplierState(address(nvda));
+        assertEq(epoch, 0, "and the regime counter did not move");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -896,14 +943,15 @@ contract DataStreamsSourceTest is BaseV2Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_admin_constructor() public {
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vm.expectRevert(V2Errors.NoSource.selector);
         new DataStreamsSource(address(0), address(proxy));
         vm.expectRevert(V2Errors.NoSource.selector);
-        new DataStreamsSource(admin, makeAddr("eoaProxy"));
+        new DataStreamsSource(address(manager), makeAddr("eoaProxy"));
 
-        DataStreamsSource fresh = new DataStreamsSource(admin, address(proxy));
+        DataStreamsSource fresh = new DataStreamsSource(address(manager), address(proxy));
         assertEq(fresh.verifierProxy(), address(proxy));
-        assertTrue(fresh.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin));
+        (bool isConfigAdmin,) = manager.hasRole(V8Roles.CONFIG_ADMIN, admin);
+        assertTrue(isConfigAdmin, "admin is the wired config admin");
         (bool ok,,) = fresh.latest(address(nvda));
         assertFalse(ok, "disabled until a feed is set");
     }
@@ -930,17 +978,15 @@ contract DataStreamsSourceTest is BaseV2Test {
         vm.stopPrank();
     }
 
-    /// @dev The source's own admin calls revert NotAuthorized, but it does not override _checkRole, so the inherited
-    ///      grantRole and revokeRole keep OpenZeppelin's error (V2-ARCHITECTURE §2.1; sweep contracts-c25).
-    function test_admin_grantRole_keepsOpenZeppelinsError() public {
-        bytes memory unauthorized = abi.encodeWithSelector(
-            IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, V2Constants.DEFAULT_ADMIN_ROLE
-        );
+    /// @dev v8: the source carries no role table at all (Managed, not AccessControl). A stranger cannot grant or
+    ///      revoke anything on the source; configuration is gated by the manager, which reverts NotAuthorized.
+    function test_admin_noRoleSurfaceOnTheSource() public {
+        assertEq(src.authority(), address(manager), "the manager is the authority");
         vm.startPrank(stranger);
-        vm.expectRevert(unauthorized);
-        src.grantRole(V2Constants.DEFAULT_ADMIN_ROLE, stranger);
-        vm.expectRevert(unauthorized);
-        src.revokeRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        src.setFeed(address(nvda), AAPL_FEED_ID);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        src.setOracle(makeAddr("oracle"), true);
         vm.stopPrank();
     }
 
@@ -1114,14 +1160,19 @@ contract DataStreamsSourceTest is BaseV2Test {
         uint256 start = E;
         uint256[] memory times = new uint256[](n);
         uint256[] memory prices = new uint256[](n);
+        // SEC-20: ONE MULTIPLIER FOR THE WHOLE WINDOW, fuzzed per run rather than per observation. This test
+        // exists to check the weighted-mean reference against the contract, and after SEC-20 a window whose
+        // observations span more than one multiplier regime REFUSES rather than averaging -- so varying the
+        // multiplier per observation (as this did) would make every run exercise the refusal and never the
+        // arithmetic. The refusal has its own coverage below and in the three deterministic cases above.
+        uint256 multiplier = bound(uint256(keccak256(abi.encode(seed, "mult"))), 0.5e18, 3e18);
+        nvda.setUiMultiplier(multiplier);
         uint256 t = start + startOffset;
         for (uint256 i; i < n; ++i) {
             if (i > 0) t += bound(uint256(keccak256(abi.encode(seed, i, "gap"))), 30, 300);
             uint256 equity = bound(uint256(keccak256(abi.encode(seed, i, "price"))), 1e6, 5000e6);
-            uint256 m = bound(uint256(keccak256(abi.encode(seed, i, "mult"))), 0.5e18, 3e18);
-            nvda.setUiMultiplier(m);
             times[i] = t;
-            prices[i] = equity * m / 1e18;
+            prices[i] = equity * multiplier / 1e18;
             _observe(t, equity);
         }
         uint256 end = t + endOffset;
@@ -1136,6 +1187,29 @@ contract DataStreamsSourceTest is BaseV2Test {
         (bool ok, uint256 price) = src.windowPrice(address(nvda), uint40(start), uint40(end));
         assertTrue(ok, "every rule holds by construction");
         assertEq(price, weighted / (end - start));
+    }
+
+    /// SEC-20: wherever the corporate action falls inside the window, the window refuses.
+    /// @dev The deterministic cases pin one position each; this pins that the rule does not depend on WHERE the
+    ///      change lands, which is the thing an off-by-one in the walk would get wrong.
+    function testFuzz_window_refusesWhereverTheMultiplierChanges(uint256 seed, uint8 nRaw, uint8 atRaw) public {
+        uint256 n = bound(nRaw, 10, 40);
+        uint256 changeAt = bound(atRaw, 1, n - 1); // never 0: the first observation defines the regime
+        nvda.setUiMultiplier(1e18);
+
+        uint256 t = E;
+        for (uint256 i; i < n; ++i) {
+            if (i > 0) t += bound(uint256(keccak256(abi.encode(seed, i, "gap"))), 30, 300);
+            if (i == changeAt) nvda.setUiMultiplier(2e18);
+            _observe(t, bound(uint256(keccak256(abi.encode(seed, i, "price"))), 1e6, 5000e6));
+        }
+        uint256 end = t + 60;
+        vm.warp(end + 61);
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        (bool ok, uint256 price) = src.windowPrice(address(nvda), uint40(E), uint40(end));
+        assertFalse(ok, "a window containing the change must refuse wherever it falls");
+        assertEq(price, 0, "and carry no price");
     }
 
     /// latest and windowPrice never revert, whatever the window and whatever was stored.

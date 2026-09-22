@@ -6,7 +6,7 @@
 # contracts (Clearinghouse, OrderBook, SettlementOracle, ExpiryCalendar, ChainlinkFeedSource, ...) as they land;
 # a name whose artifact is missing makes the export fail rather than publish a partial set.
 
-# Published interfaces for INTERFACE_VERSION 7; changes require coordinated ABI regeneration.
+# Published interfaces for INTERFACE_VERSION 8; changes require coordinated ABI regeneration.
 IClearinghouse
 IOrderBook
 ISettlementOracle
@@ -18,10 +18,34 @@ IPayoutAdapter
 IMakerRegistry
 IRewardsDistributor
 
+# INTERFACE_VERSION 8 additions. The three frozen periphery interfaces were published BEFORE their contracts existed
+# (C8-06 PayoutRouter, C8-07 FeeSplitter, C8-08 V4BuybackExecutor) precisely so the indexer, the web, the keeper and
+# the monitor could be built against them in parallel; the concrete contract then replaces the interface in the
+# generated modules, as it already does for the v7 pairs below. Each of those three tasks was to append its own
+# concrete contract to the block at the bottom of this file and none of them did, so all three compiled and shipped
+# while being impossible to publish. T-78 appended them and added the src/v2 containment check described there.
+IPayoutRouter
+IFeeSplitter
+IBuybackExecutor
+IFeeDiscount
+IFundingSource
+
+# The access manager: OpenZeppelin v5.7.0, unmodified (src/v2/access/V8AccessManagerArtifact.sol imports it so the
+# artifact exists). The indexer and the monitor decode OperationScheduled / OperationExecuted / OperationCanceled and
+# AccessManager's own RoleGranted(uint64,address,uint32,uint48,bool) -- a DIFFERENT topic from AccessControl's
+# RoleGranted(bytes32,address,address), which a v7 handler would keep listening for in silence.
+AccessManager
+
 # Shared custom errors. The interfaces declare none; decoders merge these error fragments into every v2 ABI.
 V2Errors
 
 # Concrete contracts. Each replaces its interface in the generated modules (clearinghouse.ts stays clearinghouseAbi).
+# export-abis.sh --check enforces that EVERY non-abstract `contract` declared under src/v2 (mocks excluded) appears
+# in THIS block. That containment is one-way: the interfaces, AccessManager and V2Errors above are not src/v2
+# contract declarations and the check says nothing about them.
+# UniV3PayoutAdapter stays listed beside PayoutRouter rather than being replaced by it: the payoutAdapter row in all
+# three gen-abis.mjs names the adapter artifact first, so dropping it before that row is edited would make the row
+# fall silently back to the bare IPayoutAdapter.
 ExpiryCalendar
 ChainlinkFeedSource
 UniV3TwapSource
@@ -31,7 +55,26 @@ Clearinghouse
 DataStreamsSource
 OrderBook
 UniV3PayoutAdapter
+PayoutRouter
 AutoRoller
 MakerVault
 MakerRegistry
 RewardsDistributor
+FeeSplitter
+V4BuybackExecutor
+
+# The P-lane periphery (Earn vault, House vault, zap, lending, hedger). Every one of these landed AFTER T-78 added
+# the containment check above and none appended itself here, so `export-abis.sh --check` has been red on the v8 tip
+# ever since, and the exporter -- which only ever emits what this file names -- could publish none of them. The
+# visible cost: no HouseVault.json, so the keeper's MM quoter cannot read epochEnd and K8-05 ships epoch:null
+# fail-closed. NONE of the eight is excluded: each is non-abstract, deployable, declared in a file of its own name
+# (so out/<Name>.sol/<Name>.json exists), and is bound by the app, the keeper or both. An exclusion here would be a
+# decision and would be written down as one; there is nothing to exclude.
+EarnVault
+Erc4626VenueAdapter
+Hedger
+HouseVault
+HouseVaultFactory
+StockLoanAdapter
+StockVenueAdapter
+StockZap

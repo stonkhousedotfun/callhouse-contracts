@@ -20,6 +20,26 @@ code_size_limit = 98304
 # of a transaction, read by the deposit gate: Vault._depositRefused reason 7, AUDIT-FINDINGS-2026-09-14
 # L-01) would refuse every deposit a test makes after any fill, which no real user ever sees.
 isolate = true
+
+# T-563, from the suspicion recorded in ledger entry T-222-C8-VERIFYV8-COVERAGE. forge's default `gas_limit`
+# is 2^30 = 1073741824 and `test/v2/unit/VerifyV8.t.sol` does not fit under it. MEASURED at 28d76825 -- same
+# tree, same commit, this ceiling the ONLY variable: the default gives 36 passed / 10 failed, 9000000000
+# gives 39 passed / 7 failed. Four cases are bound by the ceiling rather than by their subject:
+#   test_verify_handover_deployerStillHoldsAdmin    `EvmError: Revert` -> PASS at 1072552229
+#   test_verify_marketDrift                         `EvmError: Revert` -> PASS at 1071980351
+#   test_verify_scheduledFeeChange                  `EvmError: Revert` -> PASS at 1431100822
+#   test_verify_poolObservationRingBelowTheMinimum  `EvmError: Revert` -> a NAMED assertion failure,
+#       "a Chainlink-only market has no ring to check: 1 != 0", at 1786155327
+# THE LAST LINE IS WHY THIS IS A DEFECT AND NOT A TUNING PREFERENCE. A case killed by the ceiling reports
+# `EvmError: Revert`, which is indistinguishable from a revert the test provoked on purpose. So a limit this
+# suite does not fit under does not report "I could not run this" -- it reports something that reads like a
+# finding, and in that one case it was hiding a real one. One `check()` over this fixture costs ~3.57e8 gas
+# and a delta case runs two of them.
+# THE VALUE IS MIRRORED, NOT INVENTED: 9000000000 is the limit T-222's author already ran this suite green
+# under. It is ~5x the largest figure measured above (1786155327), and that margin is the point rather than
+# slack -- the fixture grows, 67e37278 supplied five manifest targets that `_noUnlistedRestricted` now walks
+# as well, and the next such addition moves every number here again.
+gas_limit = 9000000000
 ffi = false
 fs_permissions = [
     { access = "read", path = "./out" },
@@ -36,6 +56,28 @@ fs_permissions = [
     # script/v2/EmitSeriesIds.s.sol writes series-ids.json (committed, the id vectors seriesId.ts is tested
     # against) and test/v2/InterfaceIds.t.sol reads it back
     { access = "read-write", path = "./test/v2/fixtures" },
+    # INTERFACE_VERSION 8: roles.v8.json is the single source of truth for the role ids and delays, so the
+    # manifest loader reads it rather than duplicating the table in Solidity. Without this entry every suite
+    # that builds the access matrix fails in setUp with "path is not allowed to be accessed".
+    { access = "read", path = "./script/v2/roles.v8.json" },
+    { access = "read", path = "./script/v2/fixtures/house-limits.v8.json" },
+    # T-186: test/v2/unit/CoreNatSpecLanes.t.sol reads the five core sources to compare the AccessManager lane names
+    # in their NatSpec against roles.v8.json above. READ ONLY, and the only reason src is listed at all.
+    { access = "read", path = "./src" },
+    # T-505: test/v2/lib/V8StubSweep.t.sol counts v8-stub markers in the files its table lists, and this is the one
+    # listed file outside ./src. Granted as the SPECIFIC FILE, not ./script and not ./script/v2, for two reasons:
+    # a grant wider than the need is a permission nobody remembers giving, and leaving the rest of ./script
+    # ungranted is what lets that same test PROVE its fail-closed arm - an unreadable path must revert rather than
+    # count as a clean zero, and demonstrating that needs a path fs_permissions genuinely refuses.
+    { access = "read", path = "./script/v2/RegisterMarkets.s.sol" },
+    # T-513: test/v2/integration/V2DocsNumbers.t.sol asserts that the constants it pins actually appear in the two
+    # documents that CITE IT as their guarantee -- V2-ARCHITECTURE.md names it 16 times and V2-ACCOUNTING.md 12.
+    # Until this grant the suite could not open either file, so the documents named a guarantor that could not see
+    # them. Granted as the TWO SPECIFIC FILES for the same two reasons as the entry above: a grant wider than the
+    # need is a permission nobody remembers giving, and leaving the rest of ./docs ungranted is what keeps the
+    # fail-closed arm provable -- an unreadable path must revert rather than read as an absent phrase.
+    { access = "read", path = "./docs/V2-ARCHITECTURE.md" },
+    { access = "read", path = "./docs/V2-ACCOUNTING.md" },
 ]
 
 [profile.fork]

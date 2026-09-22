@@ -55,7 +55,11 @@ contract ClearinghousePausesTest is ClearinghouseTestBase {
             _assertBacked(putId);
 
             // New risk only.
+            // T-603: `alice` is not an allowlisted minter, so this died at NotMinter before it could reach the
+            // pause it is testing. She authorises the allowlisted test contract here; the conditional
+            // expectRevert below still binds to the mint, because nothing is called between them.
             vm.prank(alice);
+            ch.setOperator(address(this), true);
             if (flags & DISABLED != 0) {
                 vm.expectRevert(V2Errors.MarketDisabled.selector);
             } else if (flags & MINT_PAUSED != 0) {
@@ -152,7 +156,7 @@ contract ClearinghousePausesTest is ClearinghouseTestBase {
             V2Types.MarketConfig memory off = _cfg(address(oracle));
             off.enabled = false;
             vm.prank(admin);
-            ch.setMarketConfig(address(nvda), off);
+            _reconfigure(ch, address(nvda), off);
         }
         if (flags & ORACLE_REVERTS != 0) {
             oracle.setTrySpotReverts(true);

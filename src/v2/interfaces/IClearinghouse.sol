@@ -12,10 +12,17 @@ import {V2Types} from "./V2Types.sol";
 ///      Prices and strikes are USDG base units (6 dp) per whole share. Ledger amounts are base units of the asset.
 ///      Collateral per unit: a put locks strike / 100 USDG base units, a call locks UNIT (1e16) underlying base units.
 ///
-///      Trust model (ADR-09): GUARDIAN_ROLE can pause series creation and mints only; DEFAULT_ADMIN_ROLE registers
-///      and configures markets, sets the fee recipient, the payout adapter and the calendar/oracle for NEW series.
-///      No role can move, freeze or seize user collateral or tokens. close, redeem, withdraw are never pausable.
-///      The admin and guardian setters are implementation surface and not frozen here; their events are.
+///      Trust model (INTERFACE_VERSION 8, ADR-09 as amended by v8 design §2.2): roles live in one OpenZeppelin
+///      `AccessManager`, not in this contract. GUARDIAN pauses series creation and mints only; LISTING registers and
+///      lists markets; MARKET_FEE_MANAGER moves the exercise fee and the rent dial (72 h); CONFIG_ADMIN moves the
+///      oracle, calendar, payout adapter, keeper-rewards and minter pointers (24 h); TREASURY_ADMIN moves the fee
+///      recipient (24 h). No role can move, freeze or seize user collateral or tokens. close, redeem, withdraw are
+///      never pausable.
+///
+///      INTERFACE_VERSION 8 FREEZES THE ADMIN SETTERS HERE, which v7 left as implementation surface. They now carry
+///      role ids in `script/v2/roles.v8.json` and the access-matrix test asserts one against the other, so their
+///      signatures are part of the cross-repo contract rather than an implementation detail. v7's one-tuple
+///      `registerMarket` / `setMarketConfig` pair is split, because one tuple cannot sit in three delay lanes.
 interface IClearinghouse is IERC1155 {
     // ids
 
@@ -63,6 +70,83 @@ interface IClearinghouse is IERC1155 {
     /// @param longId Long id.
     /// @return True when the series exists.
     function seriesExists(uint256 longId) external view returns (bool);
+
+    // markets: the admin surface (INTERFACE_VERSION 8)
+
+    /// @notice Registers `underlying` as a market at `strikeTick`, taking its fees and oracle from the defaults.
+    ///         LISTING (1 h).
+    /// @dev REPLACES v7's `registerMarket(address, MarketConfig)`: one tuple could not sit in three delay lanes.
+    ///      Stores `MarketConfig{enabled, mintPaused: false, strikeTick, exerciseFeeBps: default, oracle: default,
+    ///      mintFeePpm: default}` -- a v8 market always registers UNPAUSED, where v7 took `mintPaused` as given.
+    ///      Reverts `UnsupportedAsset` when already registered or the token does not report 18 decimals, `BadStrike`
+    ///      unless strikeTick is a non-zero multiple of PRICE_TICK, and `NoSource` when {defaultOracle} is unset, so
+    ///      the default oracle must be set before the first registration. Emits the UNCHANGED
+    ///      {MarketRegistered}(underlying, config) with the composed tuple, so indexer and monitor handlers keep
+    ///      working: only the selector moved.
+    /// @param underlying 18-dp Stock Token.
+    /// @param strikeTick USDG base units (6 dp) per share; every strike is a multiple of it.
+    /// @param enabled Whether series may be created and minted at once.
+    function registerMarket(address underlying, uint64 strikeTick, bool enabled) external;
+
+    /// @notice Sets a registered market's listing fields. LISTING (1 h).
+    /// @dev `enabled` gates creation and mints; `strikeTick` applies to series created afterwards. Leaves the
+    ///      guardian-owned `mintPaused` untouched and emits the unchanged {MarketConfigSet} with the STORED tuple.
+    /// @param underlying Registered underlying (`UnsupportedAsset` otherwise).
+    /// @param enabled Whether series may be created and minted.
+    /// @param strikeTick USDG base units (6 dp) per share, a non-zero multiple of PRICE_TICK.
+    function setMarketListing(address underlying, bool enabled, uint64 strikeTick) external;
+
+    /// @notice Sets a market's fee dials. MARKET_FEE_MANAGER (72 h).
+    /// @dev Both are pinned into each series at creation, so a change reaches NEW series only. `CeilingExceeded`
+    ///      above EXERCISE_FEE_CEIL_BPS or MINT_FEE_CEIL_PPM. `mintFeePpm` launches at 0 on every market (owner
+    ///      decision V3-D18: no writer rent); the tested rent code stays as a dial. Leaves `mintPaused` untouched and
+    ///      emits the unchanged {MarketConfigSet}.
+    /// @param underlying Registered underlying.
+    /// @param exerciseFeeBps Exercise fee, bps of collateral, `<= EXERCISE_FEE_CEIL_BPS`.
+    /// @param mintFeePpm Collateral rent, millionths per MINT_FEE_PERIOD of remaining life, `<= MINT_FEE_CEIL_PPM`.
+    function setMarketFees(address underlying, uint16 exerciseFeeBps, uint32 mintFeePpm) external;
+
+    /// @notice Points a market's NEW series at another settlement oracle. CONFIG_ADMIN (24 h).
+    /// @dev Existing series keep the oracle pinned at their creation, so this can never touch an open position.
+    ///      `NoSource` when the oracle has no code. Leaves `mintPaused` untouched; emits {MarketConfigSet}.
+    /// @param underlying Registered underlying.
+    /// @param oracle ISettlementOracle contract.
+    function setMarketOracle(address underlying, address oracle) external;
+
+    /// @notice Sets the fee dials copied into every market registered from now on. MARKET_FEE_MANAGER (72 h).
+    /// @param exerciseFeeBps Default exercise fee, bps, `<= EXERCISE_FEE_CEIL_BPS`.
+    /// @param mintFeePpm Default collateral rent, ppm, `<= MINT_FEE_CEIL_PPM`.
+    function setDefaultMarketFees(uint16 exerciseFeeBps, uint32 mintFeePpm) external;
+
+    /// @notice Sets the oracle copied into every market registered from now on. CONFIG_ADMIN (24 h).
+    /// @dev Must be set before the first {registerMarket}, which otherwise reverts `NoSource`.
+    /// @param oracle ISettlementOracle contract.
+    function setDefaultOracle(address oracle) external;
+
+    /// @notice Adds or removes an address from the {mint} allow-list. CONFIG_ADMIN (24 h).
+    /// @dev The allow-list is what makes "5 % of the premium on first sale" hold: every long that exists was created
+    ///      inside a fill with a known premium. At launch the OrderBook is the only minter. It is an in-contract
+    ///      storage read rather than a manager role ON PURPOSE -- the book's two mint calls sit inside
+    ///      `try … {gas: 500_000}`, so a missing or delayed manager mapping would turn fills into silent skips that
+    ///      `quoteTake` had already promised.
+    /// @param minter Contract allowed to call {mint}.
+    /// @param allowed True to allow.
+    function setMinter(address minter, bool allowed) external;
+
+    /// @notice Whether `minter` may call {mint} (INTERFACE_VERSION 8).
+    /// @dev The OrderBook's planner reads this for itself, so `mintOpen` in a quote is exact.
+    /// @param minter Candidate minter.
+    /// @return True when allowed.
+    function isMinter(address minter) external view returns (bool);
+
+    /// @notice The fee dials a new market is registered with (INTERFACE_VERSION 8).
+    /// @return exerciseFeeBps Default exercise fee, bps.
+    /// @return mintFeePpm Default collateral rent, ppm.
+    function defaultMarketFees() external view returns (uint16 exerciseFeeBps, uint32 mintFeePpm);
+
+    /// @notice The oracle a new market is registered with; zero means {registerMarket} reverts `NoSource`.
+    /// @return ISettlementOracle address.
+    function defaultOracle() external view returns (address);
 
     /// @notice Creates a series, or returns the id of the existing one.
     /// @dev Anyone. Idempotent. Checks: market enabled (MarketDisabled) and creation not guardian-paused
@@ -219,7 +303,11 @@ interface IClearinghouse is IERC1155 {
 
     /// @notice Writes `units` of a series: locks units * collateralPerUnit from `writer`'s free ledger, mints `units`
     ///         long to `longTo` and `units` short to `writer`.
-    /// @dev `writer` or an operator of `writer` (NotAuthorized). Market enabled (MarketDisabled) and not
+    /// @dev INTERFACE_VERSION 8: the FIRST check is the minter allow-list -- `isMinter[msg.sender]` or `NotMinter`
+    ///      -- and the writer-or-operator check follows it unchanged. At launch the OrderBook is the only minter, so
+    ///      every long is created inside a fill that pays the 5 % primary-sale fee and there is no un-sold, un-charged
+    ///      inventory to resell at the 0 % resale rate. Everything else about {mint} is unchanged.
+    ///      `writer` or an operator of `writer` (NotAuthorized). Market enabled (MarketDisabled) and not
     ///      mint-paused (MintPaused); series exists (UnknownSeries); now < mintCutoff (PastCutoff); units > 0
     ///      (BadUnits); enough free collateral (InsufficientCollateral(have, need)). State first, ERC-1155 acceptance
     ///      callbacks last.
@@ -278,7 +366,7 @@ interface IClearinghouse is IERC1155 {
 
     // fees
 
-    /// @notice Receiver of swept protocol fees (set by DEFAULT_ADMIN_ROLE).
+    /// @notice Receiver of swept protocol fees (TREASURY_ADMIN, 24 h; the FeeSplitter in v8).
     /// @return Fee recipient address.
     function feeRecipient() external view returns (address);
 
@@ -292,16 +380,26 @@ interface IClearinghouse is IERC1155 {
     /// @param asset Asset address.
     function sweepFees(address asset) external;
 
-    /// @notice DEFAULT_ADMIN_ROLE registered a market. The tuple gained mintFeePpm in INTERFACE_VERSION 7, so this
-    ///         topic changed; a v6 decoder mis-reads it rather than failing.
+    /// @notice A market was registered. The tuple gained mintFeePpm in INTERFACE_VERSION 7, so this topic changed
+    ///         then; a v6 decoder mis-reads it rather than failing. INTERFACE_VERSION 8 keeps the topic and the tuple
+    ///         BYTE-IDENTICAL on purpose -- only {registerMarket}'s selector moved -- so indexer and monitor handlers
+    ///         written for v7 keep working.
     event MarketRegistered(address indexed underlying, V2Types.MarketConfig config);
-    /// @notice DEFAULT_ADMIN_ROLE changed a market's configuration (new series only for oracle, exercise fee and mint
-    ///         fee). Same tuple change and same warning as {MarketRegistered}.
+    /// @notice A market's configuration changed (new series only for oracle, exercise fee and mint fee). Emitted by
+    ///         all three v8 per-market setters with the STORED tuple. Same topic and tuple as v7, for the same reason
+    ///         as {MarketRegistered}.
     event MarketConfigSet(address indexed underlying, V2Types.MarketConfig config);
-    /// @notice GUARDIAN_ROLE paused or resumed mints of a market.
+    /// @notice GUARDIAN paused or resumed mints of a market.
     event MintPausedSet(address indexed underlying, bool paused);
-    /// @notice GUARDIAN_ROLE paused or resumed series creation.
+    /// @notice GUARDIAN paused or resumed series creation.
     event CreatePausedSet(bool paused);
+    /// @notice MARKET_FEE_MANAGER set the fee dials copied into every market registered from now on
+    ///         (INTERFACE_VERSION 8).
+    event DefaultMarketFeesSet(uint16 exerciseFeeBps, uint32 mintFeePpm);
+    /// @notice CONFIG_ADMIN set the oracle copied into every market registered from now on (INTERFACE_VERSION 8).
+    event DefaultOracleSet(address indexed oracle);
+    /// @notice CONFIG_ADMIN added or removed a {mint} caller (INTERFACE_VERSION 8).
+    event MinterSet(address indexed minter, bool allowed);
     /// @notice A series was created. strike: USDG 6 dp per whole share; expiry: unix seconds; mintFeePpm: the rent
     ///         rate pinned from the market (INTERFACE_VERSION 7, appended).
     event SeriesCreated(
@@ -364,9 +462,9 @@ interface IClearinghouse is IERC1155 {
     event MintFeesAccrued(uint256 indexed longId, address indexed asset, uint256 amount);
     /// @notice Accrued fees (asset base units) swept to `to`.
     event FeesSwept(address indexed asset, address indexed to, uint256 amount);
-    /// @notice DEFAULT_ADMIN_ROLE set the fee recipient.
+    /// @notice TREASURY_ADMIN set the fee recipient (24 h).
     event FeeRecipientSet(address indexed recipient);
-    /// @notice DEFAULT_ADMIN_ROLE set the PayoutAdapter and its slippage bound (<= MAX_PAYOUT_SLIPPAGE_CEIL_BPS),
+    /// @notice CONFIG_ADMIN set the PayoutAdapter and its slippage bound (<= MAX_PAYOUT_SLIPPAGE_CEIL_BPS),
     ///         measured above each route's pool fee (INTERFACE_VERSION 6).
     event PayoutAdapterSet(address indexed adapter, uint16 maxSlippageBps);
 }

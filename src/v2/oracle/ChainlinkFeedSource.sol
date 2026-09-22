@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {Managed} from "../access/Managed.sol";
 import {IPriceSource} from "../interfaces/IPriceSource.sol";
 import {V2Errors} from "../interfaces/V2Errors.sol";
 import {IAggregatorV3, IOraclePausable} from "./OracleDeps.sol";
@@ -18,10 +18,12 @@ import {PriceLib} from "./lib/PriceLib.sol";
 ///      the price "in force" from its `updatedAt` until the next round's. {windowPrice} walks backwards from
 ///      `latestRoundData` through `getRoundData(id - 1)`:
 ///        - a round with `updatedAt > end` is skipped (it is not in force inside the window, so it is neither priced nor
-///          sanity-checked: a bad print after expiry cannot void a window that was fine);
-///        - a round whose `updatedAt` is later than the newer round already accepted is skipped too. Round ids are the
-///          order the aggregator published in; a timestamp that runs backwards is a feed fault, and the newer round is
-///          what was in force;
+///          sanity-checked: a bad print after expiry cannot void a window that was fine). Only rounds read BEFORE the
+///          walk accepts its first round are skipped this way;
+///        - a round whose `updatedAt` is later than the newer round already accepted ends the walk NOT OK (SEC-46).
+///          Round ids are the order the aggregator published in, so a timestamp that runs backwards is a feed fault.
+///          Skipping the round instead would compare the newer round with an older one it does not follow, and the
+///          newer round, which is priced, would never be checked against its real predecessor;
 ///        - every other round is in force from its `updatedAt` to the newer accepted round's (or `end`), clipped to
 ///          `start`;
 ///        - the walk stops at the first round with `updatedAt <= start`: that round is in force at `start`.
@@ -32,6 +34,7 @@ import {PriceLib} from "./lib/PriceLib.sol";
 ///          not a Stock Token this source knows how to trust);
 ///        - a read reverts, returns short data, or returns `updatedAt == 0`: that is the end of the readable history,
 ///          and a window it has not covered cannot be priced;
+///        - a round is stamped later than the newer round the walk already accepted (the timestamp fault above);
 ///        - the walk reaches aggregator round 1 of the current phase before it is done. The proxy's previous phase is a
 ///          different aggregator under a different id prefix (architecture §3.3: never cross a phase boundary);
 ///        - {MAX_ROUND_READS} rounds were read before it is done;
@@ -61,8 +64,8 @@ import {PriceLib} from "./lib/PriceLib.sol";
 ///
 ///      Every external read is a raw `staticcall` with its length checked before decoding, because a typed call whose
 ///      target has no code or returns short data reverts in the caller, where try/catch cannot catch it.
-contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTransient {
-    /// @notice Per-underlying feed configuration (DEFAULT_ADMIN_ROLE).
+contract ChainlinkFeedSource is IPriceSource, Managed, ReentrancyGuardTransient {
+    /// @notice Per-underlying feed configuration (CONFIG_ADMIN in the v8 AccessManager, 24 h execution delay).
     struct FeedConfig {
         /// @dev Chainlink AggregatorV3 proxy for the Stock Token's USD price (e.g. "RHNVDA / USD"). Zero: unconfigured.
         address feed;
@@ -117,7 +120,7 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
 
     /// @notice The feed configuration of `underlying` changed. All zero: removed.
     event FeedSet(address indexed underlying, address indexed feed, uint32 maxStale, uint16 maxRoundJumpBps);
-    /// @notice DEFAULT_ADMIN_ROLE allowed or disallowed `oracle` to call {pin}.
+    /// @notice CONFIG_ADMIN allowed or disallowed `oracle` to call {pin}.
     event OracleSet(address indexed oracle, bool allowed);
     /// @notice {pin} fixed the configuration windows ending at `expiry` use: `feed`, `maxStale` in seconds,
     ///         `maxRoundJumpBps` in basis points.
@@ -125,19 +128,15 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
         address indexed underlying, uint40 indexed expiry, address feed, uint32 maxStale, uint16 maxRoundJumpBps
     );
 
-    /// @param admin DEFAULT_ADMIN_ROLE holder (sets feeds).
-    constructor(address admin) {
-        // A zero admin would leave the source permanently unconfigurable.
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-    }
+    /// @param authority The `AccessManager` mapping this contract's selectors to roles (V8Roles).
+    constructor(address authority) Managed(authority) {}
 
     /*//////////////////////////////////////////////////////////////
                                   ADMIN
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Sets or removes the feed of `underlying`.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). `feed == address(0)` removes the configuration (the other
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). `feed == address(0)` removes the configuration (the other
     ///      arguments are ignored). Reverts V2Errors.UnsupportedAsset for a zero underlying, V2Errors.NoSource for a
     ///      feed without code, and V2Errors.CeilingExceeded when `maxStale` is outside [MIN_MAX_STALE, MAX_MAX_STALE]
     ///      or `maxRoundJumpBps` outside [1, MAX_ROUND_JUMP_CEIL_BPS]. Checking the feed's description and freshness is
@@ -147,8 +146,11 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
     /// @param feed Chainlink AggregatorV3 proxy, or zero to remove.
     /// @param maxStale Seconds; DEFAULT_MAX_STALE unless the market needs otherwise.
     /// @param maxRoundJumpBps Basis points; DEFAULT_MAX_ROUND_JUMP_BPS unless the market needs otherwise.
-    function setFeed(address underlying, address feed, uint32 maxStale, uint16 maxRoundJumpBps) external nonReentrant {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    function setFeed(address underlying, address feed, uint32 maxStale, uint16 maxRoundJumpBps)
+        external
+        nonReentrant
+        restricted
+    {
         if (underlying == address(0)) revert V2Errors.UnsupportedAsset();
         if (feed == address(0)) {
             delete feeds[underlying];
@@ -165,13 +167,12 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
     }
 
     /// @notice Allows or disallows `oracle` to call {pin}.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). An allow-list rather than one pointer: series pin their
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). An allow-list rather than one pointer: series pin their
     ///      SettlementOracle at creation and a market can move to a new oracle while series on the old one still
     ///      settle, so two oracles may share this source during a migration and each must be able to pin.
     /// @param oracle SettlementOracle.
     /// @param allowed True to allow.
-    function setOracle(address oracle, bool allowed) external nonReentrant {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    function setOracle(address oracle, bool allowed) external nonReentrant restricted {
         isOracle[oracle] = allowed;
         emit OracleSet(oracle, allowed);
     }
@@ -183,7 +184,9 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
     /// @inheritdoc IPriceSource
     /// @dev The latest round with the window walk's sanity rules: oracle not paused, answer normalises, and the round
     ///      is within `maxRoundJumpBps` of its predecessor in the same phase (so the first round of a phase is not ok
-    ///      until a second one prints). Age is deliberately not checked (the oracle applies spotMaxAge).
+    ///      until a second one prints). A predecessor stamped after the head is the walk's timestamp fault and is not
+    ///      ok either (SEC-46): the head is checked against the round that really precedes it or not at all. Two reads
+    ///      at most. Age is deliberately not checked (the oracle applies spotMaxAge).
     function latest(address underlying) external view returns (bool ok, uint256 price, uint256 updatedAt) {
         FeedConfig memory cfg = feeds[underlying];
         if (cfg.feed == address(0) || _oraclePaused(underlying)) return (false, 0, 0);
@@ -195,20 +198,12 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
         (bool headOk, uint256 headPrice) = PriceLib.normalizeAnswer(head.answer, dec);
         if (!headOk) return (false, 0, 0);
 
-        uint80 id = head.id;
-        for (uint256 reads = 1; reads < MAX_ROUND_READS; ++reads) {
-            if ((id & AGGREGATOR_ROUND_MASK) <= 1) return (false, 0, 0);
-            --id;
-            Round memory prev = _read(cfg.feed, abi.encodeCall(IAggregatorV3.getRoundData, (id)));
-            if (!prev.exists) return (false, 0, 0);
-            // Same skip rule as the walk: a predecessor stamped after the head is a feed fault, not the head's
-            // predecessor in time.
-            if (prev.updatedAt > head.updatedAt) continue;
-            (bool prevOk, uint256 prevPrice) = PriceLib.normalizeAnswer(prev.answer, dec);
-            if (!prevOk || PriceLib.exceedsJump(headPrice, prevPrice, cfg.maxRoundJumpBps)) return (false, 0, 0);
-            return (true, headPrice, head.updatedAt);
-        }
-        return (false, 0, 0);
+        if ((head.id & AGGREGATOR_ROUND_MASK) <= 1) return (false, 0, 0);
+        Round memory prev = _read(cfg.feed, abi.encodeCall(IAggregatorV3.getRoundData, (head.id - 1)));
+        if (!prev.exists || prev.updatedAt > head.updatedAt) return (false, 0, 0);
+        (bool prevOk, uint256 prevPrice) = PriceLib.normalizeAnswer(prev.answer, dec);
+        if (!prevOk || PriceLib.exceedsJump(headPrice, prevPrice, cfg.maxRoundJumpBps)) return (false, 0, 0);
+        return (true, headPrice, head.updatedAt);
     }
 
     /// @inheritdoc IPriceSource
@@ -249,6 +244,10 @@ contract ChainlinkFeedSource is IPriceSource, AccessControl, ReentrancyGuardTran
                 }
                 bound = r.updatedAt;
                 newerPrice = p;
+            } else if (newerPrice != 0) {
+                // Stamped after a round the walk already accepted: the timestamp runs backwards (SEC-46). Before the
+                // first acceptance `bound` is `end`, and a round past it is simply after the window.
+                return (false, 0);
             }
             if ((r.id & AGGREGATOR_ROUND_MASK) <= 1 || reads == MAX_ROUND_READS) return (false, 0);
             // The id asked for, not the one echoed back: a feed echoing another id cannot make the walk loop or jump.

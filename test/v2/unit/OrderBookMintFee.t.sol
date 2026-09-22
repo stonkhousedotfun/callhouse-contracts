@@ -33,7 +33,7 @@ contract OrderBookMintFeeTest is OrderBookBaseTest {
         V2Types.MarketConfig memory cfg = _market();
         cfg.mintFeePpm = PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
         rentCall = ch.createSeries(address(tsla), false, RENT_STRIKE, FRI_2026_09_18);
 
         _fund(thin, ACTOR_USDG, ACTOR_SHARES, ACTOR_SHARES);
@@ -59,7 +59,7 @@ contract OrderBookMintFeeTest is OrderBookBaseTest {
 
         _depositExactly(thin, address(tsla), collateral);
         uint256 ask = _place(thin, rentCall, WRITE, P2_50, units);
-        (uint64 quoted,,) = book.quoteTake(_buy(rentCall, _ids(ask), units, alice));
+        (uint64 quoted,,,) = book.quoteTake(_buy(rentCall, _ids(ask), units, alice));
         assertEq(quoted, 0, "the quote already knows it cannot mint");
         (uint64 filled,,) = _take(alice, _buy(rentCall, _ids(ask), units, alice));
         assertEq(filled, 0, "collateral alone is not enough any more");
@@ -67,7 +67,7 @@ contract OrderBookMintFeeTest is OrderBookBaseTest {
         assertFalse(_order(ask).cancelled, "and the order is untouched, not cancelled");
 
         _depositExactly(thin, address(tsla), collateral + fee);
-        (quoted,,) = book.quoteTake(_buy(rentCall, _ids(ask), units, alice));
+        (quoted,,,) = book.quoteTake(_buy(rentCall, _ids(ask), units, alice));
         assertEq(quoted, units, "with rent headroom the quote fills");
         (filled,,) = _take(alice, _buy(rentCall, _ids(ask), units, alice));
         assertEq(filled, units, "and so does the take");
@@ -104,7 +104,7 @@ contract OrderBookMintFeeTest is OrderBookBaseTest {
         uint256 bid = _place(alice, rentCall, BID, P2_00, units);
 
         _depositExactly(thin, address(tsla), collateral);
-        (uint64 quoted,,) = book.quoteTake(_sell(rentCall, _ids(bid), units, true, thin));
+        (uint64 quoted,,,) = book.quoteTake(_sell(rentCall, _ids(bid), units, true, thin));
         assertEq(quoted, 0, "the taker cannot mint on collateral alone");
         (uint64 filled,,) = _take(thin, _sell(rentCall, _ids(bid), units, true, thin));
         assertEq(filled, 0, "and does not");
@@ -146,7 +146,7 @@ contract OrderBookMintFeeTest is OrderBookBaseTest {
         uint256 bad = _place(stranger, rentCall, WRITE, P2_00, units);
 
         V2Types.TakeParams memory p = _buy(rentCall, _ids(bad, good), 2 * units, alice);
-        (uint64 qUnits, uint256 qPremium, uint256 qFee) = book.quoteTake(p);
+        (uint64 qUnits, uint256 qPremium, uint256 qFee,) = book.quoteTake(p);
         (uint64 tUnits, uint256 tPremium, uint256 tFee) = _take(alice, p);
         assertEq(tUnits, qUnits, "units");
         assertEq(tPremium, qPremium, "premium");

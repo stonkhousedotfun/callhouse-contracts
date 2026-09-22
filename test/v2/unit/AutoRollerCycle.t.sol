@@ -6,6 +6,7 @@ import {AutoRollerTestBase} from "./AutoRollerBase.t.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
+import {MockSettlementOracle} from "../../../src/v2/mocks/MockSettlementOracle.sol";
 
 /// @notice AutoRoller over whole periods: roll, fill, expiry, settlement, close-out and the next roll, for weekly and
 ///         daily strategies, with the real Clearinghouse, OrderBook, ExpiryCalendar, KeeperRewards and SettlementOracle.
@@ -149,6 +150,10 @@ contract AutoRollerCycleTest is AutoRollerTestBase {
         _noRoll(alice, "candidate inside its delay");
         assertEq(ch.balanceOf(alice, r.longId | 1), 100, "shorts untouched");
 
+        // THE REAL ORACLE HOLDS THIS ROLL (T-OP-070 re-derived it): `oracle` here is the fixture's SettlementOracle,
+        // whose `_advance` returns false for a Held, uncorroborated expiry (SettlementOracle.sol:751), so
+        // Clearinghouse.settle sees (false, 0) and the roller has nothing to close out. The mock is not on this path;
+        // its Held gap (fixed in T-OP-070) is pinned by {test_unsettled_heldOnTheMockOracle_blocksUntilUnveto}.
         vm.prank(guardian);
         oracle.veto(address(nvda), FRI_2026_09_11);
         vm.warp(uint256(FRI_2026_09_11) + 3 hours);
@@ -159,6 +164,60 @@ contract AutoRollerCycleTest is AutoRollerTestBase {
         vm.warp(uint256(FRI_2026_09_11) + 3 hours + UNCORROBORATED_DELAY);
         (bool advanced,,) = _roll(keeper, alice);
         assertTrue(advanced, "final: closes out");
+        assertTrue(ch.series(r.longId).settled, "settled");
+        assertEq(ch.balanceOf(alice, r.longId | 1), 0, "shorts redeemed");
+        assertEq(_free(alice), WRITER_SHARES, "OTM at 224");
+    }
+
+    /// T-OP-070. The same veto block, THROUGH THE MOCK. The market is migrated to a MockSettlementOracle before the
+    /// roll, so the series is pinned to it and Clearinghouse.settle calls ITS finalize. In FinalizeOnCall mode the
+    /// pre-T-OP-070 mock finalized a Held expiry anyway (T-OP-049's "the veto does not block"), so the "held"
+    /// assertion below would FAIL against it -- the roll would close out through a finalized settlement. The mock
+    /// now mirrors SettlementOracle._advance: a Held, uncorroborated expiry reports (false, 0), and the roller has
+    /// nothing to close out; `finalizeCalls` proves the roller did ask. Unveto, and the same call finalizes.
+    function test_unsettled_heldOnTheMockOracle_blocksUntilUnveto() public {
+        MockSettlementOracle mock = new MockSettlementOracle();
+        vm.prank(admin);
+        ch.setMarketOracle(address(nvda), address(mock));
+        assertEq(ch.market(address(nvda)).oracle, address(mock), "the market reads the mock");
+
+        _setStrategy(alice, _weekly(500, 150));
+        uint256 t0 = _ny(THU_0910, 10, 0, 0);
+        vm.warp(t0);
+        mock.setSpot(address(nvda), true, 220_000_000, t0);
+        Rolled memory r = _mustRoll(alice);
+        assertEq(ch.series(r.longId).oracle, address(mock), "the series is pinned to the mock");
+        vm.warp(_ny(THU_0910, 11, 0, 0));
+        _buy(bob, r.longId, r.orderId, 100);
+
+        // The mock will finalize at 224.00 on call -- but only once it is not Held.
+        mock.setFinalizeMode(
+            address(nvda), FRI_2026_09_11, MockSettlementOracle.FinalizeMode.FinalizeOnCall, 224_000_000
+        );
+        vm.prank(guardian);
+        mock.veto(address(nvda), FRI_2026_09_11);
+        (V2Types.SettlementStatus st,) = mock.settlementPrice(address(nvda), FRI_2026_09_11);
+        assertEq(uint8(st), uint8(V2Types.SettlementStatus.Held), "premise: vetoed");
+
+        // The same clock as the real-oracle test above: a 224.00 print an hour before expiry, the held check three
+        // hours after it (past FINALIZE_DELAY, so the mock's own TooEarly is out of the way).
+        uint256 t = uint256(FRI_2026_09_11) - 1 hours;
+        vm.warp(t);
+        mock.setSpot(address(nvda), true, 224_000_000, t);
+        vm.warp(uint256(FRI_2026_09_11) + 3 hours);
+        uint256 asked = mock.finalizeCalls();
+        _noRoll(alice, "held on the mock");
+        assertGt(mock.finalizeCalls(), asked, "the roller did call finalize: the block is Held, not TooEarly");
+        (st,) = mock.settlementPrice(address(nvda), FRI_2026_09_11);
+        assertEq(uint8(st), uint8(V2Types.SettlementStatus.Held), "FinalizeOnCall finalized a Held expiry");
+        assertFalse(ch.series(r.longId).settled, "not settled while Held");
+        assertEq(ch.balanceOf(alice, r.longId | 1), 100, "shorts untouched");
+
+        vm.prank(guardian);
+        mock.unveto(address(nvda), FRI_2026_09_11);
+        vm.warp(uint256(FRI_2026_09_11) + 3 hours + UNCORROBORATED_DELAY);
+        (bool advanced,,) = _roll(keeper, alice);
+        assertTrue(advanced, "unvetoed: the same call finalizes and closes out");
         assertTrue(ch.series(r.longId).settled, "settled");
         assertEq(ch.balanceOf(alice, r.longId | 1), 0, "shorts redeemed");
         assertEq(_free(alice), WRITER_SHARES, "OTM at 224");

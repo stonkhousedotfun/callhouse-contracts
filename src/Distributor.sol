@@ -172,6 +172,15 @@ abstract contract Distributor is ERC20 {
         return _claimUsdg(msg.sender, to);
     }
 
+    /// @dev SEC-23: THE ONLY MUTATING ENTRY POINTS IN THIS SYSTEM WITHOUT `nonReentrant` are the two public
+    ///      claims above -- `Vault` carries `ReentrancyGuard` and puts the modifier on every other external
+    ///      mutator. That is a deliberate omission and it is safe only because of the ORDER below: the accrual is
+    ///      debited, the running totals are written and the USDG accounting is debited BEFORE the transfer, so a
+    ///      re-entrant claim finds `_accrued[account] == 0` and reverts `NothingToClaim` rather than paying twice.
+    ///      Strict CEI is the guard here, and it is load-bearing rather than incidental.
+    ///      WHAT WOULD BREAK IT: a payout token with transfer hooks or callbacks. USDG has none today. If the
+    ///      payout token is ever changed, or this function ever grows a second external call, add the modifier --
+    ///      do not re-derive the argument above, because the omission is not visible at the call site.
     function _claimUsdg(address account, address to) internal returns (uint256 amount) {
         _settle(account);
         amount = _accrued[account];

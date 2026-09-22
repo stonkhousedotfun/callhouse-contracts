@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {Vm} from "forge-std/Test.sol";
 import {MakerTestBase} from "./MakerBase.t.sol";
 import {IMakerRegistry} from "../../../src/v2/interfaces/IMakerRegistry.sol";
-import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {MakerRegistry} from "../../../src/v2/mm/MakerRegistry.sol";
 
@@ -42,11 +41,11 @@ contract MakerRegistryTest is MakerTestBase {
         registry.setTier(stranger, 10_000);
         vm.prank(stranger);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        registry.grantRole(V2Constants.DEFAULT_ADMIN_ROLE, stranger);
+        registry.setAuthority(stranger);
     }
 
-    function test_constructor_rejectsZeroAdmin() public {
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+    function test_constructor_rejectsCodeLessAuthority() public {
+        vm.expectRevert(V2Errors.NoSource.selector);
         new MakerRegistry(address(0));
     }
 

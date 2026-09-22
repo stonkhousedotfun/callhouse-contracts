@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {V8AccessTest} from "../lib/V8Access.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
 import {TickMath} from "../../../src/v2/oracle/lib/TickMath.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
@@ -50,7 +52,7 @@ contract RawReplyPool {
 ///        tick 222615 -> 214_999_159, 222616 -> 214_977_661, 222664 -> 213_948_292, 276324 -> 1_000_002,
 ///        191000 -> 5_074_463_338, 250000 -> 13_905_313 (USDG base units per share; the asset-token0 pool at -tick
 ///        is the same number). The conversion floors, so assertions allow 1 base unit.
-contract UniV3TwapSourceTest is Test {
+contract UniV3TwapSourceTest is V8AccessTest {
     uint40 internal constant T0 = 1_789_000_000;
     uint40 internal constant E = T0 + 1 days;
     uint128 internal constant L = 1e19;
@@ -80,7 +82,9 @@ contract UniV3TwapSourceTest is Test {
         tsla = new MockStockToken("TSLA Stock Token", "TSLAx");
         poolA = new MockUniV3Pool(address(usdg), address(nvda), 500);
         poolB = new MockUniV3Pool(address(tsla), address(usdg), 500);
-        src = new UniV3TwapSource(admin, address(usdg));
+        _deployManager();
+        src = new UniV3TwapSource(address(manager), address(usdg));
+        _wire(address(src), "UniV3TwapSource", admin, 0);
         vm.startPrank(admin);
         src.setPool(address(nvda), address(poolA), MIN_LIQ, 300);
         src.setPool(address(tsla), address(poolB), MIN_LIQ, 300);
@@ -427,13 +431,14 @@ contract UniV3TwapSourceTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_admin_constructor() public {
-        assertTrue(src.hasRole(src.DEFAULT_ADMIN_ROLE(), admin), "admin role");
+        (bool isConfigAdmin,) = manager.hasRole(V8Roles.CONFIG_ADMIN, admin);
+        assertTrue(isConfigAdmin, "admin holds CONFIG_ADMIN through the manager");
         assertEq(src.usdg(), address(usdg), "usdg");
         assertEq(src.DEFAULT_WINDOW(), 300, "default window");
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vm.expectRevert(V2Errors.NoSource.selector);
         new UniV3TwapSource(address(0), address(usdg));
         vm.expectRevert(V2Errors.UnsupportedAsset.selector);
-        new UniV3TwapSource(admin, address(0));
+        new UniV3TwapSource(address(manager), address(0));
     }
 
     function test_admin_setPool_readsTokenOrderAndEmits() public {
@@ -453,9 +458,9 @@ contract UniV3TwapSourceTest is Test {
         assertEq(minLiq, 5, "floor");
 
         vm.expectEmit(address(src));
-        emit PoolSet(address(amd), address(p1), false, 0, 3600);
+        emit PoolSet(address(amd), address(p1), false, 1, 3600);
         vm.prank(admin);
-        src.setPool(address(amd), address(p1), 0, 3600);
+        src.setPool(address(amd), address(p1), 1, 3600);
         (, usdgIsToken0,,,) = src.pools(address(amd));
         assertFalse(usdgIsToken0, "asset token0");
     }
@@ -481,6 +486,36 @@ contract UniV3TwapSourceTest is Test {
         MockUniV3Pool widePool = new MockUniV3Pool(address(usdg), address(wide), 500);
         vm.expectRevert(V2Errors.UnsupportedAsset.selector);
         src.setPool(address(wide), address(widePool), MIN_LIQ, 300);
+        vm.stopPrank();
+    }
+
+    /// @dev T-OP-062 / SEC-09. `minLiquidity` is the floor {_observeWindow} enforces (UniV3TwapSource.sol:377,
+    ///      `harmonicLiquidity < cfg.minLiquidity` refuses the window); 0 turned that guard off and {setPool} used
+    ///      to store it unchecked. RegisterMarkets.s.sol refuses 0 in the SCRIPT (`univ3MinLiquidity must be > 0
+    ///      with a pool`), so the deploy path was safe and a later CONFIG_ADMIN call was not. The refusal is BY
+    ///      SELECTOR: a raw store would not revert at all, so "it reverted" is the whole assertion. The accepted
+    ///      values are then read back, so the refusal cannot be a refusal of everything.
+    function test_admin_setPool_refusesAZeroLiquidityFloor() public {
+        vm.startPrank(admin);
+        vm.expectRevert(V2Errors.CeilingExceeded.selector);
+        src.setPool(address(nvda), address(poolA), 0, 300);
+
+        // The smallest legal floor is accepted and stored as given -- NOT substituted with a default.
+        src.setPool(address(nvda), address(poolA), 1, 300);
+        (,,,, uint128 minLiq) = src.pools(address(nvda));
+        assertEq(minLiq, 1, "floor 1 was not stored as given");
+
+        // The fixture floor (MIN_LIQ, the registry's univ3MinLiquidity stand-in) is accepted as before.
+        src.setPool(address(nvda), address(poolA), MIN_LIQ, 300);
+        (,,,, minLiq) = src.pools(address(nvda));
+        assertEq(minLiq, MIN_LIQ, "the registry floor was not stored as given");
+
+        // Removal ignores the floor argument (the `pool == address(0)` branch returns before the checks), so a
+        // removal with 0 is still a removal and not a refusal.
+        src.setPool(address(nvda), address(0), 0, 0);
+        (address pool,,,, uint128 floorAfter) = src.pools(address(nvda));
+        assertEq(pool, address(0), "removal with a zero floor argument was refused");
+        assertEq(floorAfter, 0, "removal left a floor behind");
         vm.stopPrank();
     }
 
@@ -612,7 +647,7 @@ contract UniV3TwapSourceTest is Test {
         _allowOracle();
         _pinNvda(E);
         vm.prank(admin);
-        src.setPool(address(nvda), address(shallow), 0, 60);
+        src.setPool(address(nvda), address(shallow), 1, 60); // 1 L in the pool, floor 1: the smallest legal floor
 
         vm.warp(E);
         assertTrue(src.record(address(nvda), E), "pinned expiry recorded");
@@ -625,13 +660,14 @@ contract UniV3TwapSourceTest is Test {
         assertGt(price, 399_000_000, "from the new pool");
     }
 
-    /// The pinned floor holds: dropping it to zero after the pin does not let a thin window record for that expiry.
+    /// The pinned floor holds: dropping it to the smallest legal floor (1; zero is refused, T-OP-062) after the pin
+    /// does not let a thin window record for that expiry.
     function test_pin_droppedFloor_doesNotReachThePinnedExpiry() public {
         poolA.pushState(T0, 222615, MIN_LIQ / 2);
         _allowOracle();
         _pinNvda(E);
         vm.prank(admin);
-        src.setPool(address(nvda), address(poolA), 0, 300);
+        src.setPool(address(nvda), address(poolA), 1, 300);
         vm.warp(E);
         assertFalse(src.record(address(nvda), E), "pinned floor: too thin");
         vm.warp(E + 1);
@@ -713,8 +749,8 @@ contract UniV3TwapSourceTest is Test {
         a.pushState(T0, tick, L);
         b.pushState(T0, -tick, L);
         vm.startPrank(admin);
-        src.setPool(address(nvda), address(a), 0, 300);
-        src.setPool(address(tsla), address(b), 0, 300);
+        src.setPool(address(nvda), address(a), 1, 300);
+        src.setPool(address(tsla), address(b), 1, 300);
         vm.stopPrank();
         vm.warp(E);
 

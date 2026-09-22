@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {V8AccessTest} from "../lib/V8Access.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {ChainlinkFeedSource} from "../../../src/v2/oracle/ChainlinkFeedSource.sol";
 import {PriceLib} from "../../../src/v2/oracle/lib/PriceLib.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
@@ -22,7 +24,7 @@ contract SilentFeed {
 /// @dev Self-contained setup (C2-08 consolidates into BaseV2 later). NVDA-shaped feed: 8 decimals, "RHNVDA / USD".
 ///      Prices in the expectations are USDG base units per share (6 dp); feed answers are 8 dp, so `_ans(p)` is
 ///      `p * 100`. The window under test is `[start, end]` with `end` one hour before now.
-contract ChainlinkFeedSourceTest is Test {
+contract ChainlinkFeedSourceTest is V8AccessTest {
     address internal admin = makeAddr("admin");
     address internal stranger = makeAddr("stranger");
 
@@ -39,7 +41,9 @@ contract ChainlinkFeedSourceTest is Test {
         vm.warp(1_789_000_000);
         nvda = new MockStockToken("NVDA Stock Token", "NVDAx");
         feed = new MockRoundFeed(8, "RHNVDA / USD");
-        src = new ChainlinkFeedSource(admin);
+        _deployManager();
+        src = new ChainlinkFeedSource(address(manager));
+        _wire(address(src), "ChainlinkFeedSource", admin, 0);
         vm.prank(admin);
         src.setFeed(address(nvda), address(feed), 26 hours, 2000);
         end = uint40(block.timestamp - 1 hours);
@@ -210,14 +214,41 @@ contract ChainlinkFeedSourceTest is Test {
         _assertWindow(200_666_666);
     }
 
-    /// Non-monotonic timestamps: round 3 claims start + 1500 but round 4 is stamped start + 900. Round 3 is skipped
-    /// (its 500.00 answer would fail the jump rule if it were used); 200.00 for 900 s, 204.00 for 900 s.
-    function test_window_nonMonotonicRound_isSkipped() public {
+    /// SEC-46. Non-monotonic timestamps: round 3 claims start + 1500 but round 4, which follows it, is stamped
+    /// start + 900. The walk used to skip round 3 and jump-check the priced round 4 (204.00) against round 2 (200.00),
+    /// a round it does not follow, so its real predecessor was never checked: at 500.00 it would have failed the jump
+    /// rule. A timestamp running backwards inside the walk is now a feed fault and the window is not ok.
+    function test_window_nonMonotonicRound_notOk() public {
         feed.push(_ans(199_000_000), start - 4000);
         feed.push(_ans(200_000_000), start - 100);
         feed.push(_ans(500_000_000), start + 1500);
         feed.push(_ans(204_000_000), start + 900);
-        _assertWindow(202_000_000);
+        _assertWindowNotOk();
+    }
+
+    /// SEC-46, isolated from the jump rule: round 3's answer is sane (202.00, within 1 % of both neighbours) and only
+    /// its timestamp runs backwards, so the not-ok is the timestamp rule. POSITIVE CONTROL: the same round restamped
+    /// in order prices: 200.00 for 600 s, 202.00 for 300 s, 204.00 for 900 s =
+    /// (120,000 + 60,600 + 183,600) x 1e6 / 1800 = 202,333,333.3 -> 202_333_333.
+    function test_window_backwardsTimestamp_isTheFault() public {
+        feed.push(_ans(199_000_000), start - 4000);
+        feed.push(_ans(200_000_000), start - 100);
+        uint80 r3 = feed.push(_ans(202_000_000), start + 1500);
+        feed.push(_ans(204_000_000), start + 900);
+        _assertWindowNotOk();
+
+        feed.setRound(r3, _ans(202_000_000), start + 600);
+        _assertWindow(202_333_333);
+    }
+
+    /// A backwards timestamp among the rounds AFTER `end`, read before the walk accepts anything, is still just after
+    /// the window: those rounds are skipped whatever their order, as before SEC-46.
+    function test_window_backwardsTimestampAfterEnd_isIgnored() public {
+        feed.push(_ans(199_000_000), start - 4000);
+        feed.push(_ans(200_000_000), start - 50);
+        feed.push(_ans(210_000_000), end + 600);
+        feed.push(_ans(211_000_000), end + 60);
+        _assertWindow(200_000_000);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -452,13 +483,23 @@ contract ChainlinkFeedSourceTest is Test {
         assertFalse(ok, "mis-scaled head");
     }
 
-    function test_latest_nonMonotonicPredecessor_isSkipped() public {
+    /// SEC-46: a predecessor stamped after the head is the walk's timestamp fault. `latest` used to skip it and check
+    /// the head against the round before, which the head does not follow; now it is not ok. The predecessor's answer
+    /// is sane (201.00) so the not-ok is the timestamp. POSITIVE CONTROL: restamped before the head, the same round
+    /// makes the head ok.
+    function test_latest_nonMonotonicPredecessor_notOk() public {
         feed.push(_ans(199_000_000), start - 4000);
-        feed.push(_ans(900_000_000), start + 5000);
+        uint80 r2 = feed.push(_ans(201_000_000), start + 5000);
         feed.push(_ans(200_000_000), start - 100);
-        (bool ok, uint256 price,) = src.latest(address(nvda));
-        assertTrue(ok, "skips the round stamped after the head");
+        (bool ok, uint256 price, uint256 updatedAt) = src.latest(address(nvda));
+        assertFalse(ok, "a predecessor stamped after the head");
+        assertEq(price + updatedAt, 0, "zeroes when not ok");
+
+        feed.setRound(r2, _ans(201_000_000), start - 2000);
+        (ok, price, updatedAt) = src.latest(address(nvda));
+        assertTrue(ok, "in order: ok");
         assertEq(price, 200_000_000, "price");
+        assertEq(updatedAt, start - 100, "updatedAt");
     }
 
     function test_latest_badAnswers_notOk() public {
@@ -500,7 +541,8 @@ contract ChainlinkFeedSourceTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_admin_constructorAndDefaults() public {
-        assertTrue(src.hasRole(src.DEFAULT_ADMIN_ROLE(), admin), "admin role");
+        (bool isConfigAdmin,) = manager.hasRole(V8Roles.CONFIG_ADMIN, admin);
+        assertTrue(isConfigAdmin, "admin config role");
         assertEq(src.MAX_ROUND_READS(), 96, "read cap");
         assertEq(src.DEFAULT_MAX_STALE(), 26 hours, "default maxStale");
         assertEq(src.DEFAULT_MAX_ROUND_JUMP_BPS(), 2000, "default jump");
@@ -509,7 +551,7 @@ contract ChainlinkFeedSourceTest is Test {
         assertEq(maxStale, 26 hours, "maxStale");
         assertEq(jump, 2000, "jump");
 
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vm.expectRevert(V2Errors.NoSource.selector);
         new ChainlinkFeedSource(address(0));
     }
 

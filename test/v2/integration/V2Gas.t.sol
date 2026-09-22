@@ -73,20 +73,16 @@ contract V2GasTest is V2IntegrationBase {
     //////////////////////////////////////////////////////////////*/
 
     function test_gas_mint() public {
-        vm.prank(alice);
-        ch.mint(callId, 100, alice, bob);
+        _mintAs(alice, callId, 100, bob);
         _log("mint call, first supply of the series and first balances", _gas(), 240_000);
-        vm.prank(alice);
-        ch.mint(callId, 100, alice, bob);
+        _mintAs(alice, callId, 100, bob);
         _log("mint call, repeat", _gas(), 110_000);
-        vm.prank(alice);
-        ch.mint(putId, 100, alice, bob);
+        _mintAs(alice, putId, 100, bob);
         _log("mint put, first supply of the series", _gas(), 240_000);
     }
 
     function test_gas_close() public {
-        vm.prank(alice);
-        ch.mint(callId, 100, alice, alice);
+        _mintAs(alice, callId, 100, alice);
         vm.prank(alice);
         ch.close(callId, 40);
         _log("close, partial", _gas(), 90_000);
@@ -118,16 +114,14 @@ contract V2GasTest is V2IntegrationBase {
         vm.prank(bob);
         book.place(putId, BID, PRICE, 100, 0);
         _log("place Bid (USDG escrow)", _gas(), 260_000);
-        vm.prank(carol);
-        ch.mint(callId, 100, carol, carol);
+        _mintAs(carol, callId, 100, carol);
         vm.prank(carol);
         book.place(callId, RESALE, PRICE, 100, 0);
         _log("place AskResale (ERC-1155 escrow)", _gas(), 280_000);
     }
 
     function test_gas_cancel() public {
-        vm.prank(carol);
-        ch.mint(callId, 100, carol, carol);
+        _mintAs(carol, callId, 100, carol);
         uint256 w = _place(alice, callId, WRITE, PRICE, 100);
         uint256 b = _place(bob, putId, BID, PRICE, 100);
         uint256 r = _place(carol, callId, RESALE, PRICE, 100);
@@ -161,46 +155,43 @@ contract V2GasTest is V2IntegrationBase {
         uint256[5] memory b;
         for (uint256 i; i < 5; ++i) {
             w[i] = _place(makers[i], callId, WRITE, PRICE, 10);
-            vm.prank(makers[i]);
-            ch.mint(callId, 20, makers[i], makers[i]);
+            _mintAs(makers[i], callId, 20, makers[i]);
             r[i] = _place(makers[i], callId, RESALE, PRICE, 10);
             b[i] = _place(makers[i], putId, BID, PRICE, 20);
         }
         uint256 w1 = _place(carol, callId, WRITE, PRICE, 10);
-        vm.prank(carol);
-        ch.mint(callId, 10, carol, carol);
+        _mintAs(carol, callId, 10, carol);
         uint256 r1 = _place(carol, callId, RESALE, PRICE, 10);
         uint256 b1 = _place(carol, putId, BID, PRICE, 20);
-        vm.prank(bob);
-        ch.mint(putId, 60, bob, bob);
+        _mintAs(bob, putId, 60, bob);
         // warm the takers' balances of both ids
-        vm.prank(alice);
-        ch.mint(callId, 1, alice, alice);
+        _mintAs(alice, callId, 1, alice);
 
         vm.prank(alice);
         book.take(_buyParams(callId, _ids(w1), 10, 0, alice));
-        _log("take buy AskWrite x1", _gas(), 300_000);
+        // MEASURED on this tree (C8-09c): take buy AskWrite x1 = 225,153. Ceiling is measured + ~10% headroom.
+        _log("take buy AskWrite x1", _gas(), 250_000);
         vm.prank(alice);
         book.take(_buyParams(callId, _ids(w[0], w[1], w[2], w[3], w[4]), 50, 0, alice));
-        _log("take buy AskWrite x5", _gas(), 650_000);
+        _log("take buy AskWrite x5", _gas(), 560_000);
         vm.prank(alice);
         book.take(_buyParams(callId, _ids(r1), 10, 0, alice));
-        _log("take buy AskResale x1", _gas(), 170_000);
+        _log("take buy AskResale x1", _gas(), 150_000);
         vm.prank(alice);
         book.take(_buyParams(callId, _ids(r[0], r[1], r[2], r[3], r[4]), 50, 0, alice));
-        _log("take buy AskResale x5", _gas(), 400_000);
+        _log("take buy AskResale x5", _gas(), 340_000);
         vm.prank(bob);
         book.take(_sellParams(putId, _ids(b1), 10, false, bob));
-        _log("take sell into Bid from inventory x1", _gas(), 200_000);
+        _log("take sell into Bid from inventory x1", _gas(), 180_000);
         vm.prank(bob);
         book.take(_sellParams(putId, _ids(b[0], b[1], b[2], b[3], b[4]), 50, false, bob));
-        _log("take sell into Bid from inventory x5", _gas(), 520_000);
+        _log("take sell into Bid from inventory x5", _gas(), 340_000);
         vm.prank(mm);
         book.take(_sellParams(putId, _ids(b1), 10, true, mm));
-        _log("take sell into Bid writeToSell x1", _gas(), 300_000);
+        _log("take sell into Bid writeToSell x1", _gas(), 250_000);
         vm.prank(mm);
         book.take(_sellParams(putId, _ids(b[0], b[1], b[2], b[3], b[4]), 50, true, mm));
-        _log("take sell into Bid writeToSell x5", _gas(), 650_000);
+        _log("take sell into Bid writeToSell x5", _gas(), 420_000);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -209,20 +200,15 @@ contract V2GasTest is V2IntegrationBase {
 
     /// @dev Positions on both series, a resale ask and a bid left open, the window printed, time at E.
     function _positionsThroughExpiry() internal returns (uint256 resaleAsk, uint256 bid, uint256 writeAsk) {
-        vm.prank(alice);
-        ch.mint(callId, 100, alice, bob);
-        vm.prank(carol);
-        ch.mint(callId, 50, carol, mm);
-        vm.prank(alice);
-        ch.mint(putId, 100, alice, bob);
-        vm.prank(carol);
-        ch.mint(putId, 50, carol, mm);
+        _mintAs(alice, callId, 100, bob);
+        _mintAs(carol, callId, 50, mm);
+        _mintAs(alice, putId, 100, bob);
+        _mintAs(carol, putId, 50, mm);
         resaleAsk = _place(bob, callId, RESALE, PRICE, 20);
         bid = _place(mm, putId, BID, PRICE, 20);
         writeAsk = _place(alice, callId, WRITE, PRICE, 20);
         for (uint256 i; i < 5; ++i) {
-            vm.prank(alice);
-            ch.mint(callId, 10, alice, makers[i]);
+            _mintAs(alice, callId, 10, makers[i]);
         }
 
         vm.warp(E - 2 hours);
@@ -370,29 +356,25 @@ contract V2GasTest is V2IntegrationBase {
         V2Types.MarketConfig memory cfg = _nvdaMarket();
         cfg.mintFeePpm = ppm;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
         rentCallId = ch.createSeries(address(nvda), false, 225_000_000, E);
         rentPutId = ch.createSeries(address(nvda), true, 225_000_000, E);
     }
 
     function test_gas_mint_withRent() public {
         (uint256 rentCallId, uint256 rentPutId) = _registerNvdaAtRent(80);
-        vm.prank(alice);
-        ch.mint(rentCallId, 100, alice, bob);
+        _mintAs(alice, rentCallId, 100, bob);
         _log("v7 mint call with rent, first supply of the series and first balances", _gas(), 250_000);
-        vm.prank(alice);
-        ch.mint(rentCallId, 100, alice, bob);
+        _mintAs(alice, rentCallId, 100, bob);
         _log("v7 mint call with rent, repeat", _gas(), 120_000);
-        vm.prank(alice);
-        ch.mint(rentPutId, 100, alice, bob);
+        _mintAs(alice, rentPutId, 100, bob);
         _log("v7 mint put with rent, first supply of the series", _gas(), 250_000);
         assertGt(ch.series(rentCallId).mintFeesHeld, 0, "rent was actually charged");
     }
 
     function test_gas_close_withRent() public {
         (uint256 rentCallId,) = _registerNvdaAtRent(80);
-        vm.prank(alice);
-        ch.mint(rentCallId, 100, alice, alice);
+        _mintAs(alice, rentCallId, 100, alice);
         vm.prank(alice);
         ch.close(rentCallId, 40);
         _log("v7 close with a rent refund, partial", _gas(), 100_000);
@@ -407,7 +389,7 @@ contract V2GasTest is V2IntegrationBase {
         V2Types.MarketConfig memory cfg = _nvdaMarket();
         cfg.mintFeePpm = 80;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
         vm.prank(keeper);
         ch.createSeries(address(nvda), false, 225_000_000, FRI_2026_09_11);
         _log("v7 createSeries with rent, first series of the expiry", _gas(), 420_000);
@@ -434,8 +416,7 @@ contract V2GasTest is V2IntegrationBase {
     ///      already non-zero here (the exercise fee accrues in the same call), which is the cheaper of the two cases.
     function test_gas_settle_withRentHeld() public {
         (uint256 rentCallId,) = _registerNvdaAtRent(80);
-        vm.prank(alice);
-        ch.mint(rentCallId, 100, alice, bob);
+        _mintAs(alice, rentCallId, 100, bob);
         assertGt(ch.series(rentCallId).mintFeesHeld, 0, "rent is held before settlement");
         vm.warp(E - 2 hours);
         _print(221_000_000, 222340, E - 2 hours);

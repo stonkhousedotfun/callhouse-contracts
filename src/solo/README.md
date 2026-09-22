@@ -13,8 +13,18 @@ This is a different product from the pooled `Vault`. No `cNVDA`. No shared NAV.
 
 ## Deploy
 
+One factory per market, driven from the registry (`ops/markets/tier1.json` in stonkhousedotfun/callhouse):
+
 ```
-forge script script/DeploySolo.s.sol --rpc-url $RH_RPC --broadcast --slow --non-interactive --chain 4663
+script/DeploySoloBatch.sh --rehearse --rpc http://127.0.0.1:8546 --tickers TSLA,GME,SPY   # anvil fork first
+script/DeploySoloBatch.sh --broadcast --rpc $RH_RPC --wave canary                         # mainnet, asks for "deploy"
 ```
 
-Grant `KEEPER_ROLE` / `GUARDIAN_ROLE` on the factory. Point the app at `NEXT_PUBLIC_FACTORY`. The live pooled vault is unchanged.
+The batch runs `script/DeploySolo.s.sol` (on-chain preflight: the asset's `symbol()` and the feed's
+`description()` must match `EXPECTED_TICKER`, decimals, `uiMultiplier()`, `oraclePaused()`, feed
+freshness, Clear fee state, Seaport 1.6), then `script/ConfigureSolo.s.sol` (`KEEPER_ROLE` and
+`GUARDIAN_ROLE` from the registry row, idempotent) and `script/VerifySolo.s.sol` (read-only, bytecode
+against `out/`, every immutable, parameter and role), and writes `deployment.factory`,
+`implementation`, `deployBlock`, `deployTx`, `sourcify`, `configuredAt` back into the registry.
+`docs/DEPLOY.md` "Solo factory markets (Tier 1)" has the env tables, the flags and the rehearsal record.
+Point the app at `NEXT_PUBLIC_FACTORY` (per market). The live pooled vault is unchanged and closed.

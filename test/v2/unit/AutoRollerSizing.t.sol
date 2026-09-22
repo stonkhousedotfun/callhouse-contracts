@@ -27,7 +27,7 @@ contract AutoRollerSizingTest is AutoRollerTestBase {
         V2Types.MarketConfig memory m = ch.market(address(nvda));
         m.mintFeePpm = ppm;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), m);
+        _reconfigure(ch, address(nvda), m);
     }
 
     /// @dev What a roll at Thursday 10:00 pays in rent for one unit at `ppm`.

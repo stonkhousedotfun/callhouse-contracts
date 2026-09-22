@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {Managed} from "./access/Managed.sol";
 import {IKeeperRewards} from "./interfaces/IKeeperRewards.sol";
 import {V2Constants} from "./interfaces/V2Constants.sol";
 import {V2Errors} from "./interfaces/V2Errors.sol";
@@ -32,7 +32,7 @@ import {V2Errors} from "./interfaces/V2Errors.sol";
 ///      THE BUDGET IS THE BALANCE. There is no internal budget counter: {reward} pays out of whatever USDG this
 ///      contract holds, so USDG sent here directly also funds bounties, and USDG the issuer burns or wipes here
 ///      simply is not paid. {fund} measures the balance delta so {Funded} reports what actually arrived.
-contract KeeperRewards is IKeeperRewards, AccessControl, ReentrancyGuardTransient {
+contract KeeperRewards is IKeeperRewards, Managed, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -87,6 +87,11 @@ contract KeeperRewards is IKeeperRewards, AccessControl, ReentrancyGuardTransien
     /// @notice Whether `caller` is a registered protocol contract allowed to call {reward}.
     mapping(address caller => bool) public isCaller;
 
+    /// @inheritdoc IKeeperRewards
+    /// @dev INTERFACE_VERSION 8: the Treasury Safe, set once by the constructor. Protocol-owned money (bounties) can
+    ///      only leave to it; {defund} has no free `to` argument any more.
+    address public treasury;
+
     /// @dev The spend window packed into one word: `epoch << BUCKETS_BITS | b4 << 172 | ... | b1 << 43 | b0`, where
     ///      `epoch = timestamp / EPOCH` of the last booked payment, b0 is that epoch's spend and b_i the spend i epochs
     ///      before it, USDG base units. Advancing k epochs is a left shift by k buckets: the oldest fall off the top.
@@ -96,13 +101,13 @@ contract KeeperRewards is IKeeperRewards, AccessControl, ReentrancyGuardTransien
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice DEFAULT_ADMIN_ROLE registered (`registered = true`) or unregistered `caller` for {reward}.
+    /// @notice The CONFIG_ADMIN lane registered (`registered = true`) or unregistered `caller` for {reward}.
     event CallerSet(address indexed caller, bool registered);
-    /// @notice DEFAULT_ADMIN_ROLE set the cap to `amount` USDG base units per rolling 24 h.
+    /// @notice The FEE_MANAGER lane set the cap to `amount` USDG base units per rolling 24 h.
     event DailyCapSet(uint256 amount);
     /// @notice `from` added `amount` USDG base units to the budget (the measured balance delta).
     event Funded(address indexed from, uint256 amount);
-    /// @notice DEFAULT_ADMIN_ROLE withdrew `amount` USDG base units of the budget to `to`.
+    /// @notice The TREASURY_ADMIN lane withdrew `amount` USDG base units of the budget to `to`.
     event Defunded(address indexed to, uint256 amount);
 
     /*//////////////////////////////////////////////////////////////
@@ -111,17 +116,13 @@ contract KeeperRewards is IKeeperRewards, AccessControl, ReentrancyGuardTransien
 
     /// @param usdg_ The bounty token (USDG). Must be a contract: the payout path treats empty return data as success,
     ///        which a code-less address would always give.
-    /// @param admin Receives DEFAULT_ADMIN_ROLE: registers callers, sets bounties and the cap, defunds.
-    constructor(IERC20 usdg_, address admin) {
+    /// @param authority The `AccessManager` that maps this contract's selectors to roles (V8Roles).
+    /// @param treasury_ The Treasury Safe {defund} pays. Zero is refused, so the pointer can never be unset.
+    constructor(IERC20 usdg_, address authority, address treasury_) Managed(authority) {
         if (address(usdg_).code.length == 0) revert V2Errors.UnsupportedAsset();
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
+        if (treasury_ == address(0)) revert V2Errors.NotAuthorized();
         usdg = usdg_;
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-    }
-
-    modifier onlyAdmin() {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
-        _;
+        treasury = treasury_;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -180,46 +181,62 @@ contract KeeperRewards is IKeeperRewards, AccessControl, ReentrancyGuardTransien
         emit Funded(msg.sender, received);
     }
 
-    /// @notice Withdraw `amount` USDG base units of the budget to `to`. DEFAULT_ADMIN_ROLE.
-    /// @dev Reverts if the transfer fails (SafeERC20), including for more than the balance. The spend window is left
-    ///      as it is: defunding lowers what can be paid, never what has been counted.
-    /// @param to Recipient.
-    /// @param amount USDG base units.
-    function defund(address to, uint256 amount) external nonReentrant onlyAdmin {
+    /// @inheritdoc IKeeperRewards
+    /// @dev INTERFACE_VERSION 8: TREASURY_ADMIN (24 h). Pays {treasury} only; the v7 free-`to` form is deleted.
+    ///      The `Defunded(to, amount)` topic is unchanged and now always reports {treasury}.
+    function defund(uint256 amount) external nonReentrant restricted {
+        address to = treasury;
         emit Defunded(to, amount);
         usdg.safeTransfer(to, amount);
     }
 
+    /// @notice Sets the only address {defund} can pay. TREASURY_ADMIN (24 h).
+    /// @param treasury_ The Treasury Safe; zero is refused (`NotAuthorized`), so the pointer can never be unset.
+    function setTreasury(address treasury_) external nonReentrant restricted {
+        if (treasury_ == address(0)) revert V2Errors.NotAuthorized();
+        treasury = treasury_;
+        emit TreasurySet(treasury_);
+    }
+
     /*//////////////////////////////////////////////////////////////
-                                 ADMIN
+                  SETTERS (CONFIG_ADMIN, FEE_MANAGER)
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Register (`registered = true`) or unregister `caller` as a protocol contract allowed to call {reward}.
-    ///         DEFAULT_ADMIN_ROLE.
+    ///         CONFIG_ADMIN (24 h).
     /// @param caller The protocol contract (SettlementOracle, Clearinghouse, AutoRoller).
     /// @param registered Whether it may call {reward}.
-    function setCaller(address caller, bool registered) external nonReentrant onlyAdmin {
+    /// @dev SEC-39 IS CLOSED HERE, NOT FIXED, and this is the note that says so. {reward} trusts a registered
+    ///      caller completely -- it never checks that the call it is paying for happened. That is DELIBERATE and is
+    ///      stated at the top of this contract (ELIGIBILITY IS THE CALLER'S JOB): this contract does not know what a
+    ///      series or an expiry is, so it cannot re-derive eligibility, and the trust is bounded three ways instead
+    ///      -- MAX_BOUNTY per call ({setBounty} reverts above 1 USDG), the rolling daily cap, and the balance.
+    ///      The one tightening available here would be to refuse a code-less `caller`, mirroring
+    ///      Clearinghouse.setKeeperRewards. It is NOT applied: this suite's own fixture registers EOAs as callers
+    ///      deliberately (test/v2/unit/KeeperRewards.t.sol:112-113 and :140), so the change is a rewrite of the
+    ///      tests rather than a change in behaviour on chain, and it belongs in a row that owns that decision.
+    function setCaller(address caller, bool registered) external nonReentrant restricted {
         isCaller[caller] = registered;
         emit CallerSet(caller, registered);
     }
 
-    /// @notice Set the bounty of `action` to `amount` USDG base units. DEFAULT_ADMIN_ROLE.
+    /// @notice Set the bounty of `action` to `amount` USDG base units. FEE_MANAGER (48 h).
     /// @dev Reverts CeilingExceeded above MAX_BOUNTY (1_000_000 = 1 USDG). Any action id is accepted, not only the five
     ///      V2Constants.ACTION_* ids, so a later protocol contract can be paid without a new KeeperRewards; an id
     ///      nobody reports is simply never paid. 0 disables the action.
     /// @param action Bounty action id, e.g. V2Constants.ACTION_SETTLE.
     /// @param amount USDG base units per call, <= MAX_BOUNTY.
-    function setBounty(bytes32 action, uint256 amount) external nonReentrant onlyAdmin {
+    function setBounty(bytes32 action, uint256 amount) external nonReentrant restricted {
         if (amount > V2Constants.MAX_BOUNTY) revert V2Errors.CeilingExceeded();
         bounty[action] = amount;
         emit BountySet(action, amount);
     }
 
-    /// @notice Set the maximum spend per rolling 24 h to `amount` USDG base units. DEFAULT_ADMIN_ROLE.
+    /// @notice Set the maximum spend per rolling 24 h to `amount` USDG base units. FEE_MANAGER (48 h).
     /// @dev Takes effect on the next {reward}; spend already counted stays counted, so lowering the cap below
     ///      {spentToday} pays nothing until enough epochs roll out. No compiled ceiling: the balance bounds it.
     /// @param amount USDG base units.
-    function setDailyCap(uint256 amount) external nonReentrant onlyAdmin {
+    function setDailyCap(uint256 amount) external nonReentrant restricted {
         dailyCap = amount;
         emit DailyCapSet(amount);
     }

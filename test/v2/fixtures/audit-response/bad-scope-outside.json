@@ -1,0 +1,97 @@
+{
+  "interfaceVersion": 8,
+  "auditor": "Example Audit Co (fixture, not an engagement)",
+  "packetShas": {
+    "contracts": "d50c6ac7b7756036095c8f4ce1c016df80e4a333",
+    "app": "d50c6ac7b7756036095c8f4ce1c016df80e4a333",
+    "site": "d50c6ac7b7756036095c8f4ce1c016df80e4a333",
+    "docs": "d50c6ac7b7756036095c8f4ce1c016df80e4a333"
+  },
+  "findings": [
+    {
+      "id": "FIX-01",
+      "severity": "high",
+      "title": "Fixture: a fixed finding, with a fix commit and a regression test",
+      "scope": [
+        "src/Vault.sol"
+      ],
+      "status": "fixed",
+      "fixCommit": "d50c6ac7b7756036095c8f4ce1c016df80e4a333",
+      "regressionTest": "test/v2/InterfaceIds.t.sol::test_constants_roles",
+      "rationale": null,
+      "ownerAccepted": {
+        "by": null,
+        "date": null
+      },
+      "reReviewed": {
+        "date": null
+      },
+      "interfaceImpact": false,
+      "interfaceLogEntry": null
+    },
+    {
+      "id": "ACC-01",
+      "severity": "low",
+      "title": "Fixture: an accepted risk, with a rationale the owner signed",
+      "scope": [
+        "src/v2/Clearinghouse.sol",
+        "script/v2/roles.v8.json"
+      ],
+      "status": "accepted",
+      "fixCommit": null,
+      "regressionTest": null,
+      "rationale": "Fixture rationale. The real register cites v8-plan/00-MASTER section 7 rather than restating it.",
+      "ownerAccepted": {
+        "by": "owner",
+        "date": "2026-09-20"
+      },
+      "reReviewed": {
+        "date": null
+      },
+      "interfaceImpact": false,
+      "interfaceLogEntry": null
+    },
+    {
+      "id": "DIS-01",
+      "severity": "medium",
+      "title": "Fixture: a disputed finding",
+      "scope": [
+        "src/v2/oracle/SettlementOracle.sol"
+      ],
+      "status": "disputed",
+      "fixCommit": null,
+      "regressionTest": null,
+      "rationale": "Fixture: the dispute is argued in the response document, not here.",
+      "ownerAccepted": {
+        "by": null,
+        "date": null
+      },
+      "reReviewed": {
+        "date": null
+      },
+      "interfaceImpact": false,
+      "interfaceLogEntry": null
+    },
+    {
+      "id": "OOS-01",
+      "severity": "informational",
+      "title": "Fixture: an out-of-scope finding with an interface move that IS logged",
+      "scope": [
+        "src/v2/periphery/FeeSplitter.sol"
+      ],
+      "status": "out-of-scope",
+      "fixCommit": null,
+      "regressionTest": null,
+      "rationale": "Fixture: outside the audited surface.",
+      "ownerAccepted": {
+        "by": null,
+        "date": null
+      },
+      "reReviewed": {
+        "date": null
+      },
+      "interfaceImpact": true,
+      "interfaceLogEntry": "v8-plan/status/INTERFACE-CHANGES-V8.md Entry 9 (fixture reference)"
+    }
+  ]
+}

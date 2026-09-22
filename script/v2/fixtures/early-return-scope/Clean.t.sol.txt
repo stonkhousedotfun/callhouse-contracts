@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+// FIXTURE, copied to test/Clean.t.sol on its own: only permitted shapes, so the tool must exit 0 --
+// and must still SEE each return (the test reads them back from --json), so a clean result is
+// "seen and cleared" rather than "never looked".
+
+interface Vm {
+    function skip(bool) external;
+}
+
+contract Clean {
+    Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    uint256 internal x;
+
+    modifier onlyFork() {
+        if (block.chainid != 4663) {
+            vm.skip(true);
+            return; // PERMIT: modifier: vm.skip(true) dominates
+        }
+        _;
+    }
+
+    function setUp() public {
+        if (block.chainid != 4663) return; // PERMIT: setUp is not a test body
+        x = 1;
+    }
+
+    function _ready() internal view returns (bool) {
+        return x != 0; // PERMIT: not a test function
+    }
+
+    function test_forkOnly() public onlyFork {
+        if (!_ready()) {
+            vm.skip(true);
+            return; // PERMIT: vm.skip(true) dominates
+        }
+        require(x == 1, "x");
+    }
+}

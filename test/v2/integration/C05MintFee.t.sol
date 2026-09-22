@@ -10,7 +10,7 @@ import {OptionMath} from "../../../src/v2/lib/OptionMath.sol";
 
 /// @notice c05 on the real contracts: the writer fee is rent on the collateral a mint locks, charged by
 ///         {Clearinghouse.mint} however the mint was reached, refunded pro rata by {Clearinghouse.close} and accrued
-///         to the treasury at {Clearinghouse.settle} (INTERFACE_VERSION 7, v7 design §2, §4.3, §6.1, §6.2).
+///         to the FeeSplitter at {Clearinghouse.settle} (INTERFACE_VERSION 8: {feeRecipient} is the splitter, not an EOA).
 /// @dev WHY THIS SUITE EXISTS. Until v7 the writer fee was `premiumFeeBps` of the premium of a PRIMARY book fill, so a
 ///      writer avoided it by never letting the book mint: mint directly and rest an AskResale (resale fee 0), or
 ///      `writeToSell` into a one-tick bid from a second address of its own and resell the longs at the real price.
@@ -43,8 +43,11 @@ contract C05MintFeeTest is V2IntegrationBase {
 
     function setUp() public override {
         super.setUp();
-        vm.prank(admin);
-        ch.registerMarket(address(nvda), _rentMarket(NVDA_PPM));
+        vm.startPrank(admin);
+        ch.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch.setMarketOracle(address(nvda), address(oracle));
+        ch.setMarketFees(address(nvda), EXERCISE_FEE_BPS, NVDA_PPM);
+        vm.stopPrank();
         address[4] memory traders = [alice, bob, carol, mm];
         for (uint256 i; i < traders.length; ++i) {
             _onboard(traders[i]);
@@ -73,13 +76,17 @@ contract C05MintFeeTest is V2IntegrationBase {
 
         // The PoC's deposit: collateral and not one base unit more. It used to mint.
         _deposit(alice, address(nvda), ONE_SHARE);
-        vm.expectRevert(abi.encodeWithSelector(V2Errors.InsufficientCollateral.selector, ONE_SHARE, ONE_SHARE + fee));
+        // T-603: authorise BEFORE the expectRevert -- `vm.expectRevert` binds to the NEXT call, so leaving it
+        // above `setOperator` points the expectation at a call that succeeds.
         vm.prank(alice);
+        ch.setOperator(address(this), true);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.InsufficientCollateral.selector, ONE_SHARE, ONE_SHARE + fee));
         ch.mint(c230, HUNDRED, alice, alice);
 
         // Route 1: direct mint to self, then an AskResale a buyer lifts. The rent is held by the series.
         _deposit(alice, address(nvda), fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(c230, HUNDRED, alice, alice);
         assertEq(ch.series(c230).mintFeesHeld, fee, "route 1 rent is held");
         assertEq(ch.free(alice, address(nvda)), 0, "route 1 spent collateral and rent");
@@ -91,6 +98,7 @@ contract C05MintFeeTest is V2IntegrationBase {
         // Route 2: a direct mint whose longs go straight to someone else.
         _deposit(carol, address(nvda), ONE_SHARE + fee);
         vm.prank(carol);
+        ch.setOperator(address(this), true);
         ch.mint(c230, HUNDRED, carol, bob);
         assertEq(ch.series(c230).mintFeesHeld, 2 * fee, "route 2 paid the same");
 
@@ -151,6 +159,7 @@ contract C05MintFeeTest is V2IntegrationBase {
         uint256 fee = ch.mintFee(c230, HUNDRED);
         _deposit(alice, address(nvda), ONE_SHARE + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(c230, HUNDRED, alice, alice);
 
         vm.warp(block.timestamp + 2 days);
@@ -169,6 +178,7 @@ contract C05MintFeeTest is V2IntegrationBase {
         uint256 fee = ch.mintFee(c230, HUNDRED);
         _deposit(alice, address(nvda), ONE_SHARE + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(c230, HUNDRED, alice, alice);
 
         _settleAt(E, 240_000_000, TICK_240);
@@ -182,10 +192,10 @@ contract C05MintFeeTest is V2IntegrationBase {
         ch.redeem(V2Ids.shortIdOf(c230), alice);
         uint256 total = ch.accruedFees(address(nvda));
         assertGt(total, fee, "the exercise fee joined it");
-        uint256 before = nvda.balanceOf(chFees);
+        uint256 before = nvda.balanceOf(address(splitter));
         vm.prank(admin);
         ch.sweepFees(address(nvda));
-        assertEq(nvda.balanceOf(chFees) - before, total, "one sweep sends rent and exercise fees together");
+        assertEq(nvda.balanceOf(address(splitter)) - before, total, "one sweep sends rent and exercise fees together");
     }
 
     /// @notice A put's rent is USDG, charged against the writer's USDG ledger and never against the strike it locks.
@@ -197,6 +207,7 @@ contract C05MintFeeTest is V2IntegrationBase {
 
         _deposit(alice, address(usdg), collateral + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(p210, units, alice, alice);
         assertEq(ch.locked(p210), collateral, "locked is the strike, never the rent");
         assertEq(ch.free(alice, address(usdg)), 0, "rent came out of free USDG");
@@ -227,6 +238,7 @@ contract C05MintFeeTest is V2IntegrationBase {
             uint256 fee = ch.mintFee(c230, units);
             _deposit(writers[i], address(nvda), uint256(units) * V2Constants.UNIT + fee);
             vm.prank(writers[i]);
+            ch.setOperator(address(this), true);
             ch.mint(c230, units, writers[i], mm);
             charged += fee;
             assertEq(ch.series(c230).mintFeesHeld, charged, "every mint adds its rent to the series");

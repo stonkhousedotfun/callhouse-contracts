@@ -10,14 +10,23 @@ import {V2Types} from "./V2Types.sol";
 /// @dev The fallback chain has three outcomes. Corroborated: the first ok source that agrees with another ok source
 ///      within the expiry's maxDeviationBps is final immediately. Uncorroborated: the highest-priority ok source
 ///      becomes a candidate (status Pending) and is final only after the expiry's uncorroboratedDelay unless the
-///      guardian vetoes. Held: vetoed; DEFAULT_ADMIN_ROLE resolves after RESOLVE_DELAY, or the veto is lifted. "The
-///      expiry's" parameters are the ones pinned by {pin}, or the market's for an expiry no series pinned.
+///      guardian vetoes. Held: vetoed; CONFIG_ADMIN resolves it through {adminResolve} after RESOLVE_DELAY, or
+///      GUARDIAN lifts the veto through {unveto}. "The expiry's" parameters are the ones pinned by {pin}, or the
+///      market's for an expiry no series pinned.
 ///      Disagreement is deliberately not terminal: holding a pool off-price for 30 minutes buys an attacker a
 ///      delay, never a frozen payout. Settlement of one expiry never affects any other.
 ///
 ///      Prices are USDG base units (6 dp) per whole share. Market configuration (sources, maxDeviationBps,
 ///      uncorroboratedDelay, spotMaxAge, the Clearinghouse pointer used for the open-interest bounty gate and for
-///      {pin}) is DEFAULT_ADMIN_ROLE implementation surface; only its MarketSourcesSet event is frozen here.
+///      {pin}) is CONFIG_ADMIN implementation surface; only its MarketSourcesSet event is frozen here.
+///
+///      ACCESS (INTERFACE_VERSION 8). Roles are not on the oracle: the restricted functions are gated by the one
+///      AccessManager, and `script/v2/roles.v8.json` maps {veto} and {unveto} to GUARDIAN (no execution delay) and
+///      {adminResolve} and the configuration setters to CONFIG_ADMIN (24 h execution delay, so the call is scheduled
+///      on the manager first). A caller without the role reverts V2Errors.NotAuthorized, not OpenZeppelin's
+///      AccessManagedUnauthorized, because Managed._checkCanCall replaces it. A CONFIG_ADMIN call that was not
+///      scheduled, is not ready yet or has expired reverts with the manager's own AccessManagerNotScheduled,
+///      AccessManagerNotReady or AccessManagerExpired.
 ///
 ///      PINNING (INTERFACE_VERSION 6). The Clearinghouse calls {pin} when it creates a series, so the configuration an
 ///      expiry settles on is fixed while its series are live: the market's sources, maxDeviationBps and
@@ -34,8 +43,13 @@ interface ISettlementOracle {
     /// @notice Current spot of `underlying` from source 0 (highest priority), for the AutoRoller and the strike band
     ///         at series creation; the Clearinghouse also reads {trySpot} for the floor of a payout conversion.
     /// @dev Anyone. Reverts (V2Errors.NoSource, V2Errors.StaleSpot) unless source 0 is ok, `now - updatedAt` is
-    ///      within the market's spotMaxAge (default 1 h) and the token's oraclePaused() is false. Market-level: it reads
-    ///      the market's CURRENT source list and spotMaxAge, never an expiry's pinned copy, because it settles nothing.
+    ///      within the market's spotMaxAge (default 1 h) and the token's oraclePaused() is false. A print older than the
+    ///      implementation's SPOT_CORROBORATION_AGE (30 min, owner ruling SEC-08b/c) is also StaleSpot when the market's
+    ///      source 1 is ok and disagrees with it by more than maxDeviationBps: past that bound, accuracy is judged by
+    ///      agreement with the pool rather than by the clock, because the 4663 feeds print on a 0.5 % move or a 24 h
+    ///      heartbeat and a quiet session leaves an accurate print hours old. The price is always source 0's. Market-level:
+    ///      it reads the market's CURRENT source list, maxDeviationBps and spotMaxAge, never an expiry's pinned copy,
+    ///      because it settles nothing.
     /// @param underlying 18-dp Stock Token.
     /// @return price USDG base units (6 dp) per whole share.
     /// @return updatedAt Unix seconds of the observation.
@@ -88,17 +102,19 @@ interface ISettlementOracle {
         returns (V2Types.SettlementStatus status, uint256 price);
 
     /// @notice Vetoes the uncorroborated path for (underlying, expiry): None or Pending -> Held.
-    /// @dev GUARDIAN_ROLE only (V2Errors.NotAuthorized). Reverts V2Errors.AlreadyFinal once Finalized. Blocks the
-    ///      uncorroborated path only: sources that corroborate later still finalize through {finalize}.
+    /// @dev GUARDIAN only, with no execution delay (roles.v8.json); any other caller reverts V2Errors.NotAuthorized.
+    ///      Reverts V2Errors.AlreadyFinal once Finalized. Blocks the uncorroborated path only: sources that corroborate
+    ///      later still finalize through {finalize}.
     /// @param underlying 18-dp Stock Token.
     /// @param expiry Expiry, unix seconds.
     function veto(address underlying, uint40 expiry) external; // GUARDIAN; None|Pending -> Held
 
     /// @notice Lifts a veto: Held -> Pending, with the uncorroborated delay restarted from this call.
-    /// @dev GUARDIAN_ROLE or DEFAULT_ADMIN_ROLE (V2Errors.NotAuthorized). Emits SettlementUnvetoed.
+    /// @dev GUARDIAN only, with no execution delay (roles.v8.json); any other caller reverts V2Errors.NotAuthorized.
+    ///      v7 also let DEFAULT_ADMIN_ROLE unveto; v8 maps no admin role to it. Emits SettlementUnvetoed.
     /// @param underlying 18-dp Stock Token.
     /// @param expiry Expiry, unix seconds.
-    function unveto(address underlying, uint40 expiry) external; // GUARDIAN or ADMIN; Held -> Pending, delay restarts
+    function unveto(address underlying, uint40 expiry) external; // GUARDIAN; Held -> Pending, delay restarts
 
     /// @notice The uncorroborated candidate of (underlying, expiry), if any.
     /// @dev Anyone. All zero when no candidate was ever set. While Pending, {finalize} may finalize it from
@@ -116,16 +132,18 @@ interface ISettlementOracle {
         returns (uint256 price, uint8 sourceIndex, bool disagreed, uint40 finalizableAt);
 
     /// @notice Sets the final price of an expiry that did not settle through the sources.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). Reverts V2Errors.TooEarly(expiry + RESOLVE_DELAY)
-    ///      before 48 h after expiry, V2Errors.AlreadyFinal once Finalized, and V2Errors.ResolveOutOfBand(lo, hi)
-    ///      when source prices were recorded and `price` lies outside the band they span widened by the market's
-    ///      maxDeviationBps, or, from expiry + 7 days for a Held expiry with exactly one recorded price p, outside
-    ///      [p x 0.8, p / 0.8] (a vetoed single price can then still settle at the right one). Emits
-    ///      SettlementResolved.
+    /// @dev CONFIG_ADMIN only, with its 24 h execution delay (roles.v8.json): the call is scheduled on the
+    ///      AccessManager first. Any other caller reverts V2Errors.NotAuthorized; an unscheduled, not yet ready or
+    ///      expired call reverts with the manager's AccessManagerNotScheduled, AccessManagerNotReady or
+    ///      AccessManagerExpired. Reverts V2Errors.TooEarly(expiry + RESOLVE_DELAY) before 48 h after expiry,
+    ///      V2Errors.AlreadyFinal once Finalized, and V2Errors.ResolveOutOfBand(lo, hi) when source prices were
+    ///      recorded and `price` lies outside the band they span widened by the market's maxDeviationBps, or, from
+    ///      expiry + 7 days for a Held expiry with exactly one recorded price p, outside [p x 0.8, p / 0.8] (a vetoed
+    ///      single price can then still settle at the right one). Emits SettlementResolved.
     /// @param underlying 18-dp Stock Token.
     /// @param expiry Expiry, unix seconds.
     /// @param price USDG base units (6 dp) per whole share.
-    function adminResolve(address underlying, uint40 expiry, uint256 price) external; // ADMIN, after RESOLVE_DELAY
+    function adminResolve(address underlying, uint40 expiry, uint256 price) external; // CONFIG_ADMIN, 48 h after expiry
 
     /// @notice Pins the settlement configuration of (underlying, expiry): copies the market's current source list,
     ///         maxDeviationBps, uncorroboratedDelay and spotMaxAge (defaults filled in) for that expiry, and asks each
@@ -167,23 +185,23 @@ interface ISettlementOracle {
         uint40 finalizableAt
     );
 
-    /// @notice GUARDIAN_ROLE vetoed the uncorroborated path.
+    /// @notice GUARDIAN vetoed the uncorroborated path.
     event SettlementVetoed(address indexed underlying, uint40 indexed expiry);
 
     /// @notice {unveto} lifted the veto: Held -> Pending; the candidate may finalize from `finalizableAt` (the unveto
     ///         timestamp + the market's uncorroboratedDelay). Added in INTERFACE_VERSION 2.
     event SettlementUnvetoed(address indexed underlying, uint40 indexed expiry, uint40 finalizableAt);
 
-    /// @notice DEFAULT_ADMIN_ROLE resolved the price through {adminResolve}.
+    /// @notice CONFIG_ADMIN resolved the price through {adminResolve}.
     event SettlementResolved(address indexed underlying, uint40 indexed expiry, uint256 price);
 
-    /// @notice The market's source list or its settlement parameters changed (DEFAULT_ADMIN_ROLE).
+    /// @notice The market's source list or its settlement parameters changed (CONFIG_ADMIN, through setMarket).
     event MarketSourcesSet(address indexed underlying);
 
     /// @notice {pin} fixed the configuration (underlying, expiry) settles on (INTERFACE_VERSION 6). Emitted once per
     ///         (underlying, expiry), before the sources' own pin logs and, normally, the Clearinghouse's SeriesCreated
     ///         in the same transaction. One without a SeriesCreated is a pin made outside a series creation (through a
-    ///         Clearinghouse pointer the admin moved): no series can be created on it unless it equals the
+    ///         Clearinghouse pointer CONFIG_ADMIN moved): no series can be created on it unless it equals the
     ///         configuration current at that creation.
     /// @dev `sources` in priority order (the indexes of SourceRecorded and SettlementCandidate); `maxDeviationBps` in
     ///      basis points; `uncorroboratedDelay` in seconds. Both with defaults filled in.

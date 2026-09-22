@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+// FIXTURE for script/v2/early-return-scope.test.mjs. Not compiled by forge: the `.txt` suffix keeps it
+// out of `forge build`, which compiles every .sol under script/. The test copies it to a scratch root
+// as test/Shapes.t.sol.
+//
+// Every line that returns carries a marker, and the test holds the tool to the markers exactly:
+//   EXPECT: <class>    must be reported, with this class, on this line
+//   PERMIT: <reason>   must be seen and cleared, with this reason, on this line
+// A return line with no marker fails the test, so the fixture cannot quietly grow an untested case.
+//
+// Multi-byte characters on purpose — em dashes, ≥, ×, é — because solc's offsets are UTF-8 bytes and
+// a tool that indexes a JS string drifts a line for each one above the site. — ≥ × é — ≥ × é —
+
+interface Vm {
+    function skip(bool) external;
+    function skip(bool, string calldata) external;
+}
+
+abstract contract Harness {
+    Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    uint256 internal x;
+
+    function assertTrue(bool) internal pure {}
+
+    function assertEq(uint256, uint256) internal pure {}
+
+    function ok() internal pure returns (bool) {
+        return true; // PERMIT: not a test function
+    }
+
+    // Skips, but from inside a helper: the AST cannot see that control flow, so it never dominates.
+    function _skipHere() internal {
+        vm.skip(true);
+    }
+
+    // Declared in the base, worn only by a test in Inherited.t.sol: the usage index must span files.
+    modifier bailsInBase() {
+        if (!ok()) return; // EXPECT: modifier-bail
+        _;
+    }
+}
+
+contract Shapes is Harness {
+    Vm internal constant cheats = vm; // an aliased handle is still the cheatcode contract
+
+    function external_() external {}
+
+    /*//////////////////////////////////////////////////////////////
+                      FINDINGS — every one must be reported
+    //////////////////////////////////////////////////////////////*/
+
+    function test_inlineReturn() public {
+        if (!ok()) return; // EXPECT: precondition-bail
+        assertTrue(true);
+    }
+
+    function test_blockReturn() public {
+        if (!ok()) {
+            x = 1; // a statement between the guard and the return — ≥ one line below it
+            return; // EXPECT: precondition-bail
+        }
+        assertTrue(true);
+    }
+
+    function test_catchReturn() public {
+        try this.external_() {
+            assertTrue(true);
+        } catch {
+            return; // EXPECT: precondition-bail
+        }
+    }
+
+    function test_trySuccessReturn() public {
+        try this.external_() {
+            return; // EXPECT: precondition-bail
+        } catch {}
+        assertTrue(true);
+    }
+
+    function test_nestedBranches() public {
+        if (ok()) {
+            if (x == 0) {
+                x = 2;
+                if (x == 2) {
+                    return; // EXPECT: precondition-bail
+                }
+            }
+        }
+        assertTrue(true);
+    }
+
+    function test_elseReturn() public {
+        if (ok()) x = 3;
+        else return; // EXPECT: precondition-bail
+        assertTrue(true);
+    }
+
+    function test_loopReturn() public {
+        for (uint256 i; i < 3; ++i) {
+            if (i == x) return; // EXPECT: precondition-bail
+        }
+        assertTrue(true);
+    }
+
+    function test_uncheckedReturn() public {
+        unchecked {
+            if (x == 0) return; // EXPECT: precondition-bail
+        }
+        assertTrue(true);
+    }
+
+    function test_externalVisibilityIsATest() external {
+        if (!ok()) return; // EXPECT: precondition-bail
+        assertTrue(true);
+    }
+
+    function test_skipInASiblingBranchDoesNotDominate() public {
+        if (x == 1) {
+            vm.skip(true);
+        } else {
+            return; // EXPECT: precondition-bail
+        }
+        assertTrue(true);
+    }
+
+    function test_skipInAnEarlierBranchDoesNotDominate() public {
+        if (x == 1) {
+            vm.skip(true);
+        }
+        if (!ok()) return; // EXPECT: precondition-bail
+        assertTrue(true);
+    }
+
+    function test_skipInAHelperDoesNotDominate() public {
+        if (!ok()) {
+            _skipHere();
+            return; // EXPECT: precondition-bail
+        }
+        assertTrue(true);
+    }
+
+    function test_skipOnAConditionDoesNotDominate() public {
+        vm.skip(x == 1);
+        if (!ok()) return; // EXPECT: precondition-bail
+        assertTrue(true);
+    }
+
+    function test_skipAfterTheReturnDoesNotDominate() public {
+        if (!ok()) return; // EXPECT: precondition-bail
+        vm.skip(true);
+    }
+
+    function test_postAssertionReturn() public {
+        assertTrue(ok());
+        if (x == 0) return; // EXPECT: post-assertion-return
+        assertEq(x, 1);
+    }
+
+    function testFuzz_caseDiscard(uint256 n) public {
+        if (n == 0) return; // EXPECT: case-discard
+        assertTrue(n > 0);
+    }
+
+    function invariant_caseDiscard() public view {
+        if (x == 0) return; // EXPECT: case-discard
+        assertTrue(x > 0);
+    }
+
+    function statefulFuzz_caseDiscard() public view {
+        if (x == 0) return; // EXPECT: case-discard
+        assertTrue(x > 0);
+    }
+
+    function test_unconditionalReturn() public {
+        x = 4;
+        return; // EXPECT: unconditional-return
+    }
+
+    function test_returnsAValue() public view returns (uint256) {
+        if (x == 0) return 1; // EXPECT: precondition-bail
+        return 2; // EXPECT: unconditional-return
+    }
+
+    function test_assemblyReturn() public {
+        assembly {
+            return(0, 0) // EXPECT: assembly-halt
+        }
+    }
+
+    function test_assemblyStop() public {
+        assembly {
+            stop() // EXPECT: assembly-halt
+        }
+    }
+
+    // A bare return before `_` skips the whole body of every test that wears the modifier.
+    modifier bailsBare() {
+        if (!ok()) return; // EXPECT: modifier-bail
+        _;
+    }
+
+    function test_wearsBailsBare() public bailsBare {
+        assertTrue(true);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    PERMITTED — each seen and cleared, never absent
+    //////////////////////////////////////////////////////////////*/
+
+    function test_skipThenReturn() public {
+        if (!ok()) {
+            vm.skip(true);
+            return; // PERMIT: vm.skip(true) dominates
+        }
+        assertTrue(true);
+    }
+
+    function test_skipWithReasonThenReturn() public {
+        if (!ok()) {
+            vm.skip(true, "the reason is part of the report");
+            return; // PERMIT: vm.skip(true) dominates
+        }
+        assertTrue(true);
+    }
+
+    function test_catchSkipThenReturn() public {
+        try this.external_() {
+            assertTrue(true);
+        } catch {
+            vm.skip(true);
+            return; // PERMIT: vm.skip(true) dominates
+        }
+    }
+
+    function test_topLevelSkipDominatesANestedReturn() public {
+        vm.skip(true);
+        if (!ok()) {
+            if (x == 0) return; // PERMIT: vm.skip(true) dominates
+        }
+        assertTrue(true);
+    }
+
+    function test_aliasedSkipThenReturn() public {
+        if (!ok()) {
+            cheats.skip(true);
+            return; // PERMIT: vm.skip(true) dominates
+        }
+        assertTrue(true);
+    }
+
+    modifier onlyReady() {
+        if (!ok()) {
+            vm.skip(true);
+            return; // PERMIT: modifier: vm.skip(true) dominates
+        }
+        _;
+    }
+
+    function test_wearsOnlyReady() public onlyReady {
+        assertTrue(true);
+    }
+
+    modifier bailsButNoTestWearsIt() {
+        if (!ok()) return; // PERMIT: modifier: no test wears it
+        _;
+    }
+
+    function wearsItButIsNotATest() public bailsButNoTestWearsIt {}
+
+    modifier returnsAfterTheBody() {
+        _;
+        if (x == 0) return; // PERMIT: modifier: after the last _
+    }
+
+    function test_wearsReturnsAfterTheBody() public returnsAfterTheBody {
+        assertTrue(true);
+    }
+
+    function setUp() public {
+        if (x == 7) return; // PERMIT: setUp is not a test body
+        x = 0;
+    }
+
+    function _helper() internal view returns (uint256) {
+        if (x == 0) return 0; // PERMIT: not a test function
+        return 1; // PERMIT: not a test function
+    }
+
+    // Named like a test, but internal: forge never runs it.
+    function test_internalIsNotATest() internal {
+        if (x == 0) return; // PERMIT: not a test function
+        x = _helper();
+    }
+}

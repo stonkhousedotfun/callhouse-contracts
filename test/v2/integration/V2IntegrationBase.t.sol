@@ -9,10 +9,12 @@ import {KeeperRewards} from "../../../src/v2/KeeperRewards.sol";
 import {OrderBook} from "../../../src/v2/OrderBook.sol";
 import {IClearinghouse} from "../../../src/v2/interfaces/IClearinghouse.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MockRoundFeed} from "../../../src/v2/mocks/MockRoundFeed.sol";
 import {MockUniV3Pool} from "../../../src/v2/mocks/MockUniV3Pool.sol";
 import {ChainlinkFeedSource} from "../../../src/v2/oracle/ChainlinkFeedSource.sol";
+import {FeeSplitter} from "../../../src/v2/periphery/FeeSplitter.sol";
 import {SettlementOracle} from "../../../src/v2/oracle/SettlementOracle.sol";
 import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
 
@@ -21,13 +23,15 @@ import {UniV3TwapSource} from "../../../src/v2/oracle/UniV3TwapSource.sol";
 ///         SettlementOracle, KeeperRewards, Clearinghouse and OrderBook, wired the way C2-13 will deploy them.
 /// @dev Shared by the lifecycle, gas and invariant suites (task C2-08).
 ///
-///      WIRING. `admin` holds DEFAULT_ADMIN_ROLE everywhere and `guardian` GUARDIAN_ROLE on the oracle, the
-///      Clearinghouse and the book. NVDA's oracle sources are [Chainlink, UniV3] at the default deviation (150 bps),
+///      WIRING (INTERFACE_VERSION 8). No contract holds a role table: each is {Managed} and one `AccessManager`
+///      maps (target, selector) to a role per `script/v2/roles.v8.json`. `admin` holds the mapped roles, granted by
+///      {_wire}; `guardian` holds GUARDIAN on the manager, which is the pause brake the book and the oracle used to
+///      take as a constructor argument. NVDA's oracle sources are [Chainlink, UniV3] at the default deviation (150 bps),
 ///      uncorroborated delay (6 h) and spot age (1 h); both sources list the oracle ({setOracle}), and the oracle names
 ///      the Clearinghouse, so createSeries pins the settlement configuration of each expiry. The oracle reads the
 ///      Clearinghouse's open interest for its bounty gate; both pay bounties from one KeeperRewards (SNAPSHOT 0.05,
-///      FINALIZE 0.10, SETTLE 0.05, REDEEM 0.02 USDG, 100 USDG daily cap, 1,000 USDG budget). Exercise fees go to
-///      `chFees`, book fees to `treasury`, at the
+///      FINALIZE 0.10, SETTLE 0.05, REDEEM 0.02 USDG, 100 USDG daily cap, 1,000 USDG budget). INTERFACE_VERSION 8:
+///      exercise fees AND book fees both go to the one real {FeeSplitter}; no EOA is a fee recipient anywhere, at the
 ///      registry defaults (premium 500 bps, resale 0, taker 0.10 USDG flat capped at 1000 bps, rebate 5000 bps). No
 ///      payout adapter: ITM call longs are paid in kind (C2-10 adds the adapter).
 ///      The NVDA market is NOT registered here: {_registerNvda} does it, so a story can start from registration.
@@ -53,6 +57,10 @@ abstract contract V2IntegrationBase is BaseV2Test {
 
     /// @dev Series exercise fee, bps (registry default).
     uint16 internal constant EXERCISE_FEE_BPS = 25;
+    /// @dev The launch 50/50 burn/treasury split. Source: `src/v2/periphery/FeeSplitter.sol` NatSpec and owner
+    ///      decision V3-D; the constructor takes it as `burnBps_`, so the fixture states it once rather than
+    ///      letting each suite retype it.
+    uint16 internal constant SPLITTER_BURN_BPS = 5_000;
 
     /// @dev Book fees, the registry defaults (02-interfaces §3).
     uint16 internal constant PREMIUM_FEE_BPS = 500;
@@ -90,8 +98,12 @@ abstract contract V2IntegrationBase is BaseV2Test {
     Clearinghouse internal ch;
     OrderBook internal book;
 
-    /// @dev Receives swept exercise fees (the book's fees go to `treasury`).
+    /// @dev INTERFACE_VERSION 8: kept only so a test can assert NOTHING pays it any more. Both fee lanes go to
+    ///      {splitter}; an EOA fee recipient is a v7 shape.
     address internal chFees = makeAddr("chFees");
+    /// @notice The one fee recipient of v8: exercise fees from the Clearinghouse AND premium/taker fees from the
+    ///         book both land here.
+    FeeSplitter internal splitter;
 
     /*//////////////////////////////////////////////////////////////
                                  SETUP
@@ -110,13 +122,31 @@ abstract contract V2IntegrationBase is BaseV2Test {
     }
 
     function _deployCore() internal virtual override {
-        calendar = new ExpiryCalendar(admin, new uint32[](0));
-        clSource = new ChainlinkFeedSource(admin);
-        poolSource = new UniV3TwapSource(admin, address(usdg));
-        oracle = new SettlementOracle(admin, guardian);
-        rewards = new KeeperRewards(IERC20(address(usdg)), admin);
-        ch = new Clearinghouse(admin, address(usdg), address(calendar), chFees, BASE_URI);
-        book = new OrderBook(IClearinghouse(address(ch)), admin, guardian, treasury, _defaultFees());
+        calendar = _newCalendar(new uint32[](0), admin);
+        _deployManager();
+        clSource = new ChainlinkFeedSource(address(manager));
+        _wire(address(clSource), "ChainlinkFeedSource", admin, 0);
+        poolSource = new UniV3TwapSource(address(manager), address(usdg));
+        _wire(address(poolSource), "UniV3TwapSource", admin, 0);
+        oracle = new SettlementOracle(address(manager));
+        _wire(address(oracle), "SettlementOracle", admin, 0);
+        _grant(V8Roles.GUARDIAN, guardian, 0);
+        rewards = new KeeperRewards(IERC20(address(usdg)), address(manager), treasury);
+        _wire(address(rewards), "KeeperRewards", admin, 0);
+        // INTERFACE_VERSION 8: ONE fee recipient, and it is a contract. Both lanes -- the Clearinghouse's exercise
+        // fee and the book's premium/taker fees -- pay the splitter, which is what makes the flywheel reachable from
+        // an integration story at all. Constructor shape copied from test/v2/unit/AccessMatrix.t.sol:40-41:
+        // (authority, usdg, treasury, burnBps). SPLITTER_BURN_BPS mirrors the launch 50/50 split.
+        splitter = new FeeSplitter(address(manager), address(usdg), treasury, SPLITTER_BURN_BPS);
+        _wire(address(splitter), "FeeSplitter", admin, 0);
+        ch = _newClearinghouse(address(usdg), address(calendar), address(splitter), BASE_URI, admin);
+        book = new OrderBook(IClearinghouse(address(ch)), address(manager), address(splitter), _defaultFees());
+        _wire(address(book), "OrderBook", admin, 0);
+        // The splitter needs to know the book to accept its fees; the router/executor/token pointers stay unset
+        // because no integration story routes a buyback, and setting them to mocks would assert behaviour the
+        // flywheel suites own (C3-6xx), not this fixture.
+        vm.prank(admin);
+        splitter.setOrderBook(address(book));
         vm.label(address(calendar), "ExpiryCalendar");
         vm.label(address(clSource), "ChainlinkFeedSource");
         vm.label(address(poolSource), "UniV3TwapSource");
@@ -124,6 +154,7 @@ abstract contract V2IntegrationBase is BaseV2Test {
         vm.label(address(rewards), "KeeperRewards");
         vm.label(address(ch), "Clearinghouse");
         vm.label(address(book), "OrderBook");
+        vm.label(address(splitter), "FeeSplitter");
 
         address[] memory sources = new address[](2);
         (sources[0], sources[1]) = (address(clSource), address(poolSource));
@@ -137,7 +168,10 @@ abstract contract V2IntegrationBase is BaseV2Test {
         oracle.setMarket(address(nvda), sources, 0, 0, 0);
         oracle.setClearinghouse(address(ch));
         oracle.setKeeperRewards(address(rewards));
-        ch.grantRole(V2Constants.GUARDIAN_ROLE, guardian);
+        ch.setMinter(address(this), true);
+        ch.setMinter(address(book), true);
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(EXERCISE_FEE_BPS, 0);
         ch.setKeeperRewards(address(rewards));
         rewards.setCaller(address(oracle), true);
         rewards.setCaller(address(ch), true);
@@ -175,10 +209,14 @@ abstract contract V2IntegrationBase is BaseV2Test {
         });
     }
 
-    /// @dev DEFAULT_ADMIN_ROLE registers NVDA with a 1.00 USDG strike grid, 25 bps exercise fee and the oracle.
+    /// @dev LISTING (INTERFACE_VERSION 8; `admin` holds it through {_wire}) registers NVDA with a 1.00 USDG strike
+    ///      grid, 25 bps exercise fee and the oracle. There is no DEFAULT_ADMIN_ROLE on any v8 contract.
     function _registerNvda() internal {
-        vm.prank(admin);
-        ch.registerMarket(address(nvda), _nvdaMarket());
+        vm.startPrank(admin);
+        ch.registerMarket(address(nvda), STRIKE_TICK, true);
+        ch.setMarketOracle(address(nvda), address(oracle));
+        ch.setMarketFees(address(nvda), EXERCISE_FEE_BPS, 0);
+        vm.stopPrank();
     }
 
     /// @dev Every approval a trader gives: USDG to the book and the Clearinghouse, NVDA to the Clearinghouse, ERC-1155
@@ -197,6 +235,16 @@ abstract contract V2IntegrationBase is BaseV2Test {
     function _deposit(address who, address asset, uint256 amount) internal {
         vm.prank(who);
         ch.deposit(asset, amount, who);
+    }
+
+    /// @dev Direct mint() requires isMinter[msg.sender]. The fixture grants address(this) and the
+    ///      OrderBook; EOAs are not minters. Writer names this as operator, then this mints.
+    function _mintAs(address writer, uint256 longId, uint64 units, address longTo) internal {
+        if (!ch.isOperator(writer, address(this))) {
+            vm.prank(writer);
+            ch.setOperator(address(this), true);
+        }
+        ch.mint(longId, units, writer, longTo);
     }
 
     function _place(address maker, uint256 longId, V2Types.OrderKind kind, uint128 price, uint64 units)
@@ -222,7 +270,9 @@ abstract contract V2IntegrationBase is BaseV2Test {
             limitPrice: type(uint128).max,
             writeToSell: false,
             recipient: recipient,
-            deadline: NO_DEADLINE
+            deadline: NO_DEADLINE,
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 
@@ -241,7 +291,9 @@ abstract contract V2IntegrationBase is BaseV2Test {
             limitPrice: 0,
             writeToSell: writeToSell,
             recipient: recipient,
-            deadline: NO_DEADLINE
+            deadline: NO_DEADLINE,
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 

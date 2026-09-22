@@ -4,17 +4,29 @@ Renamed from Callhouse (callhouse.finance) to Stonkhouse (stonkhouse.fun) on 202
 
 Stonkhouse contracts. Solidity 0.8.28, Foundry, OpenZeppelin 5, via-IR.
 
-Live product is isolated 1-NVDA accounts (`src/solo/`): `AccountFactory` clones a `WriterAccount`
-per user. The user deposits NVDA, requests N lots, and the keeper lists N full Seaport 1.6 orders
-of 1 contract on that account's own Valorem option type. A fill writes that user's NVDA and pays
-that user. Unfilled lots return at settle.
+Two generations of contracts live here:
 
-Factory on chain 4663: `0xc4A5Cd0DE91CaB7F5Ebe2114bc63Fbb43E642BBb`.
-Clear: `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`. App venue: `app.stonkhouse.fun/book`.
-`docs/DEPLOY.md` "Live deployment" lists every address, who holds each key and what is
-source-verified. The contracts are **unaudited**: there is no external audit yet. One is pending
-(owner, 2026-09-15; decision D14 of 2026-09-13 had ruled one out). What stands behind them is the test suite described below and the internal reviews in
-`SECURITY.md` §4, the latest on 2026-09-14 (no Critical, High or Medium findings).
+- **v2** (`src/v2/`, integration branch `v2`, not deployed): one `Clearinghouse` for every market
+  with fungible ERC-1155 long and short tokens of shared series, an on-chain `OrderBook`, a
+  `SettlementOracle` that settles on a 30-minute TWAP with a fallback chain (every constant with its test:
+  [`docs/V2-ARCHITECTURE.md` §2.4](docs/V2-ARCHITECTURE.md#24-values-no-role-can-change)), automatic payout, and the
+  periphery (AutoRoller, PayoutAdapter, MakerVault, MakerRegistry, RewardsDistributor, KeeperRewards).
+  Every lifecycle call is permissionless. Start with
+  [`docs/V2-ARCHITECTURE.md`](docs/V2-ARCHITECTURE.md). The mainnet deploy is owner-gated.
+- **v1**: the live product is isolated 1-NVDA accounts (`src/solo/`): `AccountFactory` clones a
+  `WriterAccount` per user, the keeper lists Seaport 1.6 orders of 1 contract on that account's own
+  Valorem option type, and a fill writes that user's NVDA. v2 replaces it; the freeze and run-off are
+  in [`docs/V1-RUNOFF.md`](docs/V1-RUNOFF.md). The pooled `Vault` (`src/Vault.sol`) is closed.
+  Factory on chain 4663: `0xc4A5Cd0DE91CaB7F5Ebe2114bc63Fbb43E642BBb`. Clear:
+  `0x53d7A6d0489Daf3d67b9A314e0eAB2B78Acab9C6`. `docs/DEPLOY.md` "Live deployment" lists every v1
+  address, who holds each key and what is source-verified.
+
+**The contracts, v1 and v2, are unaudited.** There is no external audit and no adversarial review
+gauntlet, and none is planned unless the owner asks: that is the owner's decision in the Stonkhouse
+v2 plan (2026-09-16), which supersedes the 2026-09-15 note that an external audit was pending. What
+stands behind v2 is the test gate described below. What stands behind v1 is its test suite and the
+internal reviews recorded in `SECURITY.md` §4, the latest on 2026-09-14 (no Critical, High or Medium
+findings).
 
 This repository is the contracts, and the thing any review would target. The app (keeper,
 indexer, web, ops) lives in stonkhousedotfun/callhouse and mounts this repository as a git submodule at
@@ -22,10 +34,17 @@ indexer, web, ops) lives in stonkhousedotfun/callhouse and mounts this repositor
 
 | Document | What it is |
 |---|---|
-| [`docs/AUDIT-SCOPE.md`](docs/AUDIT-SCOPE.md) | the review scope: what is in and out, the properties to break, the areas of concern, what the tests do and do not prove, build instructions. Anyone reading the code for bugs starts here |
-| [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) | the money maths: two ledgers, the accrual index, the redeem queue, the stranded-claim state, fees, the thirteen invariants as asserted. Read it before changing anything in `src/` |
-| [`SECURITY.md`](SECURITY.md) | the threat model (including what a compromised keeper or admin can leak through pricing, and what each third-party key can do), the properties enforced in bytecode, the 2026-09-12 internal review and the 2026-09-13 audit findings with their fixes, reporting |
-| [`docs/DEPLOY.md`](docs/DEPLOY.md) | the contract-side runbook: bootstrap admin, optional own clearinghouse, Verify, the Safe handover, the fork rehearsal record |
+| [`docs/V2-ARCHITECTURE.md`](docs/V2-ARCHITECTURE.md) | v2: the components, the trust model with every admin and guardian power and its worst case, the oracle fallback chain as a decision table, the keeper model, pauses, what is not protected |
+| [`docs/V2-ACCOUNTING.md`](docs/V2-ACCOUNTING.md) | v2 money maths: where each balance lives, units, rounding of every division, conservation proofs, the fees with worked examples, the invariants as asserted. Read it before changing anything in `src/v2/` |
+| [`docs/V2-GAS.md`](docs/V2-GAS.md) | v2 gas of every user and keeper entry point, each figure tied to a test |
+| [`docs/V2-DATA-STREAMS.md`](docs/V2-DATA-STREAMS.md) | the disabled Data Streams price source and the owner's steps to enable it |
+| [`src/v2/README.md`](src/v2/README.md) | v2 file map: every contract, interface, mock, test suite and script |
+| [`V2.md`](V2.md) | the rules of the `v2` integration branch: worktrees, remotes, gates |
+| [`docs/V1-RUNOFF.md`](docs/V1-RUNOFF.md) | freezing the v1 solo markets and running them off |
+| [`SECURITY.md`](SECURITY.md) | v2 status and threat-model summary, then the v1 record: the threat model (including what a compromised keeper or admin can leak through pricing, and what each third-party key can do), the properties enforced in bytecode, the 2026-09-12 internal review and the 2026-09-13 audit findings with their fixes, reporting |
+| [`docs/AUDIT-SCOPE.md`](docs/AUDIT-SCOPE.md) | v1: the review scope: what is in and out, the properties to break, the areas of concern, what the tests do and do not prove, build instructions |
+| [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) | v1 vault money maths: two ledgers, the accrual index, the redeem queue, the stranded-claim state, fees, the thirteen invariants as asserted. Read it before changing anything in the v1 `src/` |
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | v1 contract-side runbook: bootstrap admin, optional own clearinghouse, Verify, the Safe handover, the fork rehearsal record; "Solo factory markets (Tier 1)": one `AccountFactory` per registry market through `script/DeploySoloBatch.sh` (DeploySolo → ConfigureSolo → VerifySolo) |
 
 Paths in this repository's docs resolve from its root. A path followed by (stonkhousedotfun/callhouse)
 lives in the app repository and resolves from that repository's root; a marker after a list
@@ -34,7 +53,31 @@ applies to the whole list. For how the vault fits with the keeper, indexer and w
 
 ---
 
-## Layout
+## v2 at a glance
+
+| Piece | Contract | One line |
+|---|---|---|
+| Series and collateral | `Clearinghouse` | a series is `(underlying, isPut, strike, expiry)`; 1 unit = 0.01 share; calls lock the Stock Token, puts lock the strike in USDG; settlement pays from the collateral with no assignment |
+| Trading | `OrderBook` | bids, resale asks and write-on-fill asks; takers name the orders they hit; one taker fee per take, maker rebates, a premium fee on primary sales |
+| Settlement price | `SettlementOracle` + `ChainlinkFeedSource`, `UniV3TwapSource` (`DataStreamsSource` disabled) | a TWAP over the final 30 minutes; corroborated prices are final, a single or disagreeing source waits a delay the guardian can veto; the admin resolves stuck expiries after 48 hours inside a band |
+| Expiries | `ExpiryCalendar` | 16:00 New York on NYSE session days, dailies and weeklies |
+| Payout | `Clearinghouse.redeem` + `UniV3PayoutAdapter` | anyone pushes every holder's payout; ITM call longs convert to USDG under a slippage bound or are paid in kind |
+| Keepers | `KeeperRewards` | small USDG bounties under a rolling daily cap; no privileged keeper |
+| Writers and makers | `AutoRoller`, `MakerVault`, `MakerRegistry`, `RewardsDistributor` | set-and-forget covered calls; the treasury market maker; rebate tiers; weekly Merkle rewards |
+
+The numbers behind each line (the 0.01 share, the 30 minutes, the 48 hours and every other constant)
+are in [`docs/V2-ARCHITECTURE.md` §2.4](docs/V2-ARCHITECTURE.md#24-values-no-role-can-change) with the
+test that asserts each one. One hot key holds `DEFAULT_ADMIN_ROLE` on every v2 contract (owner
+decision); read [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) for what that
+key can do.
+
+v2 layout: `src/v2/` contracts, `test/v2/` tests (unit, integration, invariant, fork, fixtures),
+`script/v2/` scripts (devnet deploy, ABI export, v1 freeze). [`src/v2/README.md`](src/v2/README.md)
+maps every file. The v1 layout follows.
+
+---
+
+## v1 layout
 
 ```
 src/
@@ -161,23 +204,28 @@ git clone --recurse-submodules git@github.com:stonkhousedotfun/callhouse-contrac
 # or, in an existing checkout:
 git submodule update --init --recursive
 
-forge fmt --check                                     # format gate
+forge fmt --check                                     # format gate (v1 tree)
+forge fmt --check src/v2 script/v2 test/v2            # format gate (v2 tree)
 forge build --sizes                                   # report sizes; the 98,304 B chain limit is the real one (see 1 below)
 rm -rf cache/invariant                                # after any behaviour change (see 4 below)
 forge test --no-match-path 'test/fork/*'              # unit + invariant, mocks only
 forge test --match-path 'test/unit/VaultQueue.t.sol'  # one suite
+forge test --match-path 'test/v2/**'                  # the v2 suites only
+forge test                                            # everything offline: v1 and v2
 FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC    # against live chain 4663
 ```
 
 `RH_RPC` can be the public endpoint, `https://rpc.mainnet.chain.robinhood.com`. The `fork`
-profile in `foundry.toml` restricts the run to `test/fork/*`; the `ci` profile only raises
-verbosity.
+profile in `foundry.toml` restricts the run to `test/fork/*` and `test/v2/fork/*`; the `ci` profile
+only raises verbosity.
 
-Current state: **405 unit, regression and invariant tests across 24 suites, 20 fork tests** (the
-fork suite runs with `FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC`; it needs the live RPC
-and is not part of the offline gate). Measured 2026-09-14 on branch
-`redesign/a2-own-strikes-2026-09-13` after the L-01 fix. `foundry.toml` sets `isolate = true`, so
-every call a test makes runs as its own transaction, as it does on chain.
+Current state on branch `v2` (measured 2026-09-17 with the commands above): `forge test` runs
+**1423 tests across 88 suites, all passing**; `FOUNDRY_PROFILE=fork forge test --fork-url
+https://rpc.mainnet.chain.robinhood.com` runs **43 fork tests across 7 suites, all passing** (the fork
+suites need the live RPC and are not part of the offline gate). The v1-only figures further down
+(405 tests, 20 fork tests) are the counts of 2026-09-14 on branch `redesign/a2-own-strikes-2026-09-13`
+after the L-01 fix. `foundry.toml` sets `isolate = true`, so every call a test makes runs as its own
+transaction, as it does on chain.
 
 ### CI, and why the local gate is the gate
 
@@ -193,8 +241,11 @@ and the gate is the four commands above run locally:
 them with `set -o pipefail` when piping: a piped failure that hides behind `tee` is a passed gate
 that did not pass.
 
-There is no external audit yet and no separate security gauntlet. An external audit is pending (owner, 2026-09-15; it reverses decision D14 of 2026-09-13).
-The contracts are unaudited. What stands behind them is the gate above: 405 tests including the
+There is no external audit and no adversarial review gauntlet, and none is planned unless the owner
+asks (owner decision, Stonkhouse v2 plan, 2026-09-16; it supersedes the 2026-09-15 note that one was
+pending). The contracts are unaudited. What stands behind v2 is the gate above and the suites
+described in [`docs/V2-ARCHITECTURE.md` §9](docs/V2-ARCHITECTURE.md#9-where-the-numbers-come-from).
+What stood behind v1 at its last review is the v1 gate: 405 tests including the
 five audit proofs of concept re-asserted as fixed behaviour on the real Valorem bytecode, the
 real Seaport 1.6 runtime driven through five of its eight fulfilment entrypoints, a 64 × 600 stateful campaign with a
 third-party writer in the vault's bucket (thirteen invariants, among them: the vault never holds
@@ -208,7 +259,7 @@ code limit (our own Clear deployed and used on path A, Overcall's on path B; `do
 
 ---
 
-## Four things that will bite you
+## Six things that will bite you
 
 **1. `Vault` is above EIP-170's 24,576 B, and that is fine on chain 4663.** Robinhood Chain
 enforces a **98,304 B** contract code limit (verified with `eth_call --create` probes: 98,304 B
@@ -239,13 +290,30 @@ it into a local first. This has caused eight false failures in this repo already
 has the same rule: an `approve` between the cheatcode and the fill is the call it will judge.
 
 **4. Clear `cache/invariant` after changing contract behaviour.** Foundry replays persisted
-counterexamples, and a stale one surfaces as a mystery failure in an unrelated test.
+counterexamples, and a stale one surfaces as a mystery failure in an unrelated test. The v1
+`test/invariant/VaultInvariant.t.sol` has also flaked on a random seed ("no cycle was ever closed",
+then a "replay failure"): delete `cache/invariant` and re-run.
+
+**5. `forge lint` writes to the build cache.** It compiles the files it checks into `out/` and
+`cache/` without bytecode. A new or changed test file linted before its first build is then skipped by
+`forge build` ("No files changed") and `forge test` finds no tests in it (seen 2026-09-17 on
+`test/v2/integration/V2DocsNumbers.t.sol`). After linting, delete that file's entry from
+`cache/solidity-files-cache.json` and its `out/` directory, then build. Never lint between a build
+and a test run.
+
+**6. Fork suites pass by skipping without `--fork-url`.** The v2 fork tests return early on any chain
+other than 4663. `FOUNDRY_PROFILE=fork forge test` without `--fork-url` is green and proves nothing.
 
 ---
 
 ## After a contract change: the ABI flow
 
-ABIs flow one way: this repository's `out/` → `ops/abis/Vault.json` (stonkhousedotfun/callhouse) → the
+**v2.** `script/v2/export-abis.sh --callhouse <callhouse checkout>` writes the ABI of every name in
+`script/v2/abi-manifest.txt` to `ops/abis/v2/` (stonkhousedotfun/callhouse); the keeper, indexer and web
+regenerate their typed modules from there, and `--check` fails on any drift. A contract whose ABI
+consumers need must be listed in the manifest.
+
+**v1.** ABIs flow one way: this repository's `out/` → `ops/abis/Vault.json` (stonkhousedotfun/callhouse) → the
 generated copies in `indexer/` and `web/` (stonkhousedotfun/callhouse). The keeper's
 `keeper/src/abi.ts` (stonkhousedotfun/callhouse) is hand-transcribed, and a keeper test checks it against
 `contracts/out` (stonkhousedotfun/callhouse) when the artefacts are present.
@@ -271,7 +339,12 @@ generated copies in `indexer/` and `web/` (stonkhousedotfun/callhouse). The keep
 
 ## Deploying
 
-`SeaportOrderLib` and `ValoremLib` are `public` libraries and must be deployed and linked before
+**v2** is not deployed. The production deploy, configure and verify scripts are not on `v2` yet, and
+the mainnet deploy is owner-gated. `script/v2/DevDeploy.s.sol` deploys the core set on a local anvil
+fork of 4663 for the devnet only (`ops/devnet/up.sh` (stonkhousedotfun/callhouse)); it refuses any other
+node.
+
+**v1:** `SeaportOrderLib` and `ValoremLib` are `public` libraries and must be deployed and linked before
 the vault. Foundry does this automatically during `forge script`; to link manually pass
 `--libraries` once per library.
 
@@ -335,6 +408,9 @@ otherwise (DST ends 2026-11-01), and expires 24 hours later, on Saturday (`expir
 
 ## Roles
 
+This table is v1's. The v2 roles, every admin and guardian power and its worst case are in
+[`docs/V2-ARCHITECTURE.md` §2](docs/V2-ARCHITECTURE.md#2-trust-model).
+
 | Role | Holder | Powers |
 |---|---|---|
 | `DEFAULT_ADMIN_ROLE` | hot EOA `0xEb82…9d9b` (the deployer), alone; no timelock; the handover to a Safe is planned, not done | grant and revoke every role, set the fee recipient, the policy inside hard caps, the deposit cap (unbounded), `maxPriceAge`, accept the Valorem fee, halt and unhalt. Every change takes effect immediately |
@@ -374,6 +450,9 @@ impossible — that was the critical finding of the 2026-09-12 review, written u
 
 ## Hard caps, compiled in
 
+This section is v1's. The v2 compiled ceilings are in
+[`docs/V2-ARCHITECTURE.md` §2.4](docs/V2-ARCHITECTURE.md#24-values-no-role-can-change).
+
 Governance cannot exceed these. `Policy.validate` is called on construction and on every update.
 
 | Parameter | Live (`policy()`, 2026-09-15) | Hard bound |
@@ -397,3 +476,4 @@ Governance cannot exceed these. `Policy.validate` is called on construction and 
 |---|---|---|
 | stonkhousedotfun/callhouse | the app: keeper, indexer, web (app.stonkhouse.fun), ops runbooks and ABIs, project-wide docs | consumes this repository as a git submodule at `contracts/`, and regenerates `ops/abis/` (then the indexer and web copies) from `out/` after every contract change (see the ABI flow above) |
 | stonkhousedotfun/callhouse-site | the marketing landing, stonkhouse.fun | none on the code path; publishes the security contact and the unaudited disclosure |
+| stonkhousedotfun/callhouse-docs | the public docs, docs.stonkhouse.fun | its protocol pages are written from `docs/V2-ARCHITECTURE.md` and `docs/V2-ACCOUNTING.md` |

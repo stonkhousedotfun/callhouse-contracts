@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+// FIXTURE: does not compile (the return below has no semicolon). The tool must exit 2 on it, never 0:
+// a scan whose AST is missing is not a clean scan.
+
+contract Broken {
+    function test_x() public {
+        if (block.chainid != 4663) return
+    }
+}

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test, Vm, console2} from "forge-std/Test.sol";
+import {Vm, console2} from "forge-std/Test.sol";
+import {V8AccessTest} from "../lib/V8Access.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Clearinghouse} from "../../../src/v2/Clearinghouse.sol";
@@ -14,6 +15,8 @@ import {MockSettlementOracle} from "../../../src/v2/mocks/MockSettlementOracle.s
 import {IAggregatorV3} from "../../../src/v2/oracle/OracleDeps.sol";
 import {IUniV3PoolFactory, IUniV3SwapRouter02} from "../../../src/v2/periphery/PayoutDeps.sol";
 import {UniV3PayoutAdapter} from "../../../src/v2/periphery/UniV3PayoutAdapter.sol";
+
+import {ForkFloor} from "./ForkFloor.sol";
 
 interface IPoolSlot0 {
     function slot0()
@@ -58,8 +61,9 @@ interface IQuoterV2 {
 ///              it converts at the 30 bps launch bound, at most 60 bps (30 + 30) short, where a flat 30 bps floor
 ///              would have paid in kind (the pool fee alone is 30 bps);
 ///           4. GME routed through its 1 % pool converts at the launch bound, at most 130 bps (30 + 100) short.
-/// @dev Run with:  FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC --match-path "test/v2/fork/PayoutFork.t.sol" -vv
-///      Without a fork (chain id != 4663) every test logs and returns, as test/fork/ForkLive.t.sol does.
+/// @dev Run with:  FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC --fork-block-number <recorded> -j 1 --match-path "test/v2/fork/PayoutFork.t.sol" -vv
+///      Without `--fork-url` (chain id != 4663) every test logs and returns, as test/fork/ForkLive.t.sol does —
+///      that is GREEN HAVING RUN NOTHING (`06-QUIRKS.md` §A.1). Record the block number; do not report a skip as a pass.
 ///
 ///      WHAT IS REAL. Tokens, router, factory, pools and quoter are the live contracts at the RPC's latest block. The
 ///      Clearinghouse, ExpiryCalendar and adapter are deployed fresh; the settlement price comes from a
@@ -71,7 +75,7 @@ interface IQuoterV2 {
 ///
 ///      FUNDING. Stock Tokens are minted to test accounts with forge's `deal` (storage-slot discovery on the live
 ///      token). The clock is warped forward past the series' expiry; the pools only ever see time move forward.
-contract PayoutForkTest is Test {
+contract PayoutForkTest is V8AccessTest {
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address constant NVDA = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
     address constant TSLA = 0x322F0929c4625eD5bAd873c95208D54E1c003b2d;
@@ -116,6 +120,7 @@ contract PayoutForkTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -123,22 +128,27 @@ contract PayoutForkTest is Test {
 
     function setUp() public {
         if (block.chainid != 4663) return;
-        calendar = new ExpiryCalendar(admin, new uint32[](0));
+        calendar = _newCalendar(new uint32[](0), admin);
         oracle = new MockSettlementOracle();
-        ch = new Clearinghouse(admin, USDG, address(calendar), treasury, "https://app.stonkhouse.fun/api/token/");
+        ch = new Clearinghouse(
+            address(manager), USDG, address(calendar), treasury, "https://app.stonkhouse.fun/api/token/"
+        );
+        _wire(address(ch), "Clearinghouse", admin, 0);
         adapter = new UniV3PayoutAdapter(admin, USDG, ROUTER);
-        V2Types.MarketConfig memory cfg = V2Types.MarketConfig({
-            enabled: true,
-            mintPaused: false,
-            strikeTick: STRIKE_TICK,
-            exerciseFeeBps: EXERCISE_FEE_BPS,
-            oracle: address(oracle),
-            mintFeePpm: 0
-        });
         vm.startPrank(admin);
-        ch.registerMarket(NVDA, cfg);
-        ch.registerMarket(TSLA, cfg);
-        ch.registerMarket(GME, cfg);
+        // Fork helper _writeAndSettle mints as alice (no OrderBook on this fixture). Test-only.
+        ch.setMinter(alice, true);
+        ch.setDefaultOracle(address(oracle));
+        ch.setDefaultMarketFees(EXERCISE_FEE_BPS, 0);
+        ch.registerMarket(NVDA, STRIKE_TICK, true);
+        ch.setMarketOracle(NVDA, address(oracle));
+        ch.setMarketFees(NVDA, EXERCISE_FEE_BPS, 0);
+        ch.registerMarket(TSLA, STRIKE_TICK, true);
+        ch.setMarketOracle(TSLA, address(oracle));
+        ch.setMarketFees(TSLA, EXERCISE_FEE_BPS, 0);
+        ch.registerMarket(GME, STRIKE_TICK, true);
+        ch.setMarketOracle(GME, address(oracle));
+        ch.setMarketFees(GME, EXERCISE_FEE_BPS, 0);
         adapter.setRoute(NVDA, NVDA_FEE);
         ch.setPayoutAdapter(address(adapter), SLIPPAGE_BPS);
         vm.stopPrank();
@@ -188,14 +198,14 @@ contract PayoutForkTest is Test {
         uint256 out = IUniV3SwapRouter02(ROUTER)
             .exactInputSingle(
                 IUniV3SwapRouter02.ExactInputSingleParams({
-                tokenIn: NVDA,
-                tokenOut: USDG,
-                fee: NVDA_FEE,
-                recipient: stranger,
-                amountIn: 0,
-                amountOutMinimum: 1,
-                sqrtPriceLimitX96: 0
-            })
+                    tokenIn: NVDA,
+                    tokenOut: USDG,
+                    fee: NVDA_FEE,
+                    recipient: stranger,
+                    amountIn: 0,
+                    amountOutMinimum: 1,
+                    sqrtPriceLimitX96: 0
+                })
             );
         assertGt(out, 0, "the router sold its own balance for a caller who paid nothing");
         assertEq(IERC20(USDG).balanceOf(stranger), out);
@@ -476,8 +486,8 @@ contract PayoutForkTest is Test {
         (out,,,) = IQuoterV2(QUOTER)
             .quoteExactInputSingle(
                 IQuoterV2.QuoteExactInputSingleParams({
-                tokenIn: asset, tokenOut: USDG, amountIn: amountIn, fee: fee, sqrtPriceLimitX96: 0
-            })
+                    tokenIn: asset, tokenOut: USDG, amountIn: amountIn, fee: fee, sqrtPriceLimitX96: 0
+                })
             );
     }
 
@@ -497,14 +507,14 @@ contract PayoutForkTest is Test {
         IUniV3SwapRouter02(ROUTER)
             .exactInputSingle(
                 IUniV3SwapRouter02.ExactInputSingleParams({
-                tokenIn: NVDA,
-                tokenOut: USDG,
-                fee: NVDA_FEE,
-                recipient: whale,
-                amountIn: budget,
-                amountOutMinimum: 0,
-                sqrtPriceLimitX96: limit
-            })
+                    tokenIn: NVDA,
+                    tokenOut: USDG,
+                    fee: NVDA_FEE,
+                    recipient: whale,
+                    amountIn: budget,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: limit
+                })
             );
         vm.stopPrank();
         sold = budget - IERC20(NVDA).balanceOf(whale);
@@ -583,5 +593,17 @@ contract PayoutForkTest is Test {
             ) return true;
         }
         return false;
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `USDG`, an address this suite's own tests read.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_payoutForkExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(USDG, "PayoutFork");
     }
 }

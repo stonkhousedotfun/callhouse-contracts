@@ -12,6 +12,8 @@ import {IChainlinkFeed} from "../../../src/interfaces/IChainlinkFeed.sol";
 import {Order, OrderComponents, OrderParameters} from "../../../src/interfaces/ISeaport.sol";
 import {ISeaportFulfil} from "../../helpers/RealSeaportBase.sol";
 
+import {ForkFloor} from "./ForkFloor.sol";
+
 /// @notice `script/v2/FreezeV1.s.sol` against the LIVE v1 NVDA AccountFactory on a fork of chain 4663, sent by the
 ///         real role holders, and what the freeze does to a real listing on the live Seaport and Clear.
 /// @dev Run with:  FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC --match-path "test/v2/fork/*" -vv
@@ -46,6 +48,7 @@ contract FreezeV1ForkTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -79,7 +82,7 @@ contract FreezeV1ForkTest is Test {
                          THE FREEZE ON THE LIVE FACTORY
     //////////////////////////////////////////////////////////////*/
 
-    function test_fork_roleHoldersAreTheRegistrys() public view onlyFork {
+    function test_fork_roleHoldersAreTheRegistrys() public onlyFork {
         assertTrue(NVDA_FACTORY.hasRole(NVDA_FACTORY.DEFAULT_ADMIN_ROLE(), REGISTRY_ADMIN), "admin");
         assertTrue(NVDA_FACTORY.hasRole(NVDA_FACTORY.GUARDIAN_ROLE(), REGISTRY_GUARDIAN), "guardian");
         assertTrue(NVDA_FACTORY.hasRole(NVDA_FACTORY.KEEPER_ROLE(), REGISTRY_KEEPER), "keeper");
@@ -109,31 +112,39 @@ contract FreezeV1ForkTest is Test {
         assertEq(batched, missing, "one call per missing piece");
         assertEq(skipped, 2 - missing);
         assertEq(postChecked, missing == 0);
+        // T-OP-045, post-assertion-return: the four assertions above are the batch-mode result and stand
+        // whichever branch runs. When the live factory is already frozen there is nothing to send, and the
+        // early exit is a logged branch rather than a `return` that reads as PASSED-with-everything-run.
         if (missing == 0) {
             console2.log("the live NVDA factory is already frozen on this block: the run above was the check");
-            return;
+        } else {
+            assertEq(NVDA_FACTORY.writesHalted(), haltedBefore, "batch mode changed nothing");
+            assertEq(NVDA_FACTORY.depositCap(), capBefore);
+
+            _sendBatches(in_);
+
+            (executed, skipped, batched, postChecked) = new FreezeV1().runWith(in_);
+            assertEq(executed + batched, 0, "nothing left");
+            assertEq(skipped, 2, "both reported as already done");
+            assertTrue(postChecked, "post-check passed on the live factory");
+            assertTrue(NVDA_FACTORY.writesHalted());
+            assertEq(NVDA_FACTORY.depositCap(), 0);
+
+            // And with real NVDA in hand and approved, a deposit of a whole token is refused by the cap.
+            vm.prank(alice);
+            WriterAccount a = NVDA_FACTORY.createAccount();
+            // T-OP-045, post-assertion-return: the freeze is proven above; only the cap-refusal coda needs NVDA
+            // in hand. `_deal` here logs and returns false without skipping, so say what was not exercised.
+            if (!_deal(address(nvda), alice, 1e18)) {
+                console2.log("the cap refusal below was not exercised: no NVDA balance slot on this fork");
+            } else {
+                vm.prank(alice);
+                nvda.approve(address(a), 1e18);
+                vm.prank(alice);
+                vm.expectRevert(WriterAccount.DepositCapExceeded.selector);
+                a.deposit(1e18);
+            }
         }
-        assertEq(NVDA_FACTORY.writesHalted(), haltedBefore, "batch mode changed nothing");
-        assertEq(NVDA_FACTORY.depositCap(), capBefore);
-
-        _sendBatches(in_);
-
-        (executed, skipped, batched, postChecked) = new FreezeV1().runWith(in_);
-        assertEq(executed + batched, 0, "nothing left");
-        assertEq(skipped, 2, "both reported as already done");
-        assertTrue(postChecked, "post-check passed on the live factory");
-        assertTrue(NVDA_FACTORY.writesHalted());
-        assertEq(NVDA_FACTORY.depositCap(), 0);
-
-        // And with real NVDA in hand and approved, a deposit of a whole token is refused by the cap.
-        vm.prank(alice);
-        WriterAccount a = NVDA_FACTORY.createAccount();
-        if (!_deal(address(nvda), alice, 1e18)) return;
-        vm.prank(alice);
-        nvda.approve(address(a), 1e18);
-        vm.prank(alice);
-        vm.expectRevert(WriterAccount.DepositCapExceeded.selector);
-        a.deposit(1e18);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -145,19 +156,32 @@ contract FreezeV1ForkTest is Test {
     ///      buyer still exercises inside the window, a stranger settles at the account's expiry, and the writer
     ///      withdraws and claims while the market stays frozen.
     function test_fork_freezeStopsListedLots_soldLotRunsOff() public onlyFork {
+        // T-OP-045, precondition-bail: nothing asserted yet, so a missing precondition is a SKIP, not a pass.
         if (NVDA_FACTORY.writesHalted() || NVDA_FACTORY.depositCap() == 0) {
             console2.log("the live NVDA factory is already frozen: no listing can be made to test against");
+            vm.skip(true);
             return;
         }
         console2.log("fork block", block.number, "timestamp", block.timestamp);
         (uint256 strike, uint256 ask, bool fresh) = _weekTerms();
-        if (!fresh) return;
+        // T-OP-045, precondition-bail: `_weekTerms` logged why the feed is too old to list against.
+        if (!fresh) {
+            vm.skip(true);
+            return;
+        }
         uint40 exerciseTs = uint40(block.timestamp + 3 days);
         vm.prank(keeper);
         NVDA_FACTORY.setWeek(strike, exerciseTs, exerciseTs + 1 days, ask);
 
-        if (!_deal(address(nvda), alice, 2e18)) return;
-        if (!_deal(address(usdg), buyer, 1_000_000_000)) return;
+        // T-OP-045, precondition-bail: `_deal` logs the missing slot; the skip is the honest outcome.
+        if (!_deal(address(nvda), alice, 2e18)) {
+            vm.skip(true);
+            return;
+        }
+        if (!_deal(address(usdg), buyer, 1_000_000_000)) {
+            vm.skip(true);
+            return;
+        }
         uint256 liveBefore = NVDA_FACTORY.liveCount();
         vm.prank(alice);
         WriterAccount a = NVDA_FACTORY.createAccount();
@@ -320,5 +344,17 @@ contract FreezeV1ForkTest is Test {
 
     function dealToken(address token, address to, uint256 amount) external {
         deal(token, to, amount, true);
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `address(NVDA_FACTORY)`, an address this suite's own tests read.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_freezeV1ForkExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(address(NVDA_FACTORY), "FreezeV1Fork");
     }
 }

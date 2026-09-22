@@ -8,6 +8,8 @@ import {IAggregatorV3, IUniswapV3PoolOracle} from "../../../src/v2/oracle/Oracle
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 
+import {ForkFloor} from "./ForkFloor.sol";
+
 interface IFeedDescription {
     function description() external view returns (string memory);
 }
@@ -54,6 +56,7 @@ contract SourcesForkTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -73,7 +76,7 @@ contract SourcesForkTest is Test {
                          THE LIVE CONTRACTS' SHAPE
     //////////////////////////////////////////////////////////////*/
 
-    function test_fork_liveFeedAndPoolShape() public view onlyFork {
+    function test_fork_liveFeedAndPoolShape() public onlyFork {
         assertEq(IAggregatorV3(NVDA_FEED).decimals(), 8, "feed decimals");
         assertEq(IFeedDescription(NVDA_FEED).description(), "RHNVDA / USD", "feed description");
         (uint80 id,,,,) = IAggregatorV3(NVDA_FEED).latestRoundData();
@@ -209,7 +212,7 @@ contract SourcesForkTest is Test {
     /// Both `latest` values are ok on the live contracts and sane against each other. Loose on purpose: the feed's
     /// latest round can be hours old and the pool trades around the clock, so this guards against order, decimals
     /// and scale mistakes (which are off by orders of magnitude), not against the market.
-    function test_fork_latestBothOk() public view onlyFork {
+    function test_fork_latestBothOk() public onlyFork {
         (bool feedOk, uint256 feedPrice, uint256 feedAt) = feedSrc.latest(NVDA);
         (bool poolOk, uint256 poolPrice, uint256 poolAt) = poolSrc.latest(NVDA);
         console2.log("feed latest (USDG 6dp), age s:", feedPrice, block.timestamp - feedAt);
@@ -347,5 +350,17 @@ contract SourcesForkTest is Test {
         uint256 doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
         uint256 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         return era * 146_097 + doe - 719_468;
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `NVDA_FEED`, an address this suite's own tests read.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_sourcesForkExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(NVDA_FEED, "SourcesFork");
     }
 }

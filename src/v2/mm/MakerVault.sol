@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {Managed} from "../access/Managed.sol";
 import {IClearinghouse} from "../interfaces/IClearinghouse.sol";
 import {IOrderBook} from "../interfaces/IOrderBook.sol";
 import {ISettlementOracle} from "../interfaces/ISettlementOracle.sol";
@@ -17,18 +18,25 @@ import {V2Types} from "../interfaces/V2Types.sol";
 
 /// @title MakerVault
 /// @notice The protocol's treasury-funded market maker (roadmap 1.4, architecture §3.10): it holds USDG and Stock
-///         Tokens, and a bot key with QUOTER_ROLE quotes and trades them on the OrderBook inside on-chain guard rails.
+///         Tokens, and a bot key holding QUOTER on the manager quotes and trades them inside on-chain guard rails.
 ///         The vault is the maker and taker of record; every proceed, fill and payout lands in the vault.
 /// @dev UNITS (ADR-04). Prices, spot, intrinsic value and notional are USDG base units (6 dp) per whole share or in
 ///      total; units are 0.01-share units (ERC-1155 amounts); rates are bps of BPS = 10_000.
 ///
-///      WHO CAN DO WHAT.
-///        - DEFAULT_ADMIN_ROLE (the treasury key): {deposit} and {withdraw} any ERC-20, {withdrawPosition} of option
-///          tokens, {setLimits}, grant and revoke QUOTER_ROLE, and everything the quoter can do.
-///        - QUOTER_ROLE (the mm-bot key, K2-04) can only: move vault funds into the vault's Clearinghouse ledger
-///          ({depositToClearinghouse}) and back ({withdrawFromClearinghouse}, recipient fixed to the vault); {place},
-///          {replace} and {cancel} the vault's own orders; {take} with the vault as recipient; {close} long/short pairs;
-///          {claimOwed}; {sync} the exposure bookkeeping; {refreshApprovals}.
+///      WHO CAN DO WHAT (INTERFACE_VERSION 8). The vault holds no role table: it is {Managed}, and one
+///      `AccessManager` maps (this contract, selector) to a role id per `script/v2/roles.v8.json`.
+///        - ANYONE: {deposit}. It pulls from `msg.sender` and can only add funds, so the Treasury Safe funds the
+///          vault with no role at all and a donation is just a donation.
+///        - TREASURY_ADMIN (the Admin Safe, 24 h): {withdraw} any ERC-20 and {withdrawPosition} of option tokens --
+///          both to {treasury} and nowhere else -- {setTreasury} and {setLimits}. It CANNOT quote.
+///        - QUOTER (the mm-bot key, K2-04, and the Admin Safe so it can cancel and close in an emergency) can only:
+///          move vault funds into the vault's Clearinghouse ledger ({depositToClearinghouse}) and back
+///          ({withdrawFromClearinghouse}, recipient fixed to the vault); {place}, {replace} and {cancel} the vault's
+///          own orders; {take} with the vault as recipient; {close} long/short pairs; {claimOwed}; {sync} the
+///          exposure bookkeeping; {refreshApprovals}.
+///      The two sets are disjoint: no selector is mapped to both, so the treasury lane can never quote and the
+///      quoting lane can never reach the money. Rotating a compromised quoter key is OPS_ADMIN, instant, on the
+///      manager, and it never touches this contract.
 ///      NO QUOTER CALL PAYS ANYONE BUT THE VAULT. No quoter entry point names a recipient other than the vault: the
 ///      Clearinghouse withdrawal goes to the vault, a take must name the vault as recipient, the vault is the maker of
 ///      every order (proceeds and refunds go to the maker), and close frees collateral to the vault's own ledger. The
@@ -39,17 +47,35 @@ import {V2Types} from "../interfaces/V2Types.sol";
 ///      can trade the vault's inventory badly inside the guards below, each trade bounded by them and repeated trades
 ///      not. Buying a partner's ask at the bid cap and selling the longs back into the partner's bid at one tick leaves
 ///      the vault's exposure where it was and pays the partner the difference, so round trips can move the vault's
-///      whole USDG balance to a counterparty (sweep contracts-c14). Revoking QUOTER_ROLE stops it, and the bot's own
-///      realised-loss stop (K2-04) is the off-chain bound.
+///      whole USDG balance to a counterparty (sweep contracts-c14). OPS_ADMIN revoking QUOTER on the manager stops
+///      it (instant, and it never touches this contract), and the bot's realised-loss stop (K2-04) is the
+///      off-chain bound.
 ///
 ///      PRICE GUARDS (checked when an order is placed or replaced and when a take is sent, against the series' pinned
 ///      oracle's `spot`, which reverts when stale or paused, so a stale oracle stops quoting):
 ///        - asks (AskWrite, AskResale, and the limit price of a selling take) never below
-///          floor = max(0, intrinsic - spot x askToleranceBps / BPS), intrinsic = max(spot - strike, 0) for calls and
-///          max(strike - spot, 0) for puts, per share;
+///          floor = ceil(base x BPS / (BPS - sellerFeeBps)), base = max(0, intrinsic - spot x askToleranceBps / BPS),
+///          intrinsic = max(spot - strike, 0) for calls and max(strike - spot, 0) for puts, per share;
 ///        - bids (and the limit price of a buying take) never above spot x maxBidBpsOfSpot / BPS.
 ///      A standing order is not re-checked when it fills (the book never calls back), so {Limits.maxOrderLifetime}
 ///      bounds how long a quote placed at an old spot can stay live.
+///
+///      THE ASK FLOOR IS NET OF THE SELLER FEE (INTERFACE_VERSION 8). The book takes `premium x sellerFeeBps / BPS`
+///      out of what a seller receives -- `premiumFeeBps` (5 % at launch) when the fill MINTS (an AskWrite, or a
+///      `writeToSell` take) and `resaleFeeBps` when it sells inventory. A floor at the bare intrinsic value would
+///      therefore let the vault sell at `intrinsic` and keep only 95 % of it, handing the difference to the buyer:
+///      the guard that exists to stop value leaving would be crossed by the protocol's own fee. So the floor is
+///      grossed up by that fee, rounded UP, and the net the vault receives is never below `base`.
+///      THE RATE IS READ FROM THE BOOK, never copied: {IOrderBook.feeParams} already resolves any scheduled change,
+///      so a fee rise moves the floor with it rather than silently lowering it. `BPS - sellerFeeBps` underflows and
+///      reverts if a book ever reported a fee of 100 % or more, which is fail-closed; the book's own
+///      `PREMIUM_FEE_CEIL_BPS` (10 %) keeps it far from there.
+///      NOT IN THE FLOOR: the taker fee a SELLING TAKE also pays (`min(takerFeeFlat, premium x takerFeeCapBps / BPS)`,
+///      0.10 USDG at launch). It is a flat per-call charge, not a rate on the price, so folding it in would make the
+///      floor depend on size and diverge for dust; the size guards and the outflow cap bound that instead.
+///      ONE CASE THE FLOOR STILL DOES NOT COVER: a resting ask placed under the old rate stays live when a scheduled
+///      fee change takes effect (the book never calls back). {Limits.maxOrderLifetime} bounds that window, and the
+///      48 h fee delay makes it visible before it happens.
 ///
 ///      SIZE GUARDS. Per series the vault's worst-case NET position if its live orders fill, in units:
 ///        up   = longs + resale escrow + open bid units - shorts          (every bid fills)
@@ -80,7 +106,9 @@ import {V2Types} from "../interfaces/V2Types.sol";
 ///        - BOOKED AND ENFORCED: {place} and {replace} of a Bid, and {take}. BOOKED, NEVER ENFORCED: {cancel} naming a
 ///          Bid — a cancel can only give escrow back, and it must never be blockable. NOT BOOKED AT ALL: the ask side
 ///          of {place} / {replace}, {close}, {depositToClearinghouse}, {withdrawFromClearinghouse}, {claimOwed},
-///          {sync}, {refreshApprovals} and the three admin treasury calls.
+///          {sync}, {refreshApprovals}, the permissionless {deposit}, and the treasury lane ({withdraw},
+///          {withdrawPosition}, {setLimits}, {setTreasury}) -- that lane is not quoting and pays the Treasury Safe
+///          by construction, so an exhausted cap must never trap protocol money in the vault.
 ///        - Every booked call measures CASH immediately before it calls the book and again after, and charges (or
 ///          credits) the difference: a decrease is spending, an increase is escrow coming back.
 ///        - Resting bids are charged AT PLACEMENT, because anyone can fill them between vault calls at the quoter's
@@ -100,22 +128,33 @@ import {V2Types} from "../interfaces/V2Types.sol";
 ///          `units x collateralPerUnit + mintFee`, so a ledger funded for the collateral alone leaves the ask unable
 ///          to fill (`test_outflowCap_rentOn_*` pin all of it).
 ///        - No oracle is read, so cancels, closes and ledger moves never depend on a fresh spot.
-///      GUARANTEE: the net USDG the quoter moves out through booked calls over any interval of length `t` is at most
-///      maxDailyOutflow x (1 + t / OUTFLOW_WINDOW). NOT bounded by this: option value sold at or above the ask floor
-///      inside maxSeriesUnits / maxTotalNotional, which is realised at settlement rather than paid out in USDG.
-///      DEFAULT_ADMIN_ROLE is booked but never checked, so admin unwinding is never blocked and an admin-placed bid
-///      that the quoter cancels cannot create budget. That exemption is safe only while the mm-bot key never holds
-///      DEFAULT_ADMIN_ROLE; VerifyV2 FAILs on that, and the check is load-bearing here.
+///      GUARANTEE: the net USDG moved out through booked calls over any interval of length `t` is at most
+///      maxDailyOutflow x (1 + t / OUTFLOW_WINDOW), FOR EVERY CALLER. NOT bounded by this: option value sold at or
+///      above the ask floor inside maxSeriesUnits / maxTotalNotional, which is realised at settlement rather than
+///      paid out in USDG.
+///      NO CALLER IS EXEMPT (INTERFACE_VERSION 8). v7 booked the admin's calls but never checked them, which was
+///      only safe while the mm-bot key never held DEFAULT_ADMIN_ROLE -- a property a test had to keep asserting
+///      about a key. v8 removes the exemption: the cap is a property of the contract, not of who holds which key,
+///      and the Admin Safe is itself a QUOTER member (roles.v8.json `holders`) so the exemption would have applied
+///      to a quoting Safe anyway. Unwinding is not blocked by this, because unwinding only ever CREDITS the bucket:
+///      {cancel} is booked and never enforced, and {close}, {claimOwed}, {sync} and the ledger moves are not booked
+///      at all. {withdraw} and {withdrawPosition} are not booked either -- they are not quoting, and their recipient
+///      is the Treasury Safe by construction.
+///      THE ONE EXCEPTION, and it is the only booked call that can charge while selling: {take} books with
+///      `enforce` true whichever side it is on, so a SELLING take whose premium does not cover the flat taker fee
+///      is a net outflow and is charged like any other. At cap 0 that dust sale reverts OutflowCapExceeded. v7 hid
+///      this behind the admin exemption; with no exemption there is no caller who can push it through.
 ///      Kill switches, in order: the bot's own kill (cancels everything, credits only) -> {setLimits} with
-///      maxDailyOutflow 0, an on-chain spend freeze that still allows asks, sales, cancels, closes and ledger moves ->
-///      revoke QUOTER_ROLE -> the guardian's OrderBook trading pause.
+///      maxDailyOutflow 0, an on-chain spend freeze that still allows asks, cancels, closes, ledger moves and any
+///      sale whose premium covers the taker fee (see THE ONE EXCEPTION above) ->
+///      OPS_ADMIN revokes QUOTER on the manager (instant) -> the guardian's OrderBook trading pause.
 ///
 ///      APPROVALS. The constructor makes the OrderBook the vault's Clearinghouse operator (write-on-fill asks and
 ///      writeToSell), approves it for the vault's ERC-1155 tokens (resale escrow and selling from inventory) and grants
 ///      it an unlimited USDG allowance (bid escrow and buying). Deposits into the Clearinghouse approve exactly the
 ///      amount per call. The vault accepts ERC-1155 tokens from the Clearinghouse only (fills, escrow refunds, prunes),
 ///      and keeps the Clearinghouse defaults: anyone may redeem the vault's settled tokens, and payouts go to the vault.
-contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient {
+contract MakerVault is IERC1155Receiver, Managed, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -150,9 +189,6 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
-
-    /// @notice The quoting bot's role (V2Constants.QUOTER_ROLE).
-    bytes32 public constant QUOTER_ROLE = V2Constants.QUOTER_ROLE;
 
     /// @notice Most live orders the vault keeps on one series, counting an expired AskResale not yet cancelled or
     ///         pruned; {place} reverts CeilingExceeded beyond it. Bounds the gas of every exposure measurement.
@@ -195,18 +231,28 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     uint256[] private _tracked;
     mapping(uint256 longId => uint256) private _trackedPos;
 
+    /// @notice The only address {withdraw} and {withdrawPosition} can pay: the Treasury Safe
+    ///         (INTERFACE_VERSION 8).
+    /// @dev A constructor argument, changed only by TREASURY_ADMIN through {setTreasury}, and never zero. Protocol
+    ///      money therefore has exactly one exit and no caller chooses where it goes.
+    address public treasury;
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice DEFAULT_ADMIN_ROLE added `amount` base units of `asset` to the vault (the measured balance delta).
+    /// @notice `from` added `amount` base units of `asset` to the vault (the measured balance delta). Anyone may.
     event Deposited(address indexed asset, address indexed from, uint256 amount);
-    /// @notice DEFAULT_ADMIN_ROLE sent `amount` base units of `asset` from the vault to `to`.
+    /// @notice TREASURY_ADMIN sent `amount` base units of `asset` from the vault to `to`, which is always
+    ///         {treasury} from INTERFACE_VERSION 8.
     event Withdrawn(address indexed asset, address indexed to, uint256 amount);
-    /// @notice DEFAULT_ADMIN_ROLE sent `units` of Clearinghouse token `tokenId` from the vault to `to`.
+    /// @notice TREASURY_ADMIN sent `units` of Clearinghouse token `tokenId` from the vault to `to`, which is always
+    ///         {treasury} from INTERFACE_VERSION 8.
     event PositionWithdrawn(uint256 indexed tokenId, address indexed to, uint256 units);
-    /// @notice DEFAULT_ADMIN_ROLE set the guard rails.
+    /// @notice TREASURY_ADMIN set the guard rails.
     event LimitsSet(Limits limits);
+    /// @notice TREASURY_ADMIN set the only address {withdraw} and {withdrawPosition} can pay (INTERFACE_VERSION 8).
+    event TreasurySet(address indexed treasury);
     /// @notice The stored exposure of `longId` changed: `units` (0.01-share), `notional` and the new `totalNotional`
     ///         (USDG base units).
     event ExposureSet(uint256 indexed longId, uint256 units, uint256 notional, uint256 totalNotional);
@@ -216,44 +262,39 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     //////////////////////////////////////////////////////////////*/
 
     /// @param orderBook_ The OrderBook; its `clearinghouse()` and that Clearinghouse's `usdg()` become immutable.
-    /// @param admin Receives DEFAULT_ADMIN_ROLE (NotAuthorized when zero).
-    /// @param quoter Receives QUOTER_ROLE; zero grants nothing (the admin can grant it later).
+    /// @param authority_ The `AccessManager` that gates every privileged selector (NoSource when it has no code).
+    ///        INTERFACE_VERSION 8: no role is granted here and none is held here.
+    /// @param treasury_ The Treasury Safe: the only address {withdraw} and {withdrawPosition} can ever pay
+    ///        (NotAuthorized when zero).
     /// @param limits_ Initial guard rails (CeilingExceeded when a bps field is above BPS).
-    constructor(IOrderBook orderBook_, address admin, address quoter, Limits memory limits_) {
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
+    constructor(IOrderBook orderBook_, address authority_, address treasury_, Limits memory limits_)
+        Managed(authority_)
+    {
         IClearinghouse ch = IClearinghouse(orderBook_.clearinghouse());
         clearinghouse = ch;
         orderBook = orderBook_;
         usdg = IERC20(ch.usdg());
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        if (quoter != address(0)) _grantRole(QUOTER_ROLE, quoter);
+        _setTreasury(treasury_);
         _setLimits(limits_);
         _approveBook();
     }
 
-    /// @dev QUOTER_ROLE or DEFAULT_ADMIN_ROLE (NotAuthorized).
-    modifier onlyQuoter() {
-        if (!hasRole(QUOTER_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
-            revert V2Errors.NotAuthorized();
-        }
-        _;
-    }
-
     /*//////////////////////////////////////////////////////////////
-                         TREASURY (ADMIN ONLY)
+                        FUNDING AND TREASURY EXITS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Pulls `amount` base units of `asset` from the caller into the vault. DEFAULT_ADMIN_ROLE.
-    /// @dev Measures the balance delta. A plain ERC-20 transfer to the vault funds it just as well.
+    /// @notice Pulls `amount` base units of `asset` from the caller into the vault. ANYONE (INTERFACE_VERSION 8).
+    /// @dev PERMISSIONLESS ON PURPOSE. It pulls from `msg.sender` and can only ADD funds, so it hands no caller any
+    ///      power the vault did not already give everyone: a plain ERC-20 transfer to the vault funds it just as
+    ///      well and always could. Making it permissionless is what lets the Treasury Safe fund the vault with no
+    ///      role and no 24 h delay. The selector does not move. Measures the balance delta, so {Deposited} reports
+    ///      what actually arrived (a fee-on-transfer token credits less than `amount`).
+    ///      A donation is NOT a budget: USDG that arrives this way is invisible to the outflow cap, which measures
+    ///      only the change across a booked quoter call (see OUTFLOW CAP).
     /// @param asset USDG or a Stock Token.
     /// @param amount Base units of `asset` to pull (approve the vault first).
     /// @return received Base units that arrived.
-    function deposit(address asset, uint256 amount)
-        external
-        nonReentrant
-        onlyRole(DEFAULT_ADMIN_ROLE)
-        returns (uint256 received)
-    {
+    function deposit(address asset, uint256 amount) external nonReentrant returns (uint256 received) {
         IERC20 token = IERC20(asset);
         uint256 before = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), amount);
@@ -261,39 +302,47 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         emit Deposited(asset, msg.sender, received);
     }
 
-    /// @notice Sends `amount` base units of `asset` from the vault's wallet to `to`. DEFAULT_ADMIN_ROLE.
-    /// @dev Funds in the vault's Clearinghouse ledger come back first with {withdrawFromClearinghouse}.
+    /// @notice Sends `amount` base units of `asset` from the vault's wallet to {treasury}. TREASURY_ADMIN (24 h).
+    /// @dev INTERFACE_VERSION 8 DELETED v7's `withdraw(address,uint256,address)`: the free `to` argument is gone, so
+    ///      `withdraw` is no longer an overloaded name and vault money has exactly one exit. The
+    ///      `Withdrawn(asset, to, amount)` topic is unchanged and now always reports {treasury}.
+    ///      Funds in the vault's Clearinghouse ledger come back first with {withdrawFromClearinghouse}.
     /// @param asset Any ERC-20 the vault holds.
     /// @param amount Base units.
-    /// @param to Recipient (NotAuthorized when zero).
-    function withdraw(address asset, uint256 amount, address to) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (to == address(0)) revert V2Errors.NotAuthorized();
+    function withdraw(address asset, uint256 amount) external nonReentrant restricted {
+        address to = treasury;
         emit Withdrawn(asset, to, amount);
         IERC20(asset).safeTransfer(to, amount);
     }
 
-    /// @notice Sends `units` of the vault's Clearinghouse token `tokenId` (long or short) to `to`. DEFAULT_ADMIN_ROLE.
-    /// @dev For unwinding by hand. Refreshes the series' stored exposure afterwards.
+    /// @notice Sets the only address {withdraw} and {withdrawPosition} can pay. TREASURY_ADMIN (24 h).
+    /// @param treasury_ The Treasury Safe; zero is refused (`NotAuthorized`).
+    function setTreasury(address treasury_) external nonReentrant restricted {
+        _setTreasury(treasury_);
+    }
+
+    /// @notice Sends `units` of the vault's Clearinghouse token `tokenId` (long or short) to {treasury}.
+    ///         TREASURY_ADMIN (24 h).
+    /// @dev INTERFACE_VERSION 8 DELETED v7's `withdrawPosition(uint256,uint256,address)`: the free `to` argument is
+    ///      gone, for the same reason as in {withdraw}, so a position can only be unwound INTO the Treasury Safe.
+    ///      The design draft missed this one; 03-INTERFACES §2.7 names it explicitly. For unwinding by hand.
+    ///      Refreshes the series' stored exposure afterwards, so the caps see the smaller position at once.
     /// @param tokenId Long or short id.
     /// @param units 0.01-share units.
-    /// @param to Recipient; must accept ERC-1155 tokens if it is a contract.
-    function withdrawPosition(uint256 tokenId, uint256 units, address to)
-        external
-        nonReentrant
-        onlyRole(DEFAULT_ADMIN_ROLE)
-    {
+    function withdrawPosition(uint256 tokenId, uint256 units) external nonReentrant restricted {
+        address to = treasury;
         emit PositionWithdrawn(tokenId, to, units);
         clearinghouse.safeTransferFrom(address(this), to, tokenId, units, "");
         _refresh(tokenId & ~uint256(1));
     }
 
-    /// @notice Sets the guard rails. DEFAULT_ADMIN_ROLE.
+    /// @notice Sets the guard rails. TREASURY_ADMIN (24 h).
     /// @dev CeilingExceeded when askToleranceBps or maxBidBpsOfSpot is above BPS. Applies to the next guarded action;
     ///      live orders are not touched (cancel them to apply a tighter price guard at once). The outflow bucket is
     ///      settled against the OLD maxDailyOutflow first, so raising the cap never back-dates the faster refill and
     ///      lowering it (to 0, the spend freeze) never wipes what is already used.
     /// @param limits_ See {Limits}.
-    function setLimits(Limits calldata limits_) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setLimits(Limits calldata limits_) external nonReentrant restricted {
         _setLimits(limits_);
     }
 
@@ -302,19 +351,19 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Moves `amount` base units of `asset` from the vault's wallet into the vault's Clearinghouse ledger (write
-    ///         collateral). QUOTER_ROLE or admin.
+    ///         collateral). QUOTER only.
     /// @param asset USDG or a registered underlying.
     /// @param amount Base units.
-    function depositToClearinghouse(address asset, uint256 amount) external nonReentrant onlyQuoter {
+    function depositToClearinghouse(address asset, uint256 amount) external nonReentrant restricted {
         IERC20(asset).forceApprove(address(clearinghouse), amount);
         clearinghouse.deposit(asset, amount, address(this));
     }
 
     /// @notice Moves `amount` base units of `asset` from the vault's Clearinghouse ledger back to the vault's wallet.
-    ///         QUOTER_ROLE or admin. The recipient is always the vault.
+    ///         QUOTER only. The recipient is always the vault.
     /// @param asset USDG or a registered underlying.
     /// @param amount Base units (InsufficientCollateral above the free balance).
-    function withdrawFromClearinghouse(address asset, uint256 amount) external nonReentrant onlyQuoter {
+    function withdrawFromClearinghouse(address asset, uint256 amount) external nonReentrant restricted {
         clearinghouse.withdraw(asset, amount, address(this));
     }
 
@@ -322,7 +371,7 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
                                 QUOTING
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Places a vault order on the book. QUOTER_ROLE or admin.
+    /// @notice Places a vault order on the book. QUOTER only.
     /// @dev Reverts, before the book is called: UnknownSeries; the oracle's spot revert (stale, paused, no source) or
     ///      NoSource for a zero spot; BadPrice for a Bid above the bid cap or an ask below the ask floor; PastCutoff for
     ///      a validUntil beyond now + maxOrderLifetime (a zero validUntil becomes that bound when it is earlier than
@@ -339,12 +388,12 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     function place(uint256 longId, V2Types.OrderKind kind, uint128 price, uint64 units, uint40 validUntil)
         external
         nonReentrant
-        onlyQuoter
+        restricted
         returns (uint256 orderId)
     {
         V2Types.Series memory s = _series(longId);
         bool bid = kind == V2Types.OrderKind.Bid;
-        _checkPrice(s, bid, price);
+        _checkPrice(s, bid, kind == V2Types.OrderKind.AskWrite, price);
         validUntil = _boundLifetime(s, kind, validUntil);
         Exposure memory before = _measure(longId);
         if (before.live >= MAX_LIVE_ORDERS_PER_SERIES) revert V2Errors.CeilingExceeded();
@@ -357,7 +406,7 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     }
 
     /// @notice Replaces a vault order (the book cancels it and places a new one, same series, kind and validUntil).
-    ///         QUOTER_ROLE or admin.
+    ///         QUOTER only.
     /// @dev OrderNotLive for an unknown id, NotAuthorized for an order the vault did not place; then the price guard of
     ///      the order's kind on `newPrice`, the book's replace, the size guards, and the outflow cap when the order is
     ///      a Bid (OutflowCapExceeded). Replacing a Bid books the NET escrow change, so a replacement that costs less
@@ -369,7 +418,7 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     function replace(uint256 orderId, uint128 newPrice, uint64 newUnits)
         external
         nonReentrant
-        onlyQuoter
+        restricted
         returns (uint256 newOrderId)
     {
         uint256[] memory ids = new uint256[](1);
@@ -379,7 +428,7 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         if (o.maker != address(this)) revert V2Errors.NotAuthorized();
         V2Types.Series memory s = _series(o.longId);
         bool bid = o.kind == V2Types.OrderKind.Bid;
-        _checkPrice(s, bid, newPrice);
+        _checkPrice(s, bid, o.kind == V2Types.OrderKind.AskWrite, newPrice);
         Exposure memory before = _measure(o.longId);
 
         uint256 cashBefore = bid ? _cash() : 0;
@@ -389,13 +438,13 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         if (bid) _bookOutflow(cashBefore, true);
     }
 
-    /// @notice Cancels vault orders; refunds go to the vault. QUOTER_ROLE or admin. Never price-, size- or cap-checked.
+    /// @notice Cancels vault orders; refunds go to the vault. QUOTER only. Never price-, size- or cap-checked.
     /// @dev The book reverts OrderNotLive for an unknown id and NotAuthorized for an order that is not the vault's, and
     ///      skips ids already cancelled or filled. Refreshes the stored exposure of every series touched. When one of
     ///      the ids names a Bid the returned escrow is CREDITED to the outflow bucket, but the cap is never enforced
     ///      here: a cancel can only give USDG back and must stay callable while the bucket is empty or the cap is 0.
     /// @param orderIds Vault order ids.
-    function cancel(uint256[] calldata orderIds) external nonReentrant onlyQuoter {
+    function cancel(uint256[] calldata orderIds) external nonReentrant restricted {
         V2Types.Order[] memory orders = orderBook.getOrders(orderIds);
         bool anyBid;
         for (uint256 i; i < orders.length; ++i) {
@@ -420,7 +469,7 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         }
     }
 
-    /// @notice Takes liquidity for the vault. QUOTER_ROLE or admin.
+    /// @notice Takes liquidity for the vault. QUOTER only.
     /// @dev NotAuthorized unless p.recipient is the vault (longs bought and USDG from a sale both come back here).
     ///      Price guard on p.limitPrice: buying never above the bid cap, selling never below the ask floor, so no fill
     ///      of the take can be priced outside them (the book fills asks <= and bids >= the limit). The book pulls USDG
@@ -434,12 +483,12 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     function take(V2Types.TakeParams calldata p)
         external
         nonReentrant
-        onlyQuoter
+        restricted
         returns (uint64 unitsFilled, uint256 premium, uint256 takerFee)
     {
         if (p.recipient != address(this)) revert V2Errors.NotAuthorized();
         V2Types.Series memory s = _series(p.longId);
-        _checkPrice(s, p.buying, p.limitPrice);
+        _checkPrice(s, p.buying, p.writeToSell, p.limitPrice);
         Exposure memory before = _measure(p.longId);
 
         uint256 cashBefore = _cash();
@@ -449,33 +498,33 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     }
 
     /// @notice Burns `units` long and short of `longId` from the vault's wallet and frees their collateral into the
-    ///         vault's Clearinghouse ledger. QUOTER_ROLE or admin. Never price- or size-checked.
+    ///         vault's Clearinghouse ledger. QUOTER only. Never price- or size-checked.
     /// @param longId Series long id (unsettled).
     /// @param units 0.01-share units of each side.
-    function close(uint256 longId, uint64 units) external nonReentrant onlyQuoter {
+    function close(uint256 longId, uint64 units) external nonReentrant restricted {
         clearinghouse.close(longId, units);
         _refresh(longId);
     }
 
     /// @notice Withdraws the vault's {IOrderBook.owed} USDG (payments the book could not make) to the vault.
-    ///         QUOTER_ROLE or admin.
-    function claimOwed() external nonReentrant onlyQuoter {
+    ///         QUOTER only.
+    function claimOwed() external nonReentrant restricted {
         orderBook.claimOwed();
     }
 
     /// @notice Re-measures the stored exposure of each series (drops orders that filled, were cancelled or pruned, or
     ///         expired, except an expired AskResale whose longs the book still holds; positions that were redeemed).
-    ///         QUOTER_ROLE or admin.
+    ///         QUOTER only.
     /// @param longIds Series long ids; {trackedSeries} lists every series with stored notional.
-    function sync(uint256[] calldata longIds) external nonReentrant onlyQuoter {
+    function sync(uint256[] calldata longIds) external nonReentrant restricted {
         for (uint256 i; i < longIds.length; ++i) {
             _refresh(longIds[i]);
         }
     }
 
     /// @notice Re-issues the three OrderBook approvals made at deployment (operator, ERC-1155 approval, unlimited USDG
-    ///         allowance). QUOTER_ROLE or admin. Idempotent; only ever approves the immutable book.
-    function refreshApprovals() external nonReentrant onlyQuoter {
+    ///         allowance). QUOTER only. Idempotent; only ever approves the immutable book.
+    function refreshApprovals() external nonReentrant restricted {
         _approveBook();
     }
 
@@ -522,11 +571,26 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         return _tracked;
     }
 
-    /// @notice The lowest ask price the vault may place on `longId` now, USDG base units per share.
-    /// @dev Reverts like the oracle's spot when it is stale or paused, UnknownSeries for an unknown id.
+    /// @notice The lowest PRIMARY ask price the vault may place on `longId` now (an AskWrite, or the limit price of
+    ///         a `writeToSell` take), USDG base units per share.
+    /// @dev Grossed up by the book's `premiumFeeBps`, so the vault's NET is never below the bare floor (contract
+    ///         NatSpec, THE ASK FLOOR IS NET OF THE SELLER FEE). Equal to `askFloorOf(longId, true)`. Reverts like the
+    ///         oracle's spot when it is stale or paused, UnknownSeries for an unknown id.
     function askFloor(uint256 longId) external view returns (uint256) {
         V2Types.Series memory s = _series(longId);
-        return _askFloor(s, _spot(s));
+        return _askFloor(s, _spot(s), _sellerFeeBps(true));
+    }
+
+    /// @notice The lowest ask price the vault may place on `longId` now for a sale of the given kind, USDG base
+    ///         units per share.
+    /// @dev A resale of inventory pays `resaleFeeBps` instead of `premiumFeeBps`, so its floor is lower whenever the
+    ///      two rates differ (0 and 500 at launch). Named, not overloaded, so `askFloor.selector` stays unambiguous.
+    /// @param longId Series long id.
+    /// @param primary True for a fill that MINTS (AskWrite, or a `writeToSell` take), false for an AskResale or a
+    ///        take that sells inventory.
+    function askFloorOf(uint256 longId, bool primary) external view returns (uint256) {
+        V2Types.Series memory s = _series(longId);
+        return _askFloor(s, _spot(s), _sellerFeeBps(primary));
     }
 
     /// @notice The highest bid price the vault may place on `longId` now, USDG base units per share.
@@ -559,18 +623,15 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     }
 
     /// @inheritdoc IERC165
-    function supportsInterface(bytes4 interfaceId) public view override(AccessControl, IERC165) returns (bool) {
-        return interfaceId == type(IERC1155Receiver).interfaceId || super.supportsInterface(interfaceId);
+    /// @dev INTERFACE_VERSION 8: {Managed} declares no `supportsInterface`, so the vault no longer reports
+    ///      `type(IAccessControl).interfaceId`. Roles are not on this target any more.
+    function supportsInterface(bytes4 interfaceId) public pure override returns (bool) {
+        return interfaceId == type(IERC1155Receiver).interfaceId || interfaceId == type(IERC165).interfaceId;
     }
 
     /*//////////////////////////////////////////////////////////////
                                INTERNALS
     //////////////////////////////////////////////////////////////*/
-
-    /// @dev Every role check reverts with the shared v2 error. Covers grantRole / revokeRole as well.
-    function _checkRole(bytes32 role, address account) internal view override {
-        if (!hasRole(role, account)) revert V2Errors.NotAuthorized();
-    }
 
     /// @dev The USDG the outflow cap measures: the vault's wallet plus what the book still owes it. The Clearinghouse
     ///      ledger is excluded on purpose (contract NatSpec, OUTFLOW CAP).
@@ -587,10 +648,11 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
     }
 
     /// @dev Books the change of {_cash} across a booked call (contract NatSpec, OUTFLOW CAP). A decrease is charged
-    ///      and, with `enforce` and a caller who is not DEFAULT_ADMIN_ROLE, reverts OutflowCapExceeded when it would
-    ///      leave the bucket above the cap; an increase is credited and never takes the bucket below 0. The bucket is
-    ///      kept scaled by OUTFLOW_WINDOW so the refill is exact, and clamped to uint216 (unreachable at any USDG
-    ///      supply: the clamp only makes a charge cheaper, never a revert weaker).
+    ///      and, with `enforce`, reverts OutflowCapExceeded when it would leave the bucket above the cap; an increase
+    ///      is credited and never takes the bucket below 0. INTERFACE_VERSION 8: there is NO caller exemption --
+    ///      `msg.sender` is not consulted at all, so the bound is a property of the contract rather than of who holds
+    ///      which key. The bucket is kept scaled by OUTFLOW_WINDOW so the refill is exact, and clamped to uint216
+    ///      (unreachable at any USDG supply: the clamp only makes a charge cheaper, never a revert weaker).
     /// @param before {_cash} measured immediately before the call to the book.
     /// @param enforce Whether the cap may block this call. False for {cancel}, which can only credit.
     function _bookOutflow(uint256 before, bool enforce) private {
@@ -601,7 +663,7 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         if (cashAfter < before) {
             uint256 out = before - cashAfter;
             uint256 next = s + out * OUTFLOW_WINDOW;
-            if (enforce && next > cap * OUTFLOW_WINDOW && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            if (enforce && next > cap * OUTFLOW_WINDOW) {
                 uint256 used = (s + OUTFLOW_WINDOW - 1) / OUTFLOW_WINDOW;
                 revert V2Errors.OutflowCapExceeded(cap > used ? cap - used : 0, out);
             }
@@ -616,6 +678,14 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         // casting to 'uint40' is safe until the year 36812
         // forge-lint: disable-next-line(unsafe-typecast)
         _outflowAt = uint40(block.timestamp);
+    }
+
+    /// @dev Stores the Treasury Safe. Zero is refused, so {withdraw} and {withdrawPosition} never burn vault assets
+    ///      and never need a "treasury unset" branch that could be reached with money in the vault.
+    function _setTreasury(address treasury_) private {
+        if (treasury_ == address(0)) revert V2Errors.NotAuthorized();
+        treasury = treasury_;
+        emit TreasurySet(treasury_);
     }
 
     /// @dev Stores the guard rails. The outflow bucket is settled against the OLD cap first, so a new cap never
@@ -655,8 +725,21 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
         if (spot == 0) revert V2Errors.NoSource();
     }
 
-    /// @dev max(0, intrinsic - spot x askToleranceBps / BPS), USDG base units per share.
-    function _askFloor(V2Types.Series memory s, uint256 spot) private view returns (uint256) {
+    /// @dev The seller fee the book would take out of the vault's proceeds, bps of premium: `premiumFeeBps` when
+    ///      the fill mints (`primary`), `resaleFeeBps` otherwise (`OrderBook._plan`). READ FROM THE BOOK, never a
+    ///      compiled copy, and {IOrderBook.feeParams} already resolves a scheduled change, so the floor moves with
+    ///      the fee instead of being quietly crossed by it.
+    function _sellerFeeBps(bool primary) private view returns (uint256) {
+        V2Types.FeeParams memory f = orderBook.feeParams();
+        return primary ? f.premiumFeeBps : f.resaleFeeBps;
+    }
+
+    /// @dev ceil(base x BPS / (BPS - sellerFeeBps)) with base = max(0, intrinsic - spot x askToleranceBps / BPS),
+    ///      USDG base units per share. Rounded UP, so the vault's proceeds NET of the seller fee are never below
+    ///      `base`: the book charges floor(premium x sellerFeeBps / BPS), which only ever leaves more.
+    ///      `BPS - sellerFeeBps` underflows and reverts at a fee of 100 % or more -- fail-closed, and unreachable
+    ///      while the book keeps `premiumFeeBps` and `resaleFeeBps` under its own `PREMIUM_FEE_CEIL_BPS` (10 %).
+    function _askFloor(V2Types.Series memory s, uint256 spot, uint256 sellerFeeBps) private view returns (uint256) {
         uint256 strike = s.strike;
         uint256 intrinsic;
         if (s.isPut) {
@@ -665,15 +748,19 @@ contract MakerVault is IERC1155Receiver, AccessControl, ReentrancyGuardTransient
             intrinsic = spot - strike;
         }
         uint256 tolerance = spot * _limits.askToleranceBps / V2Constants.BPS;
-        return intrinsic > tolerance ? intrinsic - tolerance : 0;
+        uint256 base = intrinsic > tolerance ? intrinsic - tolerance : 0;
+        if (base == 0) return 0;
+        return Math.ceilDiv(base * V2Constants.BPS, V2Constants.BPS - sellerFeeBps);
     }
 
-    /// @dev BadPrice when a buying price is above the bid cap or a selling price below the ask floor.
-    function _checkPrice(V2Types.Series memory s, bool buying, uint256 price) private view {
+    /// @dev BadPrice when a buying price is above the bid cap or a selling price below the ask floor of its kind.
+    /// @param primary Whether a sale at this price would MINT (AskWrite, or a `writeToSell` take). Ignored when
+    ///        `buying`, because a purchase pays no seller fee.
+    function _checkPrice(V2Types.Series memory s, bool buying, bool primary, uint256 price) private view {
         uint256 spot = _spot(s);
         if (buying) {
             if (price > spot * _limits.maxBidBpsOfSpot / V2Constants.BPS) revert V2Errors.BadPrice();
-        } else if (price < _askFloor(s, spot)) {
+        } else if (price < _askFloor(s, spot, _sellerFeeBps(primary))) {
             revert V2Errors.BadPrice();
         }
     }

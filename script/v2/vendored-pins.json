@@ -1,0 +1,43 @@
+{
+  "_readme": "Content-hash pins for files whose HEADER ASSERTS THE BODY HAS NOT CHANGED since it landed. A vendoring header is an assertion about the day the file landed; it cannot see later edits, so an audit-scope exclusion resting on 'it is vendored' depends on something nobody re-checks. script/v2/check-vendored-pins.sh fails when a pinned file's sha256 differs from its entry here, and names the file. T-574. WHICH FILES ARE PINNED IS DECIDED BY READING EACH HEADER, NOT BY DIRECTORY -- see notPinned below, which records the ones deliberately left out so the next reader does not re-litigate them. TO CHANGE A PINNED FILE ON PURPOSE: update the sha256 here in the SAME commit, and say in the message why the body moved.",
+  "algorithm": "sha256 of the file bytes, as printed by shasum -a 256 (or sha256sum)",
+  "pinnedAt": "8bc1dc36bca142183028e4fa371d321f19404b79",
+  "pinned": [
+    {
+      "path": "src/v2/oracle/lib/FullMath.sol",
+      "sha256": "3ccdc6c4bec4adcc295dcd3aaf863a99e4ae71d4d2e0d6deb16edfe48f3ddeaf",
+      "assertion": "Apart from these comment lines and the two forgefmt markers, every line is identical to that file, in order. Do not edit or reformat it; diff it against the URL instead.",
+      "upstream": "Uniswap v3-core branch 0.8 @ 6562c52e8f75f0c10f9deaf44861847585fc8129, contracts/libraries/FullMath.sol",
+      "why": "The audit scope excludes it as vendored. That exclusion is only sound while the body is unchanged."
+    },
+    {
+      "path": "src/interfaces/IValoremClear.sol",
+      "sha256": "fbf76043d7a2d7554adb38272e7a5d3b4f8b8397daf78b48046fae95a1dd3006",
+      "assertion": "This file is a verbatim copy of src/interfaces/IValoremClear.sol from the Blockscout-verified source ... Comments only have changed from the verified copy. If Valorem's deployment ever moves, re-transcribe rather than adapt.",
+      "upstream": "Blockscout-verified source of Overcall's NVDA registry on chain 4663 (0x8E973cE1A6884E28Ad3E377d5f670Bc0b463f4EA); hand transcription of valorem-labs-inc/clear @ 6436c823f560af493af119d6148fb3237037aca4",
+      "why": "Its header says re-transcribe rather than adapt, which is a fixedness claim about the body. It is NOT byte-identical to any upstream file -- the provenance paragraph itself differs -- so the pin is against its own recorded bytes, not against Valorem."
+    },
+    {
+      "path": "test/v2/lib/V4ProtocolFeeMirror.sol",
+      "sha256": "6876f27d544f28c3cea425256d1cd7eb372a6d99aa8a5f2e3beb66f2b03e0785",
+      "assertion": "MIRRORED, NOT RE-DERIVED. Copied line for line from the v4-core checkout on this machine. If v4-core changes these, this file is wrong and the pin must be re-mirrored from the same path.",
+      "upstream": "Uniswap v4-core src/libraries/ProtocolFeeLibrary.sol:8,17-23; local checkout recorded by the file header",
+      "why": "This test-only dependency mirror is deliberately independent of the production decode sites. Silent edits would make the supposed upstream reference agree with the code under test for the wrong reason."
+    }
+  ],
+  "notPinned": [
+    {
+      "path": "src/v2/oracle/lib/TickMath.sol",
+      "why": "NOT VENDORED. Its own header says it is a REWRITE with its own TickOutOfRange error, a uint256[20] factor table instead of the unrolled chain, and no getTickAtSqrtRatio. T-529 established this. Pinning it would assert a fixedness its header explicitly denies, and would freeze first-party code on the price path.",
+      "note": "src/v2/README.md:40 still lists it beside FullMath.sol as 'Vendored unchanged from Uniswap v3-core' -- that line contradicts the file's own header and is out of this row's scope to fix. Reported, not repaired."
+    },
+    {
+      "path": "src/v2/oracle/lib/PriceLib.sol",
+      "why": "Checked, per this row's criterion 3. It carries no vendoring header. It copies Policy.normalizeSpot's arithmetic from v1 and its own @dev states a DELIBERATE divergence -- it reports ok = false where normalizeSpot reverted -- so it is first-party code that was written from a model, not a copy held fixed."
+    },
+    {
+      "path": "src/v2/periphery/BuybackDeps.sol, src/v2/periphery/PayoutDeps.sol",
+      "why": "Hand-written interfaces. Their claim is ABI-compatibility with v4-core and SwapRouter02 ('ABI-identical', 'encodes to the same five static words'), which is a statement about the encoding, not about the bytes of an upstream file. A content pin would not test that claim; a selector or pool-id assertion would."
+    }
+  ]
+}

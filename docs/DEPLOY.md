@@ -362,3 +362,170 @@ What this rehearsal does **not** prove:
 - Sourcify source verification (not run on a fork; Sourcify verifies against the live chain).
 - Anything after configuration: the first `rollOpen`, a listing, a fill. The keeper dry run
   (`keeper/DRYRUN.md` in stonkhousedotfun/callhouse) covers three full cycles on a separately deployed vault.
+
+---
+
+## Solo factory markets (Tier 1)
+
+The live product is one `AccountFactory` per market (`src/solo/`; the pooled Vault above is closed and
+is never redeployed). Every market's inputs come from the registry, `ops/markets/tier1.json` in
+stonkhousedotfun/callhouse (read `ops/markets/README.md` there first): `asset`, `feed`, `depositCap`,
+`ticker`, `deployment.keeper`, `deployment.guardian`, `deployment.admin`, `deployment.feeRecipient`.
+`script/DeploySoloBatch.sh` drives the three scripts below for a set of markets and writes
+`deployment.factory`, `implementation`, `deployBlock`, `deployTx`, `sourcify` and `configuredAt` back;
+it writes nothing else in the registry (`status` and `wave` stay hand-maintained). The live NVDA
+factory `0xc4A5Cd0DE91CaB7F5Ebe2114bc63Fbb43E642BBb` was verified against this checkout's build on
+2026-09-16 (below); it is not touched by any of this.
+
+| Script | What it does |
+|---|---|
+| `script/DeploySolo.s.sol` | preflight (below), then `new AccountFactory(...)`, whose constructor deploys and locks the `WriterAccount` implementation. `ValoremLib` (linked by `WriterAccount`, 4 call sites) is deployed through the CREATE2 factory if absent; on 4663 it already exists at `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d`, so a market deploy is ONE transaction (4,766,283 gas on the fork; 4,766,595 for the live NVDA factory) |
+| `script/ConfigureSolo.s.sol` | grants `KEEPER_ROLE` and `GUARDIAN_ROLE`; optionally `setDepositCap` / `setPolicy`. Idempotent: a grant already held is skipped ("already granted"), the cap only when `DEPOSIT_CAP` is set and differs, a policy only when `SET_POLICY=true` and it differs. With `ADMIN_PK` it broadcasts from that key (refuses a key without `DEFAULT_ADMIN_ROLE`); without, it only writes a Safe Transaction Builder batch. Refuses keeper == guardian, or either == the admin |
+| `script/VerifySolo.s.sol` | read-only. **60** checks on a fresh, configured factory (**56** with `EXPECT_FRESH=false`, e.g. the live NVDA market): chain id; factory runtime against `out/AccountFactory.sol/AccountFactory.json` with immutable slots masked; implementation runtime against `out/Account.sol/WriterAccount.json` with immutables and the 4 `ValoremLib` link sites masked (each checked to hold `VALOREM_LIB`, the count read from the artifact); `ValoremLib` runtime and self-address word; every immutable on both by value, the implementation locked with no owner; the asset's symbol, decimals, `uiMultiplier()`, `oraclePaused()`; USDG decimals; the feed's description, decimals, live answer, age within `maxPriceAge`; Seaport 1.6; Clear `feeBps`, switch, ERC-1155; policy field by field, cap, price age, fee recipient, not halted, fee not accepted; roles (admin, keeper exactly `KEEPER_ROLE`, guardian exactly `GUARDIAN_ROLE`, three distinct, role admins); fresh state (no week, no account, nothing pending or live). Reverts if any fail |
+| `script/lib/BytecodeCheck.sol` | the masking helpers, copied from `Verify.s.sol` (which is unchanged so its recorded counts stay exact) and generalised to one linked library |
+| `script/DeploySoloBatch.sh` | Deploy → Configure → Verify → write-back per market, from the registry (flags below). `set -euo pipefail`: a piped `forge script` once hid a failure here |
+| `script/rehearse-solo.sh` | starts an anvil fork (`--code-size-limit 98304`), runs the batch with `--rehearse`, checks the real registry's sha256 is unchanged, flips one byte of a factory (`anvil_setCode`) and shows VerifySolo FAIL, kills the anvil on exit |
+
+### `DeploySolo.s.sol` preflight and environment
+
+Every default is the live NVDA market, so `DEPLOYER_PK=... ADMIN=... SAFE_FEE=... forge script
+script/DeploySolo.s.sol ...` still deploys NVDA exactly as before; the batch exports the rest per
+market. The preflight prints one `ok` line per check and reverts, before anything is broadcast, with
+a message naming the value read and the value expected:
+
+| Env | Default | Preflight |
+|---|---|---|
+| `DEPLOYER_PK` | required | pays for the deploy; holds no role afterwards |
+| `ADMIN` (else `SAFE_ADMIN`) | required | `DEFAULT_ADMIN_ROLE` at construction; a WARNING is printed when it is a plain key |
+| `SAFE_FEE` | required | `feeRecipient()`: the protocol-fee consideration item of every lot order |
+| `ASSET` | NVDA `0xd060…9EEC` | `symbol() == EXPECTED_TICKER` (a fat-fingered address reverts `asset symbol mismatch: ASSET 0x… is "AAPL", EXPECTED_TICKER is "TSLA"`); `decimals() == 18`; `uiMultiplier()` answers by staticcall and is > 0; `oraclePaused()` answers and is false (both probed the way `ValoremLib` does: a token without them is not a Stock Token) |
+| `PRICE_FEED` | NVDA/USD `0x379E…9F15` | `description()` contains `EXPECTED_TICKER` (`"RHTSLA / USD"`, `"Robinhood GME / USD"`; a wrong feed reverts `feed description mismatch: PRICE_FEED 0x… is "…", EXPECTED_TICKER is "…"`); `decimals() == 8`; `roundId != 0`; `answer > 0`; `updatedAt` within `MAX_PRICE_AGE` (4 days) of `block.timestamp`, the bound the factory applies to every write |
+| `EXPECTED_TICKER` | `NVDA` | the two checks above. An empty value matches nothing |
+| `DEPOSIT_CAP` | `20e18` | must be > 0 (per-account cap, asset base units; the registry's `depositCap`) |
+| `USDG` | `0x5fc5…d168` | `decimals() == 6` |
+| `CLEARINGHOUSE` | our Clear `0x53d7…b9C6` | `feeBps() == 15`, fee switch off, ERC-1155 |
+| `SEAPORT` | `0x0000…B395` | `information()` version `1.6` and the canonical ConduitController `0x00000000F9490004C11Cef243f5400493c00Ad63` |
+| `PREFLIGHT_SKIP_CONDUIT_CONTROLLER` | `false` | TEST ONLY: `MockSeaport.information()` answers a zero controller, so the unit test skips that one line (and shows it is on by default). The batch never sets it; a WARN line is printed when it is on |
+
+`test/unit/DeploySoloPreflight.t.sol` drives the script through `vm.setEnv` + `run()` against the
+mocks (`MockStockToken` "TSLA", `MockFeed` 8 dp "Robinhood TSLA / USD", `MockClear`, `MockSeaport`):
+the happy path returns a factory whose immutables, cap, fee recipient, admin, locked implementation
+and policy match, and each refusal (symbol, description, feed decimals, stale feed, answer ≤ 0,
+oracle paused, cap 0, token decimals, not a Stock Token, Clear fee on, wrong conduit controller,
+empty ticker) reverts with its message. The cases run in ONE test function, in order: `vm.setEnv`
+writes the process environment that forge's parallel test threads share, so separate functions
+would race for `ASSET`. `ConfigureSolo.t.sol` (8 tests) drives `runWith(Inputs)`, the script's
+explicit-input entry, for the same reason.
+
+### `ConfigureSolo.s.sol` environment
+
+| Env | What |
+|---|---|
+| `FACTORY`, `KEEPER`, `GUARDIAN` | required. The registry row's `deployment.keeper` (one hot key per market, `keeperKeyIndex`) and `deployment.guardian` |
+| `ADMIN_PK` | key-admin mode. Without it: batch only, nothing broadcast |
+| `DEPOSIT_CAP` | optional; `setDepositCap` only when set and ≠ `depositCap()` (the batch passes the registry cap, which the constructor already set, so it is skipped) |
+| `SET_POLICY` + `MIN_OTM_BPS`, `MAX_OTM_BPS`, `MIN_PREMIUM_BPS`, `MAX_UTILIZATION_BPS`, `PROTOCOL_FEE_BPS`, `MAX_CONTRACTS_CAP` | optional, as `Configure.s.sol`; applied only when it differs from `policy()` |
+| `SAFE_ADMIN`, `SAFE_BATCH_OUT` | the Safe named in the batch file; where it goes (default `broadcast/configure-solo-safe-batch.json`; the batch writes `broadcast/solo-batch/<utc>/<TICKER>-configure-safe-batch.json`) |
+
+After a key-admin broadcast the script re-reads `hasRole` for both and `depositCap()` and prints
+them ("post-check"); `VerifySolo.s.sol` against the chain is still the gate.
+
+### `VerifySolo.s.sol` environment
+
+| Env | Default | What it pins |
+|---|---|---|
+| `FACTORY` | required | the AccountFactory (its `implementation()` is read from it) |
+| `KEEPER`, `GUARDIAN`, `ADMIN` | required | `ADMIN` = the `DEFAULT_ADMIN_ROLE` holder (bootstrap: the deployer) |
+| `FEE_RECIPIENT` | required | `feeRecipient()` |
+| `EXPECTED_TICKER` | `NVDA` | asset `symbol()`, feed `description()` |
+| `DEPOSIT_CAP` | `20e18` | `depositCap()` (the live NVDA factory: `type(uint256).max`) |
+| `ASSET`, `PRICE_FEED`, `USDG`, `CLEARINGHOUSE`, `SEAPORT` | DeploySolo's defaults | every immutable, on the factory and on the implementation |
+| `VALOREM_LIB` | read from the implementation's first link site | all 4 link sites, then the library's runtime against `out/ValoremLib.sol/ValoremLib.json` with its self-address word checked, which is what makes a derived address safe |
+| `EXPECT_KEEPER_CONFIGURED` | `true` | `false` before ConfigureSolo: keeper and guardian hold nothing |
+| `EXPECT_FRESH` | `true` | `false` on a market that has run |
+| `EXPECT_CHAIN_ID` | `4663` | |
+| `SET_POLICY` + `MIN_OTM_BPS`… | launchDefaults | the policy to expect when ConfigureSolo set one |
+
+### `DeploySoloBatch.sh`
+
+```bash
+script/DeploySoloBatch.sh --rehearse --rpc http://127.0.0.1:8546 --tickers TSLA,GME,SPY [--out copy.json] [--deployer-pk 0x…] [--force]
+script/DeploySoloBatch.sh --broadcast --rpc $RH_RPC --wave canary          # DEPLOYER_PK and ADMIN_PK in the environment
+script/DeploySoloBatch.sh --rehearse --rpc http://127.0.0.1:8546 --wave wave1 --dry-run
+```
+
+| Flag | |
+|---|---|
+| `--registry <path>` | default `../callhouse/ops/markets/tier1.json` from the repository root |
+| `--tickers A,B,C` / `--wave canary\|wave1\|wave2` | which rows. `--wave live` is refused; a row with `deployment.factory` set is skipped unless `--force` (and a `status: live` row is never redeployed on mainnet); a row with `verification.ok == false` is refused; a row with `status: superseded-by-v2` (every planned row since 2026-09-16) is refused in every mode, `--force` included: those markets list on v2 (`docs/DEPLOY-V2.md`, `script/v2/batch-refusals.sh` checks it) |
+| `--rpc <url>` | default `$RH_RPC` |
+| `--rehearse` | `--rpc` must be `127.0.0.1`/`localhost`, chain id 4663, and the node must answer `web3_clientVersion` as anvil and accept a 30,000 B contract (the `--code-size-limit 98304` probe). Deployer = admin = anvil account #0 (or `--deployer-pk`). Write-back goes to `--out` (default a fresh temp directory, printed), never the real file, whose sha256 is checked unchanged at the end. forge's records go under the run's log directory (`FOUNDRY_BROADCAST`), so `broadcast/DeploySolo.s.sol/4663/run-latest.json`, the mainnet NVDA record, is not overwritten |
+| `--broadcast` | `--rpc` must be non-local and not anvil; `DEPLOYER_PK` and `ADMIN_PK` from the environment (never printed, never on a command line: forge runs in a subshell that exports them); `ADMIN_PK`'s address must equal each row's `deployment.admin`; prints the plan and waits for the literal word `deploy` on stdin before the first transaction; adds `--verify --verifier sourcify --chain 4663`; writes the REAL registry after each market; stops at the first failure |
+| `--dry-run` | prints the per-market environment and the three commands, runs nothing, needs no RPC; with `--broadcast` (even `--broadcast --dry-run`), `DEPLOYER_PK` and `ADMIN_PK` must still be exported — the plan step derives and checks the admin address |
+
+Per market it exports `ASSET`, `PRICE_FEED`, `DEPOSIT_CAP`, `EXPECTED_TICKER`, `ADMIN`, `SAFE_FEE`,
+runs `forge script script/DeploySolo.s.sol --rpc-url … --broadcast --slow --no-storage-caching
+--non-interactive [--verify …]`, reads the factory address, block, tx, gas and the `ValoremLib`
+address from `run-latest.json` (`jq`), `implementation()` with `cast`, then `ConfigureSolo` with
+`ADMIN_PK`, `KEEPER`, `GUARDIAN`, `DEPOSIT_CAP`, then `VerifySolo` with `EXPECT_FRESH=true` and
+requires its `VERIFY PASSED` line, then `node` rewrites the six `deployment` fields (2-space JSON +
+newline, the builder's own serialisation, so nothing else in the file moves). Logs:
+`broadcast/solo-batch/<utc>/{batch.log, <T>-deploy.log, <T>-configure.log, <T>-verify.log,
+<T>-run-latest.json, <T>-configure-safe-batch.json}`.
+
+### Sizes (`forge build --sizes`, this commit)
+
+| Contract | Runtime | Initcode |
+|---|---|---|
+| `AccountFactory` | 6,403 B | 22,766 B (it carries `WriterAccount`'s initcode) |
+| `WriterAccount` | 14,653 B | 15,288 B |
+
+Both are under EIP-170's 24,576 B, so unlike the Vault neither needs chain 4663's 98,304 B limit;
+`--non-interactive` and the anvil flag are kept for uniformity with the rest of this runbook.
+
+### Rehearsal record — 2026-09-16 (Tier 1 batch)
+
+`script/rehearse-solo.sh` (anvil `--fork-url https://rpc.mainnet.chain.robinhood.com --chain-id 4663
+--port 8546 --code-size-limit 98304`), fork block **64170688**, every forge call with
+`--no-storage-caching --non-interactive`, on the working tree of `5eb84d1` plus these scripts
+(`src/` unchanged). **Passed.** Deployer and admin: anvil account #0
+`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`; keeper, guardian and fee recipient from the registry
+rows; `ValoremLib` reused at `0xd3CB94893EAb55e425cCd77Db98458b38D75Fa3d` (already on chain), so
+each market is one transaction.
+
+| Market | Preflight (feed answer 8 dp, age; `uiMultiplier`) | Factory / implementation | Block, gas | Verify |
+|---|---|---|---|---|
+| TSLA (canary, cap 27 TSLA) | `35624000000`, 1,312 s; `1e18`; description `"RHTSLA / USD"` | `0xF94AB55a20B32AC37c3A105f12dB535986697945` / `0x54f8dEbD81e25Fb3e33bf2412d5d7A2f4344813c` | 64170689, 4,766,283 | **60 of 60** |
+| GME (wave2, cap 466 GME) | `2142499999`, 26,111 s; `1e18`; `"Robinhood GME / USD"` | `0x364C7188028348566E38D762f6095741c49f492B` / `0xab7CFa26b99409C07355dB52dE7E9D3922970783` | 64170692, 4,766,283 | **60 of 60** |
+| SPY (wave1, cap 13 SPY) | `75750500000`, 45,571 s; `1e18`; `"RHSPY / USD"` | `0xC3549920b94a795D75E6C003944943D552C46F97` / `0x96d7B523011a3629D09ce07A3B907dF76b5054d3` | 64170695, 4,766,283 | **60 of 60** |
+
+Every preflight printed all 16 `ok` lines (symbol, decimals, `uiMultiplier`, `oraclePaused`, USDG,
+description, feed decimals, roundId, answer, age, Clear ×3, Seaport ×2, cap) and the plain-key
+WARNING. ConfigureSolo broadcast 2 calls per market from anvil #0 and skipped `setDepositCap`
+("already 27000000000000000000"); post-check printed both roles held. VerifySolo read
+`VALOREM_LIB` from the batch (`run-latest.json` `.libraries[]`) and passed all 4 link sites and the
+library runtime. The registry copy (`broadcast/solo-rehearsal/20260916T030142Z/tier1.rehearsal.json`)
+holds the three `deployment` rows with `sourcify: null` and `configuredAt: "2026-09-16"`; the real
+registry's sha256 `51a917a0…edcd1` was identical before and after, and
+`broadcast/DeploySolo.s.sol/4663/run-latest.json` (the live NVDA record) was byte-identical too.
+
+Negative check: byte 100 of TSLA's factory flipped `0x14 → 0x15` with `anvil_setCode`; VerifySolo
+printed `FAIL  factory: runtime == compiled AccountFactory, outside immutable slots` and reverted.
+The batch's own refusals were exercised without a node: `--broadcast` with a local RPC, `--rehearse`
+with the public RPC, `--wave live`, `--tickers NVDA` (skipped, already deployed), `--broadcast`
+without `DEPLOYER_PK`, and `--broadcast` with an `ADMIN_PK` whose address is not the row's
+`deployment.admin`.
+
+**Live NVDA factory, read-only, same day** (public RPC, simulation only, nothing sent):
+`FACTORY=0xc4A5…2BBb EXPECTED_TICKER=NVDA DEPOSIT_CAP=<uint256 max> EXPECT_FRESH=false …
+forge script script/VerifySolo.s.sol` → **56 of 56**: the live factory and its implementation
+`0xe412…45EC` are byte-identical to this checkout's `out/` outside immutable and link slots, linked to
+the same `ValoremLib`, policy `launchDefaults()`, keeper `0x06c1…C1d2`, guardian `0x2974…6F39`, admin
+and fee recipient `0xEb82…9d9b` (a plain key). So the `DeploySoloBatch.sh --broadcast` path deploys
+the same bytes the live market runs.
+
+What this rehearsal does **not** prove: Sourcify verification (`--verify` runs only on `--broadcast`,
+against the live chain); the real deployer and admin keys (anvil #0 stood in for
+`0xEb82…9d9b`, so the batch's `deployment.admin == address(ADMIN_PK)` check was exercised only as a
+refusal); anything after configuration (the first `setWeek`, a `createAccount`, a listing, a fill);
+and the keeper and indexer processes reading the written-back rows.

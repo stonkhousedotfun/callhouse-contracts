@@ -97,8 +97,19 @@ contract LifecycleTest is V2IntegrationBase {
         for (uint256 i; i < traders.length; ++i) {
             _onboard(traders[i]);
         }
-        address[10] memory everyone =
-            [alice, bob, carol, mm, treasury, chFees, keeper, address(rewards), address(ch), address(book)];
+        address[11] memory everyone = [
+            alice,
+            bob,
+            carol,
+            mm,
+            treasury,
+            chFees,
+            address(splitter),
+            keeper,
+            address(rewards),
+            address(ch),
+            address(book)
+        ];
         for (uint256 i; i < everyone.length; ++i) {
             tracked.push(everyone[i]);
         }
@@ -203,20 +214,20 @@ contract LifecycleTest is V2IntegrationBase {
     function _buyersTakeFractionalSizes() internal {
         uint256 bobBefore = usdg.balanceOf(bob);
         uint256 carolBefore = usdg.balanceOf(carol);
-        uint256 treasuryBefore = usdg.balanceOf(treasury);
+        uint256 splitterBefore = usdg.balanceOf(address(splitter));
         // 1 unit of the 210 call from carol at 12.50: premium 0.125, fee 0.0125 (cap), seller fee 0.00625, rebate
         // 0.00625.
         _buy(bob, c210, _ids(cC210, aC210), 1, _fills(Fill(carol, 12_500_000, 1, true)));
         assertEq(bobBefore - usdg.balanceOf(bob), 137_500, "1 unit: bob paid premium + capped fee");
         assertEq(usdg.balanceOf(carol) - carolBefore, 125_000, "1 unit: carol got premium - 5 % + rebate");
-        assertEq(usdg.balanceOf(treasury) - treasuryBefore, 12_500, "1 unit: treasury");
+        assertEq(usdg.balanceOf(address(splitter)) - splitterBefore, 12_500, "1 unit: splitter");
 
         _buy(bob, c230, _ids(aC230), 10, _fills(Fill(alice, 1_500_000, 10, true)));
 
         bobBefore = usdg.balanceOf(bob);
         carolBefore = usdg.balanceOf(carol);
         uint256 aliceBefore = usdg.balanceOf(alice);
-        treasuryBefore = usdg.balanceOf(treasury);
+        splitterBefore = usdg.balanceOf(address(splitter));
         // 100 units across carol (99 left at 12.50) and alice (1 at 13.00): premium 12.505, one 0.10 fee, shares
         // 98_960 / 1_040, rebates 49_480 / 520.
         _buy(
@@ -229,7 +240,7 @@ contract LifecycleTest is V2IntegrationBase {
         assertEq(bobBefore - usdg.balanceOf(bob), 12_605_000, "100 units: bob");
         assertEq(usdg.balanceOf(carol) - carolBefore, 11_805_730, "100 units: carol");
         assertEq(usdg.balanceOf(alice) - aliceBefore, 124_020, "100 units: alice");
-        assertEq(usdg.balanceOf(treasury) - treasuryBefore, 675_250, "100 units: treasury");
+        assertEq(usdg.balanceOf(address(splitter)) - splitterBefore, 675_250, "100 units: splitter");
 
         _buy(
             bob,
@@ -291,7 +302,12 @@ contract LifecycleTest is V2IntegrationBase {
         vm.prank(alice);
         vm.expectRevert(V2Errors.PastCutoff.selector);
         book.place(c210, WRITE, 13_000_000, 10, 0);
+        // T-603: the subject here is the PastCutoff REFUSAL, so the call has to reach that check. Pranked as
+        // `alice` it never did -- she is not allowlisted, so it died at NotMinter (Clearinghouse.sol:641) and the
+        // test reported `NotMinter() != PastCutoff()`. The writer authorises the allowlisted sender first, and the
+        // authorisation goes before the expectRevert because that cheatcode binds to the next call.
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         vm.expectRevert(V2Errors.PastCutoff.selector);
         ch.mint(c210, 1, alice, alice);
         vm.prank(bob);
@@ -463,8 +479,8 @@ contract LifecycleTest is V2IntegrationBase {
         ch.sweepFees(address(nvda));
         ch.sweepFees(address(usdg));
         vm.stopPrank();
-        expNvda[chFees] += nvdaFees;
-        expUsdg[chFees] += usdgFees;
+        expNvda[address(splitter)] += nvdaFees;
+        expUsdg[address(splitter)] += usdgFees;
         paidOutByAsset[address(nvda)] += nvdaFees;
         paidOutByAsset[address(usdg)] += usdgFees;
 
@@ -540,7 +556,8 @@ contract LifecycleTest is V2IntegrationBase {
     /// @dev ADR-08 for one take. Buying: the taker pays premium + fee; each maker gets premium - seller fee + rebate
     ///      (bid escrow is not involved); a primary fill spends the maker's free collateral. Selling: the escrow of the
     ///      bids pays the premium; the taker (recipient) gets premium - seller fees - fee; bid makers get their rebates;
-    ///      writeToSell spends the taker's free collateral. The treasury gets seller fees + fee - rebates.
+    ///      writeToSell spends the taker's free collateral. INTERFACE_VERSION 8: the FeeSplitter gets seller fees +
+    ///      fee - rebates (OrderBook._payOrOwe to {feeRecipient}, which the fixture set to the splitter).
     function _modelTake(address taker, uint256 longId, Fill[] memory fills, bool buying, bool writeToSell)
         internal
         returns (uint64 units, uint256 premium, uint256 fee)
@@ -579,7 +596,7 @@ contract LifecycleTest is V2IntegrationBase {
         } else {
             expUsdg[taker] += premium - sellerFees - fee;
         }
-        expUsdg[treasury] += sellerFees + fee - rebates;
+        expUsdg[address(splitter)] += sellerFees + fee - rebates;
     }
 
     function _mSpendCollateral(address writer, uint256 longId, uint64 units) internal {

@@ -33,7 +33,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory cfg = _cfg(address(oracle));
         cfg.mintFeePpm = PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
         rentCall = ch.createSeries(address(tsla), false, K_240, E);
         rentPut = ch.createSeries(address(tsla), true, K_200, E);
         freeCall = _call(K_240, E);
@@ -56,6 +56,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         // every refund below 0 rather than the floored product this table is checking.
         _deposit(alice, address(tsla), callColl + ch.mintFee(c, 100));
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(c, 100, alice, alice);
 
         uint256[4] memory remaining = [uint256(45 days), 7 days, 1 days, uint256(V2Constants.SETTLEMENT_WINDOW) + 1];
@@ -98,6 +99,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         // Closed on the Wednesday, 172_800 s later, 100 units get back the floored remainder.
         _deposit(alice, address(tsla), 1e18 + ch.mintFee(c, 100));
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(c, 100, alice, alice);
         vm.warp(block.timestamp + 2 days);
         assertEq(ch.closeRefund(c, 100), 25_833_333_333_333, "the design's Wednesday refund");
@@ -110,7 +112,11 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
     function test_mintFee_rateZeroChargesNothing() public {
         _deposit(alice, address(nvda), 1e18);
         assertEq(ch.mintFee(freeCall, 100), 0, "no rate, no rent");
+        // T-603: `mint` is gated twice -- `isMinter[msg.sender]` (Clearinghouse.sol:641) and, separately,
+        // `msg.sender == writer || isOperator[writer][msg.sender]` (:642). The base allowlists the test contract,
+        // not `alice`, so the writer authorises it here rather than the base allowlisting an arbitrary EOA.
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(freeCall, 100, alice, alice);
         assertEq(ch.free(alice, address(nvda)), 0, "collateral only");
         assertEq(ch.series(freeCall).mintFeesHeld, 0, "nothing held");
@@ -123,6 +129,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         assertGt(fee, 0, "the rate charges");
         _deposit(alice, address(tsla), 1e18 + fee + 7);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, bob);
         assertEq(ch.free(alice, address(tsla)), 7, "collateral and rent left the ledger");
         assertEq(ch.locked(rentCall), 1e18, "locked is the collateral, never the rent");
@@ -135,12 +142,17 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         uint256 needed = 1e18 + fee;
         _deposit(alice, address(tsla), needed - 1);
-        vm.expectRevert(abi.encodeWithSelector(V2Errors.InsufficientCollateral.selector, needed - 1, needed));
+        // T-603: the authorisation goes BEFORE the expectRevert. `vm.expectRevert` binds to the NEXT call, so
+        // leaving it above `setOperator` points the expectation at a call that succeeds, and the test fails with
+        // "next call did not revert as expected" -- green gate, wrong subject.
         vm.prank(alice);
+        ch.setOperator(address(this), true);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.InsufficientCollateral.selector, needed - 1, needed));
         ch.mint(rentCall, 100, alice, alice);
 
         _deposit(alice, address(tsla), 1);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
         assertEq(ch.free(alice, address(tsla)), 0, "exact headroom is enough and nothing is left");
     }
@@ -149,8 +161,11 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
     function test_mint_emitsTheRentAndKeepsTheLogOrder() public {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
-        vm.recordLogs();
+        // T-603: the writer authorises the allowlisted minter BEFORE recordLogs, or {OperatorSet} lands in the
+        // recording and this test's whole subject -- that Minted is the THIRD log -- is measured against four.
         vm.prank(alice);
+        ch.setOperator(address(this), true);
+        vm.recordLogs();
         ch.mint(rentCall, 100, alice, bob);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(logs.length, 3, "TransferSingle(long), TransferSingle(short), Minted");
@@ -167,7 +182,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory cfg = _cfg(address(oracle));
         cfg.mintFeePpm = V2Constants.MINT_FEE_CEIL_PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
         assertEq(ch.series(rentCall).mintFeePpm, PPM, "the old series keeps its rate");
         assertEq(ch.mintFee(rentCall, 100), before, "and its charge");
 
@@ -182,17 +197,20 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         cfg.mintFeePpm = V2Constants.MINT_FEE_CEIL_PPM + 1;
         vm.expectRevert(V2Errors.CeilingExceeded.selector);
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
 
-        // Registration checks the same bound: an 18-dp token that is not yet a market, at a rate above the ceiling.
+        // Registration composes from the defaults; the per-market setter checks the same bound on a market
+        // that is not registered yet (a fresh 18-dp token registered first, then the over-ceiling rate).
         MockStockToken fresh = new MockStockToken("FRESH Stock Token", "FRESHx");
+        vm.prank(admin);
+        ch.registerMarket(address(fresh), STRIKE_TICK, true);
         vm.expectRevert(V2Errors.CeilingExceeded.selector);
         vm.prank(admin);
-        ch.registerMarket(address(fresh), cfg);
+        ch.setMarketFees(address(fresh), cfg.exerciseFeeBps, cfg.mintFeePpm);
 
         cfg.mintFeePpm = V2Constants.MINT_FEE_CEIL_PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
         assertEq(ch.market(address(tsla)).mintFeePpm, V2Constants.MINT_FEE_CEIL_PPM, "the ceiling itself is allowed");
     }
 
@@ -205,6 +223,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
 
         vm.warp(block.timestamp + 3 days);
@@ -226,6 +245,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
         vm.startPrank(alice);
         ch.safeTransferFrom(alice, carol, rentCall, 100, "");
@@ -245,6 +265,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
 
         vm.warp(E);
@@ -262,6 +283,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
 
         vm.startPrank(guardian);
@@ -272,7 +294,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         cfg.enabled = false;
         cfg.mintFeePpm = PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
 
         uint256 refund = ch.closeRefund(rentCall, 100);
         assertGt(refund, 0, "there is rent to give back");
@@ -289,6 +311,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
         assertLe(
             ch.closeRefund(rentCall, 100),
@@ -318,6 +341,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 fee = ch.mintFee(rentCall, 100);
         _deposit(alice, address(tsla), 1e18 + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentCall, 100, alice, alice);
 
         oracle.setSettlement(address(tsla), E, V2Types.SettlementStatus.Finalized, TSLA_SPOT);
@@ -359,6 +383,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         uint256 collateral = 100 * (uint256(K_200) / V2Constants.UNITS_PER_SHARE);
         _deposit(alice, address(usdg), collateral + fee);
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(rentPut, 100, alice, alice);
 
         // Settle deep in the money so the put pays an exercise fee in USDG as well.
@@ -383,7 +408,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory cfg = _cfg(address(oracle));
         cfg.mintFeePpm = V2Constants.MINT_FEE_CEIL_PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
         uint256 dear = ch.createSeries(address(tsla), false, K_240, E);
 
         (uint256 l0, uint256 f0, uint256 s0) = ch.previewSettlement(freeCall, TSLA_SPOT);
@@ -409,7 +434,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory cfg = _cfg(address(oracle));
         cfg.mintFeePpm = ppm;
         vm.prank(admin);
-        ch.setMarketConfig(address(tsla), cfg);
+        _reconfigure(ch, address(tsla), cfg);
         uint256 id = ch.createSeries(address(tsla), false, K_220, E);
 
         vm.warp(block.timestamp + elapsed);
@@ -417,6 +442,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
         _deposit(alice, address(tsla), uint256(units) * V2Constants.UNIT + quoted);
         uint256 freeBefore = ch.free(alice, address(tsla));
         vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(id, units, alice, alice);
         assertEq(
             freeBefore - ch.free(alice, address(tsla)),
@@ -481,6 +507,7 @@ contract ClearinghouseMintFeeTest is ClearinghouseTestBase {
                 uint256 fee = ch.mintFee(id, units);
                 _deposit(actor, address(tsla), uint256(units) * V2Constants.UNIT + fee);
                 vm.prank(actor);
+                ch.setOperator(address(this), true);
                 ch.mint(id, units, actor, actor);
                 paid += fee;
             } else if (action == 1) {

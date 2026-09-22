@@ -3,14 +3,18 @@ pragma solidity 0.8.28;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {AccessManager} from "@openzeppelin/contracts/access/manager/AccessManager.sol";
 import {DevDeploy} from "../../../script/v2/DevDeploy.s.sol";
 import {AutoRoller} from "../../../src/v2/AutoRoller.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Types} from "../../../src/v2/interfaces/V2Types.sol";
 import {MakerVault} from "../../../src/v2/mm/MakerVault.sol";
 import {UniV3PayoutAdapter} from "../../../src/v2/periphery/UniV3PayoutAdapter.sol";
 import {MockRoundFeed} from "../../../src/v2/mocks/MockRoundFeed.sol";
 import {IAggregatorV3} from "../../../src/v2/oracle/OracleDeps.sol";
+
+import {ForkFloor} from "./ForkFloor.sol";
 
 /// @notice `script/v2/DevDeploy.s.sol` against the LIVE chain-4663 contracts on a fork: the mock feed starts from the
 ///         real NVDA feed's latest round, spot and the pool's TWAP are live, a series on the next daily expiry can be
@@ -28,6 +32,7 @@ contract DevDeployForkTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -157,10 +162,16 @@ contract DevDeployForkTest is Test {
 
         AutoRoller roller = AutoRoller(d.autoRoller);
         assertEq(address(roller.orderBook()), address(d.orderBook), "roller -> book");
-        assertTrue(roller.hasRole(V2Constants.PRICER_ROLE, makeAddr("devPricer")), "pricer");
+        // C8-05: roller, vault and distributor are `Managed` on the devnet's single AccessManager.
+        AccessManager mgr = AccessManager(d.clearinghouse.authority());
+        assertEq(roller.authority(), address(mgr), "one manager for the whole devnet");
+        (bool pricerOk,) = mgr.hasRole(V8Roles.PRICER, makeAddr("devPricer"));
+        assertTrue(pricerOk, "pricer");
         assertTrue(d.keeperRewards.isCaller(address(roller)), "roller may reward");
         assertEq(address(d.orderBook.makerRegistry()), d.makerRegistry, "book -> registry");
-        assertTrue(MakerVault(d.makerVault).hasRole(V2Constants.QUOTER_ROLE, makeAddr("devQuoter")), "quoter");
+        (bool quoterOk,) = mgr.hasRole(V8Roles.QUOTER, makeAddr("devQuoter"));
+        assertTrue(quoterOk, "quoter");
+        assertEq(MakerVault(d.makerVault).authority(), address(mgr), "vault on the same manager");
         assertTrue(d.rewardsDistributor.code.length > 0, "distributor");
     }
 
@@ -174,5 +185,20 @@ contract DevDeployForkTest is Test {
         assertTrue(ok, "live latest");
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(price, uint256(realAnswer) / 100, "live price");
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`, an address this suite's own tests read.
+    ///      USDG, mirrored from `script/v2/DevDeploy.s.sol:139` (`USDG_4663`) rather than retyped: this suite has no address
+    ///      constants of its own and reads that one through `script.USDG_4663()`, which is unavailable here because
+    ///      `setUp` returns early off-fork.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_devDeployForkExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168, "DevDeployFork");
     }
 }

@@ -17,10 +17,15 @@ pragma solidity ^0.8.28;
 ///        - Times are unix seconds.
 library V2Types {
     /// @notice One market row of the Clearinghouse, keyed by underlying (ADR-02: one Clearinghouse, markets are rows).
-    /// @dev Set by DEFAULT_ADMIN_ROLE at registration; `mintPaused` is the GUARDIAN_ROLE switch.
+    /// @dev Written by three different lanes, not one:
+    ///      - the LISTING lane, 1 h, registers the row and moves listing (registerMarket / setMarketListing);
+    ///      - the MARKET_FEE_MANAGER lane, 72 h, moves the fee fields (setMarketFees);
+    ///      - `mintPaused` is the GUARDIAN switch, no delay (setMintPaused).
     ///      INTERFACE_VERSION 7 APPENDED `mintFeePpm`. Appended, never inserted: a decoder built on the v6 tuple keeps
-    ///      reading the first five fields correctly. The tuple is part of registerMarket / setMarketConfig and of the
-    ///      MarketRegistered / MarketConfigSet topics, so all four changed.
+    ///      reading the first five fields correctly. No v8 function takes the tuple as an argument: `registerMarket`
+    ///      builds it from scalars and the field setters (setMarketListing / setMarketFees / setMarketOracle /
+    ///      setMintPaused) each write their own fields. It IS the payload of the `MarketRegistered` and
+    ///      `MarketConfigSet` topics and the return of `market(address)`, so those three changed.
     struct MarketConfig {
         bool enabled; // series may be created and minted
         bool mintPaused; // guardian switch
@@ -80,6 +85,12 @@ library V2Types {
     }
 
     /// @notice Arguments of OrderBook.take. The taker names the order ids; there is no on-chain sorting (ADR-03).
+    /// @dev INTERFACE_VERSION 8 APPENDED `maxTotalFee`. Appended, never inserted, like every other tuple here. It is
+    ///      a HARD CAP on the taker-side fees of the call, so a caller that forgets the field passes 0 and the take
+    ///      reverts `FeeAboveMax` the moment any fee is due: the field FAILS CLOSED. `type(uint128).max` means "no
+    ///      limit" and is what a quote passes. Because the struct grew, `take` and `quoteTake` both changed selector
+    ///      (and `MakerVault.take`, which forwards the struct, moved with them) and `IOrderBook`'s interface id
+    ///      changed -- see test/v2/InterfaceIds.t.sol.
     struct TakeParams {
         uint256 longId;
         bool buying; // true: hit asks. false: hit bids
@@ -90,6 +101,9 @@ library V2Types {
         bool writeToSell; // selling only: mint the longs from taker's free collateral
         address recipient; // receives longs (buying) or USDG (selling)
         uint40 deadline; // unix seconds
+        // v8: USDG base units; hard cap on this call's TAKER-SIDE fees -- the taker fee when buying, the taker fee
+        // PLUS the seller fees when selling into bids. type(uint128).max = no limit; 0 = zero fees only.
+        uint128 maxTotalFee;
     }
 
     /// @notice OrderBook fee parameters (ADR-08). Admin-set under the V2Constants ceilings.
@@ -115,7 +129,7 @@ library V2Types {
     struct Strategy {
         bool active;
         bool weekly; // false = daily
-        bool smartPricing; // lets PRICER_ROLE reprice inside [minAskBps, maxAskBps]
+        bool smartPricing; // lets the PRICER lane reprice inside [minAskBps, maxAskBps]
         uint16 otmBps; // strike distance above spot, bps (100-2500)
         uint16 askBps; // ask price as bps of spot (5-1000)
         uint16 minAskBps; // smart-pricing floor, bps of spot

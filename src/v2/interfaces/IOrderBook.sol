@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {IFeeDiscount} from "./IFeeDiscount.sol";
 import {V2Types} from "./V2Types.sol";
 
 /// @title IOrderBook
@@ -10,10 +11,20 @@ import {V2Types} from "./V2Types.sol";
 /// @dev Prices are USDG base units (6 dp) per whole share and multiples of PRICE_TICK (100); units are 0.01-share
 ///      units; premium(price, units) = price * units / 100. Fees follow ADR-08 (V2Types.FeeParams). The book opts out
 ///      of third-party redemption in its constructor so nobody can redeem its escrowed longs from under their makers.
-///      GUARDIAN_ROLE may pause place and take (TradingPaused); cancel, prune and claimOwed are never pausable.
-///      Admin setters (fee params under the V2Constants ceilings, which take effect FEE_CHANGE_DELAY after they are
-///      scheduled; maker registry) are implementation surface and not frozen here; their events are. Trading stops at
-///      expiry for every kind.
+///      GUARDIAN may pause place and take (TradingPaused); cancel, prune and claimOwed are never pausable.
+///      Fee params (under the V2Constants ceilings) take effect FEE_CHANGE_DELAY after they are scheduled -- 48 h
+///      from INTERFACE_VERSION 8, on top of the FEE_MANAGER role's own 48 h execution delay on the manager. Trading
+///      stops at expiry for every kind.
+///
+///      INTERFACE_VERSION 8 FREEZES THE ADMIN SETTERS HERE, which v7 left as implementation surface: they carry role
+///      ids in `script/v2/roles.v8.json` now. It also adds three things to {take}, all default-off:
+///        - `TakeParams.maxTotalFee`, a HARD CAP on the taker-side fees, checked after the final fee is known and
+///          before any USDG moves. {quoteTake} grew a fourth return, `sellerFees`, so a SELLING taker can set that
+///          cap exactly; both selectors moved with the struct and `IOrderBook`'s interface id changed.
+///        - an optional {IFeeDiscount} module, read once per take under a gas cap and clamped.
+///        - an optional PRE-FUND STAGE: a maker contract that CONFIG_ADMIN has allowed, and that turned funding on
+///          for itself, is asked to fund its own Clearinghouse ledger before planning. With no funded maker named,
+///          the added cost is one storage read per order.
 interface IOrderBook {
     /// @notice The Clearinghouse whose longs this book trades.
     /// @return Clearinghouse address.
@@ -107,7 +118,13 @@ interface IOrderBook {
     ///      premium - takerFee - sellerFee. Taker fee = min(takerFeeFlat, premium * takerFeeCapBps / 1e4), once per
     ///      call; maker rebates come out of it. Every fee is priced at {feeParams} in the take's block. Maker proceeds
     ///      are paid immediately, else credited to {owed}.
-    /// @param p Take parameters (units in 0.01-share units, limitPrice in USDG 6 dp per share, deadline unix seconds).
+    ///      INTERFACE_VERSION 8: after the final taker fee is known and BEFORE any USDG moves,
+    ///      `fee = takerFee + (p.buying ? 0 : sellerFees)`; `fee > p.maxTotalFee` reverts
+    ///      `V2Errors.FeeAboveMax(fee, p.maxTotalFee)`. Any discount module is read ONCE for the whole call. When a
+    ///      named order's maker has funding on, the pre-fund stage runs before planning and its `Funded` /
+    ///      `FundingFailed` logs come before every fill log; the pinned fill log order itself is unchanged.
+    /// @param p Take parameters (units in 0.01-share units, limitPrice in USDG 6 dp per share, deadline unix seconds,
+    ///        maxTotalFee in USDG base units -- `type(uint128).max` for no limit).
     /// @return unitsFilled 0.01-share units filled.
     /// @return premium USDG base units, sum of price * units / 100 over the fills.
     /// @return takerFee USDG base units charged to the taker.
@@ -116,15 +133,25 @@ interface IOrderBook {
         returns (uint64 unitsFilled, uint256 premium, uint256 takerFee);
 
     /// @notice View twin of {take}: what the call would fill and cost now.
-    /// @dev Anyone. Same skip rules and fee maths as {take}; the web app and bots simulate with it before a write.
+    /// @dev Anyone; the taker is msg.sender (set `from` on eth_call). Same skip rules and fee maths as {take}; the
+    ///      web app and bots simulate with it before a write. It does NOT enforce `p.maxTotalFee` -- it is what a
+    ///      caller uses to choose one -- so a quote passes `type(uint128).max`. A funded maker's budget includes its
+    ///      {IFundingSource.fundable} ANSWER, read under a gas cap, which makes this an UPPER BOUND on that maker and
+    ///      not an equality: {take} pre-funds first and then fills on what the source actually DELIVERED, and a short
+    ///      delivery is saturated at 0 rather than reverted. A source that answers more than it delivers quotes units
+    ///      {take} will not fill. Every unfunded maker -- which is every maker at launch, since none is `allowed` --
+    ///      quotes exactly.
+    ///      INTERFACE_VERSION 8 appended `sellerFees`, without which a taker SELLING into bids could not set the cap
+    ///      exactly; the selector moved with `TakeParams` regardless.
     /// @param p Take parameters.
     /// @return unitsFilled 0.01-share units that would fill.
     /// @return premium USDG base units.
     /// @return takerFee USDG base units.
+    /// @return sellerFees USDG base units the taker would pay AS A SELLER; 0 when buying.
     function quoteTake(V2Types.TakeParams calldata p)
         external
         view
-        returns (uint64 unitsFilled, uint256 premium, uint256 takerFee);
+        returns (uint64 unitsFilled, uint256 premium, uint256 takerFee, uint256 sellerFees);
 
     /// @notice Orders by id, in the order given. Unknown ids return zero structs.
     /// @param orderIds Order ids.
@@ -163,6 +190,41 @@ interface IOrderBook {
     /// @notice Transfers the caller's {owed} USDG to the caller.
     /// @dev Caller only. Never pausable.
     function claimOwed() external;
+
+    // admin and seams (INTERFACE_VERSION 8)
+
+    /// @notice Sets, or clears with `address(0)`, the optional taker-fee discount module. FEE_MANAGER (48 h).
+    /// @dev Read once per {take} under `V2Constants.DISCOUNT_READ_GAS` and clamped to `MAX_DISCOUNT_BPS`; a revert,
+    ///      an out-of-gas or short return data counts as no discount. It reduces the TAKER fee only.
+    /// @param module IFeeDiscount contract, or `address(0)` to turn the seam off.
+    function setDiscountModule(IFeeDiscount module) external;
+
+    /// @notice The discount module, or `address(0)` when none is set (the launch state).
+    /// @return Module address.
+    function discountModule() external view returns (address);
+
+    /// @notice Allows or forbids `maker` to turn just-in-time funding on for itself. CONFIG_ADMIN (24 h).
+    /// @dev Allowing is not enabling: the maker must then call {setFunding} itself. This is the admin half of the
+    ///      opt-in, so no role can push an external call into another maker's fills.
+    /// @param maker Maker contract implementing {IFundingSource}.
+    /// @param allowed True to allow.
+    function setFundingAllowed(address maker, bool allowed) external;
+
+    /// @notice Turns just-in-time funding on or off for the CALLER. The maker itself only.
+    /// @dev Reverts `V2Errors.NotAuthorized` unless CONFIG_ADMIN allowed the caller. Switching it on reads
+    ///      `IFundingSource.fundable(usdg)` once and requires an answer, so an EOA cannot enable it. THE PROBE ASKS
+    ///      ABOUT USDG ONLY. A series is funded in its own collateral asset -- USDG for a put, the UNDERLYING for a
+    ///      call -- so answering here establishes that the caller answers the interface at all, and nothing about the
+    ///      asset any series will ask it for. A source that answers only for USDG enables funding and then contributes
+    ///      0 to every call series; the runtime read fails closed to 0, so the cost is that maker's pre-funding.
+    /// @param on True to have the book pre-fund this maker inside {take}.
+    function setFunding(bool on) external;
+
+    /// @notice Whether `maker` is allowed to fund and whether it currently has funding on.
+    /// @param maker Maker address.
+    /// @return allowed CONFIG_ADMIN allowed it.
+    /// @return on The maker turned it on.
+    function fundingOf(address maker) external view returns (bool allowed, bool on);
 
     /// @notice An order was placed. price: USDG 6 dp per share; units: 0.01-share; validUntil: unix seconds (resolved).
     event OrderPlaced(
@@ -203,15 +265,28 @@ interface IOrderBook {
     /// @notice The initial fee parameters, set by the constructor under the compiled ceilings and in effect at once.
     /// @dev Emitted only at construction. Later changes are announced by {FeeParamsScheduled}.
     event FeeParamsSet(V2Types.FeeParams params);
-    /// @notice DEFAULT_ADMIN_ROLE scheduled fee parameters under the compiled ceilings (INTERFACE_VERSION 6).
+    /// @notice FEE_MANAGER scheduled fee parameters under the compiled ceilings (INTERFACE_VERSION 6; 48 h lane in v8).
     /// @dev They take effect once block.timestamp >= effectiveAt = the scheduling block's timestamp +
-    ///      V2Constants.FEE_CHANGE_DELAY (24 h), for every take from then on, resting orders included. A later
+    ///      V2Constants.FEE_CHANGE_DELAY (48 h from INTERFACE_VERSION 8), for every take from then on, resting orders included. A later
     ///      FeeParamsScheduled before effectiveAt replaces this change and restarts the delay; after effectiveAt this
     ///      change stays in effect until the next scheduled change takes effect. No log marks the moment a change
     ///      takes effect.
     event FeeParamsScheduled(V2Types.FeeParams params, uint40 effectiveAt);
     /// @notice `maker` approved or revoked `delegate`.
     event DelegateSet(address indexed maker, address indexed delegate, bool approved);
-    /// @notice GUARDIAN_ROLE paused or resumed place and take.
+    /// @notice GUARDIAN paused or resumed place and take (v7 accepted the admin too; v8 is GUARDIAN only).
     event TradingPausedSet(bool paused);
+    /// @notice FEE_MANAGER set, or cleared with `address(0)`, the taker-fee discount module (INTERFACE_VERSION 8).
+    event DiscountModuleSet(address indexed module);
+    /// @notice CONFIG_ADMIN allowed or forbade `maker` to turn just-in-time funding on (INTERFACE_VERSION 8).
+    event FundingAllowedSet(address indexed maker, bool allowed);
+    /// @notice `maker` turned just-in-time funding on or off for itself (INTERFACE_VERSION 8).
+    event FundingSet(address indexed maker, bool on);
+    /// @notice The pre-fund stage asked `maker` for `requested` base units of `asset` and measured `delivered`
+    ///         arriving in its Clearinghouse ledger (INTERFACE_VERSION 8). `delivered` is a balance delta, never the
+    ///         maker's own claim, and may be less than `requested` -- those orders then simply skip.
+    event Funded(address indexed maker, address indexed asset, uint256 requested, uint256 delivered);
+    /// @notice The pre-fund call to `maker` reverted or ran out of its gas cap (INTERFACE_VERSION 8). The take
+    ///         continues on real balances; that maker's orders skip like any under-collateralised AskWrite.
+    event FundingFailed(address indexed maker, address indexed asset, uint256 requested);
 }

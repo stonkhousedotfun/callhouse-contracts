@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {DataStreamsSource} from "../../../src/v2/oracle/DataStreamsSource.sol";
+import {ForkFloor} from "./ForkFloor.sol";
 import {
     DataStreamsReportV11,
     IDataStreamsVerifierProxy,
@@ -43,6 +44,7 @@ contract DataStreamsForkTest is Test {
     modifier onlyFork() {
         if (block.chainid != 4663) {
             console2.log("skipping: not forked onto 4663 (chainid %s)", block.chainid);
+            vm.skip(true);
             return;
         }
         _;
@@ -55,14 +57,14 @@ contract DataStreamsForkTest is Test {
         src.setFeed(NVDA, NVDA_FEED_ID);
     }
 
-    function test_fork_verifierProxyShape() public view onlyFork {
+    function test_fork_verifierProxyShape() public onlyFork {
         assertGt(VERIFIER_PROXY.code.length, 0, "VerifierProxy has code");
         assertEq(ITypeAndVersion(VERIFIER_PROXY).typeAndVersion(), "VerifierProxy 2.0.0", "version");
         assertEq(IDataStreamsVerifierProxy(VERIFIER_PROXY).s_feeManager(), address(0), "no FeeManager");
         assertEq(IVerifierProxyAccess(VERIFIER_PROXY).s_accessController(), address(0), "no access controller");
     }
 
-    function test_fork_sourceConfiguredOnLiveToken() public view onlyFork {
+    function test_fork_sourceConfiguredOnLiveToken() public onlyFork {
         assertEq(src.verifierProxy(), VERIFIER_PROXY);
         assertEq(src.feedIdOf(NVDA), NVDA_FEED_ID);
         assertEq(src.underlyingOf(NVDA_FEED_ID), NVDA);
@@ -100,5 +102,17 @@ contract DataStreamsForkTest is Test {
         emit ReportSkipped(0, NVDA_FEED_ID, DataStreamsSource.SkipReason.VerifyFailed);
         assertEq(src.submit(reports), 0, "skipped");
         assertEq(src.observationCount(NVDA), 0);
+    }
+
+    /// @dev THE FLOOR (T-588). Every other test in this file carries a chain-id guard that SKIPS when no fork is
+    ///      attached, so a run that never reached chain 4663 prints `0 failed` and exits 0 -- indistinguishable from
+    ///      a run in which every invariant held. This test carries no such guard. Under `FOUNDRY_PROFILE=fork` it
+    ///      FAILS when the suite could not have executed, and it is the only test here that can say so.
+    ///
+    ///      Its witness is `VERIFIER_PROXY`, an address this suite's own tests read.
+    ///      A count of reported tests would not do: a skip IS a report, so such a floor is satisfied by a run in
+    ///      which nothing ran. See `ForkFloor` for the rest of the reasoning.
+    function test_fork_floor_dataStreamsForkExecutedAgainstARealFork() public {
+        ForkFloor.requireExecutedAgainstRealFork(VERIFIER_PROXY, "DataStreamsFork");
     }
 }

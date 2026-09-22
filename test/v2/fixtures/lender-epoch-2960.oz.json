@@ -1,0 +1,73 @@
+{
+  "decimals": "18",
+  "entries": [
+    {
+      "account": "0x1111111111111111111111111111111111111111",
+      "amount": "100000000000000000000",
+      "index": 0,
+      "proof": [
+        "0xa17cafb5467ede956f0094fd8fefa0d2afcac6fe9db66004d74fcebfb451cf60",
+        "0x0ea732353392487fd9e567a71ed33f34b5a011e8929922572da2389cceb187ae"
+      ]
+    },
+    {
+      "account": "0x2222222222222222222222222222222222222222",
+      "amount": "2500000000000000000000",
+      "index": 1,
+      "proof": [
+        "0x6a705485af809a14caf9f5523f5889121b638b73a1eb1a0f1586ac412b35da7a",
+        "0x0ea732353392487fd9e567a71ed33f34b5a011e8929922572da2389cceb187ae"
+      ]
+    },
+    {
+      "account": "0x3333333333333333333333333333333333333333",
+      "amount": "1000000000000000000",
+      "index": 2,
+      "proof": [
+        "0x1b7291b8a46326fc2aa0e3ec00748172da8e8f592820a53ecd5a50dd7413e6b2",
+        "0xb9b2577b73abaf228a7d875dab5ea244465a6e7d9921ec0b7d7d587c4434d281",
+        "0x368bb8009517db613829a7a83884d558c0dfe66c9332d6d423f88daca6af23ed"
+      ]
+    },
+    {
+      "account": "0x4444444444444444444444444444444444444444",
+      "amount": "0",
+      "index": 3,
+      "proof": [
+        "0x34c6e3d2c00d37751b8853d7a323a09067e4ae578e88a7cbb2ef809699667d86",
+        "0xb9b2577b73abaf228a7d875dab5ea244465a6e7d9921ec0b7d7d587c4434d281",
+        "0x368bb8009517db613829a7a83884d558c0dfe66c9332d6d423f88daca6af23ed"
+      ]
+    },
+    {
+      "account": "0x5555555555555555555555555555555555555555",
+      "amount": "123456789012345678",
+      "index": 4,
+      "proof": [
+        "0x849c7a88eef51de2d6e2d932fbd1328ae3ddf7f8ea2cdc391ed7e06c4ec9302f",
+        "0x368bb8009517db613829a7a83884d558c0dfe66c9332d6d423f88daca6af23ed"
+      ]
+    }
+  ],
+  "epoch": 2960,
+  "generatedBy": "callhouse-contracts script/v2/EmitLenderEpoch.s.sol",
+  "root": "0x42758658626162126786767f92853840ef916b398e2e936d905f329436abfb44",
+  "source": "@openzeppelin/merkle-tree StandardMerkleTree.of, default sortLeaves -- rebuilt by callhouse-contracts script/v2/EmitLenderEpoch.s.sol and validated against test/v2/fixtures/maker-epoch-2958.oz.json",
+  "tampered": {
+    "account": "0x1111111111111111111111111111111111111111",
+    "amount": "100000000000000000001",
+    "index": 0,
+    "proof": [
+      "0xa17cafb5467ede956f0094fd8fefa0d2afcac6fe9db66004d74fcebfb451cf60",
+      "0x0ea732353392487fd9e567a71ed33f34b5a011e8929922572da2389cceb187ae"
+    ],
+    "verifies": false
+  },
+  "total": "2601123456789012345678",
+  "types": [
+    "uint256",
+    "uint256",
+    "address",
+    "uint256"
+  ]
+}

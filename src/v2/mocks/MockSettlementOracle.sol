@@ -16,6 +16,16 @@ import {V2Types} from "../interfaces/V2Types.sol";
 ///          FINALIZE_DELAY, like the real oracle.
 ///      Per underlying: {setSpot} sets what {spot} / {trySpot} return. Global switches make {trySpot} or
 ///      {settlementPrice} revert outright, to drive the "oracle broken or absent" paths.
+///      SPOT STALENESS (T-OP-070, modelling SettlementOracle._spot after T-OP-061). By default a set spot is fresh for
+///      ever, exactly as before. {setSpotRule} gives an underlying the real oracle's three-step rule -- an outer
+///      `spotMaxAge` (0 = no outer bound), the 30-minute SPOT_CORROBORATION_AGE, and a modelled source-1 witness set by
+///      {setSpotWitness} that must agree within `maxDeviationBps` when the print is older than 30 minutes -- and
+///      {setSpotStale} is the blunt switch. A stale spot makes {spot} revert StaleSpot(updatedAt) and {trySpot}
+///      answer (false, 0, 0), as the real oracle does.
+///      HELD (T-OP-070, modelling SettlementOracle._advance). `FinalizeOnCall` on a Held expiry finalizes only when
+///      {setCorroborated} marked it corroborated: the real chain finalizes a corroborated expiry whatever its status
+///      and returns (false, 0) from a Held uncorroborated one. Default not corroborated, so a vetoed expiry now stays
+///      Held until {unveto}, which is the behaviour a veto test means to assert.
 ///      {finalizeCalls} counts every finalize that did not revert, so a test can prove settle called it (or did not).
 ///      {pin} (INTERFACE_VERSION 6) accepts any caller, counts calls in {pinCalls}, marks {pinned} and emits nothing,
 ///      so the Clearinghouse suites' log assertions are those of the Clearinghouse alone; {setPinReverts} makes it
@@ -40,6 +50,16 @@ contract MockSettlementOracle is ISettlementOracle {
         uint256 updatedAt;
     }
 
+    /// @dev The real oracle's spot rule, per underlying (SettlementOracle._spot, T-OP-061). All-zero = the pre-T-OP-070
+    ///      mock: a set spot is fresh for ever.
+    struct SpotRule {
+        uint32 spotMaxAge; // outer bound, seconds; 0 = none
+        uint16 maxDeviationBps; // the agreement band the witness must meet
+        bool witnessOk; // source 1 modelled as answering ok
+        uint256 witnessPrice; // source 1's price
+        bool forceStale; // {setSpotStale}: stale whatever the clock says
+    }
+
     struct CandidateEntry {
         uint256 price;
         uint8 sourceIndex;
@@ -50,6 +70,17 @@ contract MockSettlementOracle is ISettlementOracle {
     mapping(address underlying => mapping(uint40 expiry => Entry)) internal _entries;
     mapping(address underlying => mapping(uint40 expiry => CandidateEntry)) internal _candidates;
     mapping(address underlying => SpotEntry) internal _spots;
+    mapping(address underlying => SpotRule) internal _spotRules;
+    /// @dev {finalize} in FinalizeOnCall mode finalizes a Held expiry only when this is set (T-OP-070).
+    mapping(address underlying => mapping(uint40 expiry => bool)) public corroborated;
+
+    /// @notice MIRRORS SettlementOracle.SPOT_CORROBORATION_AGE (30 minutes, T-OP-061): a print younger than this needs
+    ///         no witness. The real contract is not imported here (a mock must not drag the oracle into every suite),
+    ///         so the literal is mirrored and pinned by the unit tests that drive this rule.
+    uint32 public constant SPOT_CORROBORATION_AGE = 30 minutes;
+    uint8 private constant SPOT_OK = 0;
+    uint8 private constant SPOT_NO_SOURCE = 1;
+    uint8 private constant SPOT_STALE = 2;
 
     bool public enforceTooEarly = true;
     bool public trySpotReverts;
@@ -80,6 +111,30 @@ contract MockSettlementOracle is ISettlementOracle {
 
     function setSpot(address underlying, bool ok, uint256 price, uint256 updatedAt) external {
         _spots[underlying] = SpotEntry(ok, price, updatedAt);
+    }
+
+    /// @notice The outer age bound and the agreement band of the three-step rule (0, 0 = the always-fresh default).
+    function setSpotRule(address underlying, uint32 spotMaxAge, uint16 maxDeviationBps) external {
+        SpotRule storage r = _spotRules[underlying];
+        r.spotMaxAge = spotMaxAge;
+        r.maxDeviationBps = maxDeviationBps;
+    }
+
+    /// @notice The modelled source 1: whether it answers ok, and at what price.
+    function setSpotWitness(address underlying, bool ok, uint256 price) external {
+        SpotRule storage r = _spotRules[underlying];
+        r.witnessOk = ok;
+        r.witnessPrice = price;
+    }
+
+    /// @notice The blunt switch: stale whatever the clock and the witness say.
+    function setSpotStale(address underlying, bool stale) external {
+        _spotRules[underlying].forceStale = stale;
+    }
+
+    /// @notice Marks (underlying, expiry) corroborated, so FinalizeOnCall finalizes it even while Held.
+    function setCorroborated(address underlying, uint40 expiry, bool on) external {
+        corroborated[underlying][expiry] = on;
     }
 
     function setCandidate(
@@ -118,15 +173,43 @@ contract MockSettlementOracle is ISettlementOracle {
     }
 
     function spot(address underlying) external view returns (uint256 price, uint256 updatedAt) {
-        SpotEntry memory s = _spots[underlying];
-        if (!s.ok) revert V2Errors.NoSource();
+        (uint8 status, SpotEntry memory s) = _spot(underlying);
+        if (status == SPOT_NO_SOURCE) revert V2Errors.NoSource();
+        if (status == SPOT_STALE) revert V2Errors.StaleSpot(s.updatedAt);
         return (s.price, s.updatedAt);
     }
 
     function trySpot(address underlying) external view returns (bool ok, uint256 price, uint256 updatedAt) {
         if (trySpotReverts) revert MockOracleReverted();
-        SpotEntry memory s = _spots[underlying];
-        return (s.ok, s.price, s.updatedAt);
+        (uint8 status, SpotEntry memory s) = _spot(underlying);
+        // Pre-T-OP-070 shape for a spot that was never ok: the set values come back with ok = false, as before.
+        if (status == SPOT_NO_SOURCE) return (false, s.price, s.updatedAt);
+        if (status == SPOT_STALE) return (false, 0, 0);
+        return (true, s.price, s.updatedAt);
+    }
+
+    /// @dev SettlementOracle._spot's three steps over the set spot and the modelled witness (T-OP-061, mirrored):
+    ///        1. print at most SPOT_CORROBORATION_AGE old -> ok;
+    ///        2. else, witness ok -> ok iff |witness - print| within maxDeviationBps of the smaller, else STALE;
+    ///        3. else -> ok.
+    ///      `spotMaxAge` (when set) is the outer bound in every step, and {setSpotStale} overrides everything. A print
+    ///      stamped in the future is treated as age 0 here (the real `_latestOf` refuses it): fixtures that set a
+    ///      spot before warping to it kept working unchanged, and modelling that refusal is a separate fidelity item.
+    function _spot(address underlying) private view returns (uint8 status, SpotEntry memory s) {
+        s = _spots[underlying];
+        SpotRule memory r = _spotRules[underlying];
+        if (!s.ok) return (SPOT_NO_SOURCE, s);
+        if (r.forceStale) return (SPOT_STALE, s);
+        uint256 age = s.updatedAt >= block.timestamp ? 0 : block.timestamp - s.updatedAt;
+        if (r.spotMaxAge != 0 && age > r.spotMaxAge) return (SPOT_STALE, s);
+        if (age <= SPOT_CORROBORATION_AGE) return (SPOT_OK, s);
+        if (r.witnessOk) {
+            uint256 lo = s.price < r.witnessPrice ? s.price : r.witnessPrice;
+            uint256 diff = s.price < r.witnessPrice ? r.witnessPrice - s.price : s.price - r.witnessPrice;
+            // SettlementOracle._agree, mirrored: |p_i - p_j| x 10_000 <= min(p_i, p_j) x maxDeviationBps.
+            return (diff * 10_000 <= lo * r.maxDeviationBps ? SPOT_OK : SPOT_STALE, s);
+        }
+        return (SPOT_OK, s);
     }
 
     function snapshot(address, uint40) external returns (uint8 newlyRecorded) {
@@ -141,10 +224,13 @@ contract MockSettlementOracle is ISettlementOracle {
             revert V2Errors.TooEarly(expiry + V2Constants.FINALIZE_DELAY);
         }
         ++finalizeCalls;
-        if (e.mode == FinalizeMode.FinalizeOnCall && e.status != V2Types.SettlementStatus.Finalized) {
+        // SettlementOracle._advance, mirrored: a corroborated expiry finalizes whatever its status; a Held
+        // uncorroborated one is left untouched and reports (false, 0) until {unveto} (T-OP-070).
+        bool heldBack = e.status == V2Types.SettlementStatus.Held && !corroborated[underlying][expiry];
+        if (e.mode == FinalizeMode.FinalizeOnCall && e.status != V2Types.SettlementStatus.Finalized && !heldBack) {
             e.status = V2Types.SettlementStatus.Finalized;
             e.price = e.finalizePrice;
-            emit SettlementFinalized(underlying, expiry, e.price, 0, true);
+            emit SettlementFinalized(underlying, expiry, e.price, 0, corroborated[underlying][expiry]);
         }
         if (e.status == V2Types.SettlementStatus.Finalized) return (true, e.price);
         return (false, 0);

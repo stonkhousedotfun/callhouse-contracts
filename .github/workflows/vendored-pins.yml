@@ -1,0 +1,19 @@
+name: vendored content pins
+
+on:
+  push:
+    branches: [v8]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vendored-pins:
+    name: vendored content pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pinned vendored content
+        run: bash script/v2/check-vendored-pins.sh

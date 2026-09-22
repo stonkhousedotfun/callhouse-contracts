@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test} from "forge-std/Test.sol";
 import {MockERC20} from "../../src/mocks/MockERC20.sol";
 import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
+import {V8AccessTest} from "./lib/V8Access.sol";
 
 /// @notice Shared fixture for the v2 tests: actors, the clock, USDG and two Stock Token markets.
 /// @dev TOKENS. The v1 mocks already model everything v2 needs, so they are reused rather than forked into
@@ -28,7 +28,7 @@ import {MockStockToken} from "../../src/mocks/MockStockToken.sol";
 ///          `admin` holding DEFAULT_ADMIN_ROLE and `guardian` GUARDIAN_ROLE. It runs after funding, so an override may
 ///          also have actors deposit or approve.
 ///      A suite overrides a hook and calls `super` when it extends rather than replaces it.
-abstract contract BaseV2Test is Test {
+abstract contract BaseV2Test is V8AccessTest {
     /*//////////////////////////////////////////////////////////////
                                  ACTORS
     //////////////////////////////////////////////////////////////*/

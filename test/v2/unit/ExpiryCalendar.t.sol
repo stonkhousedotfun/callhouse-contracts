@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test, Vm} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Test.sol";
 import {ExpiryCalendar} from "../../../src/v2/ExpiryCalendar.sol";
 import {IExpiryCalendar} from "../../../src/v2/interfaces/IExpiryCalendar.sol";
-import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
+import {V8AccessTest} from "../lib/V8Access.sol";
 
 /// @notice ExpiryCalendar: the 16:00 New York grid, DST switches, holidays, weeklies, special expiries, the regular
 ///         session, the bounded next-expiry search and the admin surface.
@@ -18,7 +19,7 @@ import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
 ///      The calendar is seeded exactly like the launch deploy: the NYSE 2026-2028 full-day closures from the F2-02
 ///      recon (callhouse ops/markets/v2-sources.json `nyseHolidays`, copied into the fixture's `holidayDayIndexes`).
 ///      Setup is self-contained until C2-08 consolidates the v2 test base.
-contract ExpiryCalendarTest is Test {
+contract ExpiryCalendarTest is V8AccessTest {
     string internal constant FIXTURE = "test/v2/fixtures/expiries.json";
 
     uint256 internal constant DAY = 86_400;
@@ -42,6 +43,14 @@ contract ExpiryCalendarTest is Test {
     uint40 internal constant FRI_0918_CLOSE = 1_789_761_600; // 2026-09-18 16:00:00 EDT
     uint40 internal constant SAT_0919_NOON = 1_789_833_600; // 2026-09-19 12:00:00 EDT
     uint40 internal constant SAT_0919_1600 = 1_789_848_000; // 2026-09-19 16:00:00 EDT
+    // T-479 special-expiry windows. Derived with Python zoneinfo America/New_York, not by hand.
+    uint40 internal constant WED_0916_0959_59 = 1_789_567_199; // 2026-09-16 09:59:59 EDT: window opens 09:29:59
+    uint40 internal constant WED_0916_1000 = 1_789_567_200; // 2026-09-16 10:00:00 EDT: window opens 09:30:00
+    uint40 internal constant WED_0916_1600_01 = 1_789_588_801; // 2026-09-16 16:00:01 EDT: window ends after close
+    uint40 internal constant FRI_0918_NOON = 1_789_747_200; // 2026-09-18 12:00:00 EDT
+    uint40 internal constant SUN_0920_1600 = 1_789_934_400; // 2026-09-20 16:00:00 EDT, BUG-04 F3's witness
+    uint40 internal constant WED_1202_0959_59 = 1_796_223_599; // 2026-12-02 09:59:59 EST
+    uint40 internal constant WED_1202_1000 = 1_796_223_600; // 2026-12-02 10:00:00 EST
     uint40 internal constant MON_0921_CLOSE = 1_790_020_800; // 2026-09-21 16:00:00 EDT
     uint40 internal constant FRI_0925_CLOSE = 1_790_366_400; // 2026-09-25 16:00:00 EDT
     uint40 internal constant MON_0928_CLOSE = 1_790_625_600; // 2026-09-28 16:00:00 EDT
@@ -104,7 +113,7 @@ contract ExpiryCalendarTest is Test {
 
     function setUp() public {
         vm.warp(1_789_000_000);
-        cal = new ExpiryCalendar(admin, _seed());
+        cal = _newCalendar(_seed(), admin);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -134,6 +143,21 @@ contract ExpiryCalendarTest is Test {
     function _close(uint32[] memory dayIndexes) internal {
         vm.prank(admin);
         cal.setHolidays(dayIndexes, true);
+    }
+
+    /// @dev Seeds `year` with one closure on its first Saturday, which no weekday read can see. Cases written for a
+    ///      year with no closure (the fixture's 2029-2030, far-future fuzz weeks) need it now that the launch-shaped
+    ///      calendar closes an unseeded year (SEC-48).
+    function _markSeeded(uint256 year) internal {
+        uint256 day = _refJan1(year);
+        while (_refWeekday(day) != 5) ++day;
+        _close(_days(day, 1));
+    }
+
+    /// @dev Reference for AN UNSEEDED YEAR FAILS CLOSED, sharing no code with the contract: the launch seed covers
+    ///      2026-2028 and nothing else.
+    function _refSeeded(uint256 day) internal pure returns (bool) {
+        return day >= _refJan1(2026) && day < _refJan1(2029);
     }
 
     function _day(uint40 ts) internal pure returns (uint32) {
@@ -200,7 +224,13 @@ contract ExpiryCalendarTest is Test {
     }
 
     /// @dev Every case of expiries.json: all five reads plus nextExpiry both ways (0 = must revert).
+    ///      The fixture's 2029-2030 cases were generated as years with no closure whose weekdays trade (its Good Friday
+    ///      2029 case says so). Under SEC-48 a year with no closure has no session days, so both years are marked
+    ///      seeded first; what those cases then pin is a seeded year that misses a holiday, which still trades.
+    ///      Launch pass: teach gen-expiries.mjs the rule and drop the two markers.
     function test_fixture_everyInstantMatchesIntl() public {
+        _markSeeded(2029);
+        _markSeeded(2030);
         string memory json = vm.readFile(FIXTURE);
         assertEq(vm.parseJsonUint(json, ".searchDays") * DAY, uint256(cal.NEXT_EXPIRY_SEARCH()), "search bound");
         uint256 n;
@@ -268,7 +298,7 @@ contract ExpiryCalendarTest is Test {
     function test_constructor_seedsHolidaysEmitsAndGrantsAdmin() public {
         uint32[] memory seed = _seed();
         vm.recordLogs();
-        ExpiryCalendar fresh = new ExpiryCalendar(admin, seed);
+        ExpiryCalendar fresh = _newCalendar(seed, admin);
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         uint256 seen;
@@ -280,16 +310,120 @@ contract ExpiryCalendarTest is Test {
             ++seen;
         }
         assertEq(seen, seed.length, "one HolidaySet per seeded day");
-        assertTrue(fresh.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin));
-        assertFalse(fresh.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, address(this)), "the deployer gets nothing");
+        (bool isMember,) = manager.hasRole(V8Roles.LISTING, admin);
+        assertTrue(isMember, "LISTING is granted to admin, not the deployer");
+        (bool deployerIs,) = manager.hasRole(V8Roles.LISTING, address(this));
+        assertFalse(deployerIs, "the deployer gets nothing");
     }
 
     function test_constructor_emptySeedAndZeroAdmin() public {
-        ExpiryCalendar bare = new ExpiryCalendar(admin, new uint32[](0));
+        ExpiryCalendar bare = _newCalendar(new uint32[](0), admin);
         assertTrue(bare.isValidExpiry(GOOD_FRI_0403_CLOSE), "no seed: Good Friday is an ordinary Friday");
 
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        // No seed makes no holiday claim, so no year is closed for want of one (SEC-48), and the mode is fixed at
+        // construction: a closure set later does not switch it on for the other years.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 fri2029 = uint40(bare.closeOf(uint32(_refJan1(2029) + 4)));
+        assertTrue(bare.isValidExpiry(fri2029), "no seed: an unseeded 2029 Friday still trades");
+        vm.prank(admin);
+        bare.setHolidays(_days(_refJan1(2026), 1), true);
+        assertTrue(bare.isValidExpiry(fri2029), "a later closure does not close the other years");
+
+        vm.expectRevert(V2Errors.NoSource.selector);
         new ExpiryCalendar(address(0), new uint32[](0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    AN UNSEEDED YEAR FAILS CLOSED (SEC-48)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev The launch seed covers 2026-2028. A 2029 weekday is no session day, and the search from the last 2028
+    ///      close runs into the closed year and reverts, both ways. POSITIVE CONTROL: seeding New Year's Day 2029
+    ///      alone opens every other 2029 weekday and the same reads flip, so the refusals above are the year rule and
+    ///      nothing else about those dates. Removing the year's only closure closes it again.
+    function test_unseededYear_hasNoSessionDaysUntilSeeded() public {
+        uint256 jan1 = _refJan1(2029); // Monday, New Year's Day
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 fri = uint32(jan1 + 4); // Friday 2029-01-05
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 friClose = uint40(cal.closeOf(fri));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 tueClose = uint40(cal.closeOf(uint32(jan1 + 1)));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 lastClose2028 = uint40(cal.closeOf(uint32(jan1 - 3))); // Friday 2028-12-29
+        uint40 friMidday = friClose - 3 hours; // 13:00 EST, inside the session hours
+
+        assertTrue(cal.isValidExpiry(lastClose2028), "2028 is seeded: its last Friday trades");
+        assertTrue(cal.isWeekly(lastClose2028), "and is its week's weekly");
+        assertFalse(cal.isValidExpiry(friClose), "unseeded 2029: Friday 01-05 is no expiry");
+        assertFalse(cal.isSessionDay(fri), "no session day");
+        assertFalse(cal.isWeekly(friClose), "no weekly");
+        assertFalse(cal.isRegularSession(friMidday), "no session");
+        _expectNoNext(lastClose2028, false);
+        _expectNoNext(lastClose2028, true);
+
+        _close(_days(jan1, 1));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        assertFalse(cal.isValidExpiry(uint40(cal.closeOf(uint32(jan1)))), "New Year's Day itself is closed");
+        assertTrue(cal.isValidExpiry(friClose), "seeded 2029: Friday 01-05 trades");
+        assertTrue(cal.isSessionDay(fri), "session day");
+        assertTrue(cal.isWeekly(friClose), "weekly");
+        assertTrue(cal.isRegularSession(friMidday), "in session");
+        _expectNext(lastClose2028, false, tueClose, "daily: Tuesday 01-02, over the weekend and New Year's Day");
+        _expectNext(lastClose2028, true, friClose, "weekly: Friday 01-05");
+
+        vm.prank(admin);
+        cal.setHolidays(_days(jan1, 1), false);
+        assertFalse(cal.isValidExpiry(friClose), "removing the year's only closure closes it again");
+        assertFalse(cal.isValidExpiry(tueClose), "every weekday of it");
+        _expectNoNext(lastClose2028, false);
+    }
+
+    /// @dev The count moves only on a real change: a day listed twice, or set to what it already is, counts once, so a
+    ///      single removal empties the year. Removing a day that is not set moves nothing and cannot underflow.
+    function test_unseededYear_countsChangesNotEntries() public {
+        uint256 jan1 = _refJan1(2029);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 friClose = uint40(cal.closeOf(uint32(jan1 + 4)));
+        uint32[] memory twice = new uint32[](2);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        (twice[0], twice[1]) = (uint32(jan1), uint32(jan1));
+        _close(twice);
+        _close(_days(jan1, 1));
+        assertTrue(cal.isValidExpiry(friClose), "seeded");
+
+        vm.prank(admin);
+        cal.setHolidays(_days(jan1 + 1, 1), false); // not set: no change
+        assertTrue(cal.isValidExpiry(friClose), "still seeded");
+
+        vm.prank(admin);
+        cal.setHolidays(_days(jan1, 1), false);
+        assertFalse(cal.isValidExpiry(friClose), "one removal empties a year seeded by one day, however often listed");
+    }
+
+    /// @dev A week that runs into an unseeded year has no weekly: its later weekdays are not known to be closed, so
+    ///      they still take the weekly away from the seeded Monday. Seeding the new year then puts the weekly where it
+    ///      belongs, rather than moving one that was already handed out.
+    function test_unseededYear_weekRunningIntoItHasNoWeekly() public {
+        _markSeeded(2029); // 2029 seeded, 2030 not
+        uint256 jan1 = _refJan1(2030); // Tuesday
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 monClose = uint40(cal.closeOf(uint32(jan1 - 1))); // Monday 2029-12-31
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 friBefore = uint40(cal.closeOf(uint32(jan1 - 4))); // Friday 2029-12-28
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 friAfter = uint40(cal.closeOf(uint32(jan1 + 3))); // Friday 2030-01-04
+
+        assertTrue(cal.isValidExpiry(monClose), "Monday 12-31 is in seeded 2029");
+        assertFalse(cal.isWeekly(monClose), "Tue-Fri of its week are unseeded, not known closed");
+        assertFalse(cal.isValidExpiry(friAfter), "Friday 01-04 is in unseeded 2030");
+        _expectNext(friBefore, false, monClose, "daily still finds Monday 12-31");
+        _expectNoNext(friBefore, true);
+
+        _close(_days(jan1, 1)); // New Year's Day 2030 seeds 2030
+        assertFalse(cal.isWeekly(monClose), "Monday is still not the weekly");
+        assertTrue(cal.isWeekly(friAfter), "Friday 01-04 is");
+        _expectNext(friBefore, true, friAfter, "weekly search lands on it");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -498,24 +632,48 @@ contract ExpiryCalendarTest is Test {
 
     function test_special_acceptedButNeverWeeklyNorReturned() public {
         vm.expectEmit(address(cal));
-        emit IExpiryCalendar.SpecialExpirySet(SAT_0919_NOON, true);
+        emit IExpiryCalendar.SpecialExpirySet(FRI_0918_NOON, true);
         vm.prank(admin);
-        cal.setSpecialExpiry(SAT_0919_NOON, true);
+        cal.setSpecialExpiry(FRI_0918_NOON, true);
 
-        assertTrue(cal.specialExpiry(SAT_0919_NOON));
-        assertTrue(cal.isValidExpiry(SAT_0919_NOON), "whitelisted Saturday noon is a valid expiry");
-        assertFalse(cal.isWeekly(SAT_0919_NOON), "a special expiry is never weekly");
-        assertTrue(cal.isWeekly(FRI_0918_CLOSE), "a later special expiry does not take the weekly from Friday");
-        _expectNext(FRI_0918_CLOSE, false, MON_0921_CLOSE, "nextExpiry reads the grid only");
-        assertFalse(cal.isRegularSession(SAT_0919_NOON), "and it opens no session");
+        assertTrue(cal.specialExpiry(FRI_0918_NOON));
+        assertTrue(cal.isValidExpiry(FRI_0918_NOON), "whitelisted Friday noon is a valid expiry");
+        assertFalse(cal.isWeekly(FRI_0918_NOON), "a special expiry is never weekly");
+        assertTrue(cal.isWeekly(FRI_0918_CLOSE), "an earlier special expiry does not take the weekly from the close");
+        _expectNext(FRI_0918_NOON - 1, false, FRI_0918_CLOSE, "nextExpiry reads the grid only");
+        _expectNext(FRI_0918_CLOSE, false, MON_0921_CLOSE, "and skips nothing after it");
     }
 
-    function test_special_onHolidayDoesNotMoveTheWeekly() public {
+    /// @dev T-479 (BUG-04 F3). The report's witness: Sunday 16:00 has no session, so the Chainlink source's round in
+    ///      force at the window start is Friday's last print, over `maxStale` old, and on a Chainlink-only market no
+    ///      source is ever ok. Refused at the calendar, before any series can be created on it. The edges pin the
+    ///      rule: the whole window [ts - SETTLEMENT_WINDOW, ts] inside one session, in daylight and standard time.
+    ///      PROVE BY BREAKING: remove the check in {ExpiryCalendar.setSpecialExpiry} and this test goes red.
+    function test_special_refusesAnInstantNoSessionCanPrice() public {
+        uint40[7] memory refused = [
+            SUN_0920_1600, SAT_0919_NOON, GOOD_FRI_0403_CLOSE, WED_0916_0959_59, WED_0916_1600_01, WED_1202_0959_59, 1
+        ];
+        for (uint256 i; i < refused.length; ++i) {
+            vm.prank(admin);
+            vm.expectRevert(V2Errors.BadExpiry.selector);
+            cal.setSpecialExpiry(refused[i], true);
+            assertFalse(cal.isValidExpiry(refused[i]), "a refused instant stays invalid");
+        }
+
+        uint40[4] memory accepted = [WED_0916_1000, FRI_0918_NOON, WED_1202_1000, WED_0916_CLOSE];
+        for (uint256 i; i < accepted.length; ++i) {
+            vm.prank(admin);
+            cal.setSpecialExpiry(accepted[i], true);
+            assertTrue(cal.specialExpiry(accepted[i]), "a window inside one session is accepted");
+        }
+    }
+
+    function test_special_onHolidayIsRefusedAndTheWeeklyStays() public {
         vm.prank(admin);
+        vm.expectRevert(V2Errors.BadExpiry.selector);
         cal.setSpecialExpiry(GOOD_FRI_0403_CLOSE, true);
 
-        assertTrue(cal.isValidExpiry(GOOD_FRI_0403_CLOSE), "Good Friday close whitelisted");
-        assertFalse(cal.isWeekly(GOOD_FRI_0403_CLOSE), "still not a weekly");
+        assertFalse(cal.isValidExpiry(GOOD_FRI_0403_CLOSE), "the Good Friday close is not a valid expiry");
         assertTrue(cal.isWeekly(THU_0402_CLOSE), "Thursday keeps the weekly");
         _expectNext(THU_0402_CLOSE, false, MON_0406_CLOSE, "not returned by nextExpiry");
         _expectNext(THU_0402_CLOSE - 1 days, true, THU_0402_CLOSE, "weekly search unchanged");
@@ -523,17 +681,24 @@ contract ExpiryCalendarTest is Test {
 
     function test_special_removalAndRegularCloses() public {
         vm.startPrank(admin);
-        cal.setSpecialExpiry(SAT_0919_NOON, true);
+        cal.setSpecialExpiry(FRI_0918_NOON, true);
         cal.setSpecialExpiry(WED_0916_CLOSE, true);
 
         vm.expectEmit(address(cal));
-        emit IExpiryCalendar.SpecialExpirySet(SAT_0919_NOON, false);
-        cal.setSpecialExpiry(SAT_0919_NOON, false);
+        emit IExpiryCalendar.SpecialExpirySet(FRI_0918_NOON, false);
+        cal.setSpecialExpiry(FRI_0918_NOON, false);
         cal.setSpecialExpiry(WED_0916_CLOSE, false);
+
+        // Removal is never refused, even for an instant the rule would not accept today: one whitelisted before the
+        // rule existed must still come off.
+        vm.expectEmit(address(cal));
+        emit IExpiryCalendar.SpecialExpirySet(SUN_0920_1600, false);
+        cal.setSpecialExpiry(SUN_0920_1600, false);
         vm.stopPrank();
 
-        assertFalse(cal.isValidExpiry(SAT_0919_NOON), "removed special is invalid again");
+        assertFalse(cal.isValidExpiry(FRI_0918_NOON), "removed special is invalid again");
         assertTrue(cal.isValidExpiry(WED_0916_CLOSE), "a grid close stays valid whatever its special flag");
+        assertFalse(cal.isValidExpiry(SUN_0920_1600));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -553,7 +718,7 @@ contract ExpiryCalendarTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        cal.grantRole(V2Constants.DEFAULT_ADMIN_ROLE, alice);
+        cal.setAuthority(alice);
 
         assertTrue(cal.isValidExpiry(WED_0916_CLOSE));
         assertFalse(cal.isValidExpiry(SAT_0919_NOON));
@@ -587,17 +752,15 @@ contract ExpiryCalendarTest is Test {
     }
 
     function test_admin_grantedAdminCanMaintain() public {
-        vm.prank(admin);
-        cal.grantRole(V2Constants.DEFAULT_ADMIN_ROLE, bob);
+        _grant(V8Roles.LISTING, bob, 0);
         vm.prank(bob);
-        cal.setSpecialExpiry(SAT_0919_NOON, true);
-        assertTrue(cal.isValidExpiry(SAT_0919_NOON));
+        cal.setSpecialExpiry(FRI_0918_NOON, true);
+        assertTrue(cal.isValidExpiry(FRI_0918_NOON));
 
-        vm.prank(admin);
-        cal.revokeRole(V2Constants.DEFAULT_ADMIN_ROLE, bob);
+        manager.revokeRole(V8Roles.LISTING, bob);
         vm.prank(bob);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        cal.setSpecialExpiry(SAT_0919_NOON, false);
+        cal.setSpecialExpiry(FRI_0918_NOON, false);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -605,14 +768,15 @@ contract ExpiryCalendarTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Any valid expiry is a Monday-Friday non-holiday 16:00:00 New York; on a session day exactly one of the two
-    ///      candidate UTC instants (20:00, 21:00) is valid, on other days neither. Whole uint40 range, seeded holidays.
+    ///      candidate UTC instants (20:00, 21:00) is valid, on other days neither. Whole uint40 range, seeded holidays;
+    ///      outside the seeded 2026-2028 no day is a session day (SEC-48).
     function testFuzz_validExpiryIsWeekdayClose(uint256 dayRaw, uint256 secondRaw) public view {
         uint256 day = bound(dayRaw, 0, DAY_MAX - 1);
         uint256 ts = day * DAY + bound(secondRaw, 0, DAY - 1);
         // forge-lint: disable-next-line(unsafe-typecast)
         uint40 t = uint40(ts);
         // forge-lint: disable-next-line(unsafe-typecast)
-        bool session = _refWeekday(day) < 5 && !cal.holiday(uint32(day));
+        bool session = _refWeekday(day) < 5 && !cal.holiday(uint32(day)) && _refSeeded(day);
 
         if (cal.isValidExpiry(t)) {
             assertLt(_refWeekday(day), 5, "valid expiry on a weekend");
@@ -632,6 +796,22 @@ contract ExpiryCalendarTest is Test {
     }
 
     /// @dev Matches the closed-form DST rule to the second over 2007-2099.
+    /// @dev T-479. {setSpecialExpiry} accepts `ts` exactly when the window start is in a regular session and the
+    ///      window end is too, or is that session's close - cross-checked against {isRegularSession} and the grid, an
+    ///      implementation this rule does not share. Bounded to the seeded years 2026-2028.
+    function testFuzz_special_acceptedExactlyWhenTheWindowIsInOneSession(uint256 tsRaw) public {
+        // casting to uint40 is safe because the bound is below 2^40
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint40 ts = uint40(bound(tsRaw, 1_767_225_600, 1_861_919_999)); // 2026-01-01 .. 2028-12-31 UTC
+        uint40 start = ts - 1800;
+        bool gridClose = cal.isValidExpiry(ts); // no special is set yet, so this is the grid alone
+        bool expected = cal.isRegularSession(start) && (cal.isRegularSession(ts) || gridClose);
+        vm.prank(admin);
+        if (!expected) vm.expectRevert(V2Errors.BadExpiry.selector);
+        cal.setSpecialExpiry(ts, true);
+        assertEq(cal.specialExpiry(ts), expected);
+    }
+
     function testFuzz_newYorkOffsetMatchesReference(uint256 tsRaw) public view {
         uint256 ts = bound(tsRaw, DAY_2007 * DAY, DAY_2100 * DAY - 1);
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -663,14 +843,15 @@ contract ExpiryCalendarTest is Test {
         assertTrue(off == EDT || off == EST);
     }
 
-    /// @dev Over 2007-2099 the session is exactly [09:30, 16:00) New York on a Mon-Fri non-holiday, per the reference.
+    /// @dev Over 2007-2099 the session is exactly [09:30, 16:00) New York on a Mon-Fri non-holiday of a seeded year,
+    ///      per the reference.
     function testFuzz_regularSessionMatchesReference(uint256 tsRaw) public view {
         uint256 ts = bound(tsRaw, DAY_2007 * DAY, DAY_2100 * DAY - 1);
         uint256 local = ts - (_refOffset(ts) == EDT ? 4 hours : 5 hours);
         uint256 day = local / DAY;
         uint256 second = local % DAY;
         // forge-lint: disable-next-line(unsafe-typecast)
-        bool closed = cal.holiday(uint32(day));
+        bool closed = cal.holiday(uint32(day)) || !_refSeeded(day);
         bool expected = _refWeekday(day) < 5 && !closed && second >= 9 hours + 30 minutes && second < 16 hours;
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(cal.isRegularSession(uint40(ts)), expected);
@@ -684,8 +865,14 @@ contract ExpiryCalendarTest is Test {
     }
 
     /// @dev nextExpiry(t) > t, lands on a valid Mon-Fri close within 14 days (weekly when asked), and skips nothing.
-    ///      2025-2031 covers the seeded holidays and the unseeded years after them.
-    function testFuzz_nextExpiryIsNextValidClose(uint256 tsRaw, bool weekly) public view {
+    ///      2025-2031 covers the seeded holidays and the year boundaries around them. The years outside the launch seed
+    ///      are marked seeded (a Saturday closure each) so the search runs across them: closing them is SEC-48's
+    ///      behaviour, pinned by the test_unseededYear_* tests, not this one's subject.
+    function testFuzz_nextExpiryIsNextValidClose(uint256 tsRaw, bool weekly) public {
+        _markSeeded(2025);
+        for (uint256 year = 2029; year <= 2031; ++year) {
+            _markSeeded(year);
+        }
         uint256 ts = bound(tsRaw, _refJan1(2025) * DAY, _refJan1(2031) * DAY);
         // forge-lint: disable-next-line(unsafe-typecast)
         uint40 t = uint40(ts);
@@ -706,24 +893,37 @@ contract ExpiryCalendarTest is Test {
         }
     }
 
-    /// @dev Over the whole uint40 range nextExpiry either returns something later or reverts BadExpiry, and it only
-    ///      reverts in the last two weeks of the range (no holidays are seeded past 2028).
+    /// @dev Over the whole uint40 range nextExpiry either returns something later or reverts BadExpiry, and it reverts
+    ///      exactly when no close of the seeded 2026-2028 lies in (t, t + 14 days]: from Friday 2028-12-29, the last
+    ///      2028 close and weekly, onward (the end of uint40 included), and before Friday 2026-01-02, the first.
+    ///      SEC-48: before it, this test allowed a revert only in the last two weeks of the range.
     function testFuzz_nextExpiryAnyTs(uint40 t, bool weekly) public view {
+        uint256 firstSeeded = _refClose(_refJan1(2026) + 1);
+        uint256 lastSeeded = _refClose(_refJan1(2029) - 3);
         try cal.nextExpiry(t, weekly) returns (uint40 e) {
             assertGt(e, t, "nextExpiry(t) > t");
             assertTrue(cal.isValidExpiry(e));
             assertLt(_refWeekday(e / DAY), 5, "Mon-Fri");
+            assertTrue(uint256(e) >= firstSeeded && uint256(e) <= lastSeeded, "a close outside the seeded years");
         } catch (bytes memory err) {
             assertEq(err, abi.encodeWithSelector(V2Errors.BadExpiry.selector));
-            assertGt(uint256(t), uint256(type(uint40).max) - 15 days, "reverted far from the end of uint40");
+            assertTrue(
+                uint256(t) >= lastSeeded || uint256(t) + 14 days < firstSeeded,
+                "reverted with a seeded close inside the search"
+            );
         }
     }
 
     /// @dev With any subset of a week's weekdays closed, the weekly is the last open weekday (none when all are
     ///      closed), and both searches from the week's start agree. Weeks after 2030 up to the end of uint40, where
-    ///      no seeded holiday interferes.
+    ///      no seeded holiday interferes. Those years have no closure, so the Saturdays before, of and after the week
+    ///      are closed first: that seeds every year the week and the next one touch (SEC-48) and no weekday read sees
+    ///      it, so the week tests the weekly rule and not the unseeded-year one.
     function testFuzz_weeklyIsLastOpenWeekday(uint256 weekRaw, uint8 closedMask) public {
         uint256 monday = MONDAY_2026_09_21 + 7 * bound(weekRaw, 250, (DAY_MAX - MONDAY_2026_09_21) / 7 - 3);
+        _close(_days(monday - 2, 1));
+        _close(_days(monday + 5, 1));
+        _close(_days(monday + 12, 1));
         uint256 lastOpen = type(uint256).max;
         uint256 firstOpen = type(uint256).max;
         for (uint256 i; i < 5; ++i) {

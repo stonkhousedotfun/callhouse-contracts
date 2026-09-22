@@ -1,14 +1,262 @@
 # Security
 
-The threat model, the properties the contracts enforce, and the record of what the 2026-09-12
-adversarial review, the 2026-09-13 documentation review and the 2026-09-13 second pass found and
-what was done about it.
+Two parts. **[v2](#v2)** first: the status of the v2 contracts (`src/v2/`), what stands behind them,
+and their threat model in summary, with the full detail in
+[docs/V2-ARCHITECTURE.md](docs/V2-ARCHITECTURE.md). Then **the v1 record** (from
+[§0](#0-the-2026-09-13-redesign-write-on-fill-no-registry)): the threat model, the properties the v1
+contracts enforce, and what the 2026-09-12 adversarial review, the 2026-09-13 documentation review
+and the 2026-09-13 second pass found and what was done about it, kept as written with its dates.
+[Reporting](#6-reporting) covers both.
 
 > **Paths.** Paths resolve from the root of this repository, stonkhousedotfun/callhouse-contracts. A path
 > followed by (stonkhousedotfun/callhouse) lives in the app repository (keeper, indexer, web, ops and the
 > project-wide docs), which mounts this repository as a git submodule at `contracts/`; a path
 > followed by (stonkhousedotfun/callhouse-site) lives in the marketing site repository. Both resolve from
 > that repository's root.
+
+---
+
+## v2
+
+### Status
+
+- **Unaudited.** No external audit report of v2 exists at this commit, and this repository links to
+  none. That is a statement about today, not a policy: owner decision **V3-D33** (2026-09-19,
+  `v8-plan/00-MASTER-2026-09-19.md` §2) withdrew the earlier decision that no audit would be
+  commissioned, and **INTERFACE_VERSION 8 launches verified and audited**. The audit is commissioned by
+  `OWN8-12` and its report is linked from this page by `C8-14`; while no link is here, no third party
+  has reviewed this code. V3-D33 supersedes both the owner's 2026-09-16 decision in the v2 plan and the
+  2026-09-15 note in [§0](#0-the-2026-09-13-redesign-write-on-fill-no-registry) that an external audit
+  was pending, and it is what [the v1 record's D14](#4-the-2026-09-12-adversarial-review) now reads
+  against.
+- **No v8 contract is deployed anywhere.** Every v8 `--broadcast` is owner-gated. The **v7** set is
+  live on chain 4663 — thirteen contracts at `v2.deployBlock` 65780341, deployed 2026-09-18 from commit
+  `1b087550cfc92fd1878e5f1c0feaabaa91dc415f` and pinned in `script/artifacts/v2-4663/manifest.json`
+  ([docs/DEPLOY-V2.md](docs/DEPLOY-V2.md), "Pinned deployed runtimes") — and v8 is a full redeploy
+  beside it, after which v7 is frozen and run off like v1 (owner decisions V3-D1 and V3-D8). Nothing on
+  this page describes code that is running on chain today.
+- **No bug bounty** ([§6](#6-reporting)). V3-D33 puts a follow-up review and a bug bounty at $1 M TVL.
+- **The v8 migration is half landed in this tree, and this page says where.** `OrderBook` still carries
+  v7's `onlyRole(DEFAULT_ADMIN_ROLE)` on all five of its setters
+  (`src/v2/OrderBook.sol:573,587,597,626,637`, until `C8-03` and `C8-13`), and the superseded
+  `UniV3PayoutAdapter` never migrates at all (`src/v2/periphery/UniV3PayoutAdapter.sol:111`;
+  `PayoutRouter` replaces it). Every other target is a `Managed` against the one manager
+  ([V2-ARCHITECTURE §2.1](docs/V2-ARCHITECTURE.md#21-roles)). Where the role manifest and the bytecode
+  disagree, the manifest is the target and the source is the fact; the rest of this page names which is
+  which.
+
+### What stands behind v2
+
+**No gate figure on this page was produced by the commit that wrote it.** Under the owner's build-mode
+directive of 2026-09-19 the suites are written but are not run as a condition of shipping, so this
+section names what each gate covers and quotes no test count, check count or gas figure. The counts
+that stood here before were measured on branch `v2` on 2026-09-17, at INTERFACE_VERSION 7, on a tree
+that has since replaced four per-contract `bytes32` role tables with one `AccessManager` and added a
+FeeSplitter, a PayoutRouter, a V4BuybackExecutor, a fee-discount seam, a just-in-time funding hook and
+mint-on-fill. Carrying them forward would have been a claim about code they never ran against; they are
+in git history. What the launch verification pass has to re-measure is listed in the deferred-verification ledger,
+`stonkhouse-plan/status/DEFERRED-VERIFICATION.md`, in the project plan folder beside this repository.
+
+| Gate | What it covers |
+|---|---|
+| `forge test` | the v2 unit suites per contract; `LifecycleTest` (a weekly ladder of calls and puts, every wallet, ledger and fee balance checked against an independent model after every step); `V2GasTest`; `V2DocsNumbersTest` (the figures the v2 docs quote); the OrderBook suites rerun against the real Clearinghouse; `ClearinghouseMintFeeTest` and `C05MintFeeTest` (the collateral-rent charge, its pro-rata refund and its settle accrual, with the two c05 avoidance PoCs flipped); `AutoRollerStaleTest` and `AutoRollerTimingTest` (the stale cancel, the in-the-money reprice refusal and the open grace, with the two c16 PoCs flipped); `MakerVaultOutflowTest` (the outflow cap, with the c14 and c21 PoCs flipped); and, for INTERFACE_VERSION 8, the access-matrix test that compares `script/v2/roles.v8.json` with `src/v2/access/V8Roles.sol` and with what each target actually restricts |
+| the invariant suite, inside `forge test` | `V2InvariantTest` (Clearinghouse invariants 1-5, 2′ and 7 — held rent always covers every refund it owes — book invariants B1-B3 and invariant 6, and that every expiry settles on the configuration its first series pinned: [docs/V2-ACCOUNTING.md §10](docs/V2-ACCOUNTING.md#10-the-invariants-as-asserted), [V2-ARCHITECTURE §9](docs/V2-ARCHITECTURE.md#9-where-the-numbers-come-from)); plus `AutoRollerStaleInvariantTest` and `MakerVaultOutflowInvariantTest`. Driven under oracle faults, mid-life reconfiguration of the market and its sources, the pinning attacks, USDG pause and freeze, guardian pauses, veto and admin resolve, and unauthorised attempts on other accounts |
+| `FOUNDRY_PROFILE=fork forge test --fork-url $RH_RPC` | against live chain 4663 (run serially, `-j 1`: the public RPC rate-limits parallel suites): a two-source settlement on the real NVDA feed history and pool, the observation-ring depth `setPool` requires, a feed-only weekly through the delay, the feed walk, payout conversion through the live SwapRouter02, the live Data Streams VerifierProxy, the devnet deploy, the v1 freeze, and the pinned runtimes of the live v7 set |
+| `forge fmt --check src/v2 script/v2 test/v2` | formatting |
+
+The commands are in [V2-ARCHITECTURE §9](docs/V2-ARCHITECTURE.md#9-where-the-numbers-come-from).
+
+What the tests do not establish: that the Admin Safe's signers are honest (they are trusted, see
+below), that keepers show up, how the real issuers, sequencer and feed operators behave beyond what the
+mocks and the fork model, and the gas of a real signed Data Streams verification. Under build mode they
+do not establish that they pass, either.
+
+### The model in one paragraph
+
+No role can move, freeze or seize a user's free collateral or tokens, and `close`, `withdraw`,
+`redeem`, ERC-1155 transfers, order `cancel`, `prune` and `claimOwed` have no pause. From
+INTERFACE_VERSION 8 every privileged function in the system is gated by **one** OpenZeppelin
+`AccessManager` holding **eleven** roles, not by a `DEFAULT_ADMIN_ROLE` inside each contract: the
+manifest is `script/v2/roles.v8.json` and `src/v2/access/V8Roles.sol` is its compiled mirror. Nine of
+the eleven go to a **2-of-3 Admin Safe** and the instant ones to four hot bot keys
+(`script/v2/roles.v8.json:42-58`); the Safe being 2-of-3 with all three keys the owner's is owner
+decisions V3-D1 and V3-D10, which nothing in this repository enforces — the manifest knows only an
+address. The **execution delay belongs to the lane, not to the key**: 48 h on `ADMIN` and
+`FEE_MANAGER`, 72 h on `MARKET_FEE_MANAGER`, 24 h on `CONFIG_ADMIN` and `TREASURY_ADMIN`, 1 h on
+`LISTING`, and 0 on `OPS_ADMIN`, `GUARDIAN`, `PRICER`, `QUOTER` and `BUYBACK`
+(`script/v2/roles.v8.json:16-28`, `src/v2/access/V8Roles.sol:91-101`). A delayed call is scheduled on
+the manager, sits in public for its delay, and only then executes; while it waits the guardian can
+cancel it — for every delayed lane except `ADMIN`'s, which no guardian can touch
+([§2.3](docs/V2-ARCHITECTURE.md#23-every-guardian-power-and-its-worst-case)). An `OrderBook` fee change
+then waits its own compiled `FEE_CHANGE_DELAY` of **48 h** on top
+(`src/v2/interfaces/V2Constants.sol:60`, raised from 24 h by owner decision V3-D13), so it is visible
+for 48 h before it can even be scheduled on the book and takes another 48 h to bite. `CONFIG_ADMIN`
+configures which price sources settle an expiry, but only until the expiry's first series is created:
+that series pins the oracle's sources and parameters and each source's feed and pool (owner decision
+2026-09-17, closing C2-16 finding 1), so no role can re-price a live series. Pinning fails closed: a
+series is created only with every source pinned, and a pin made outside a series creation (through the
+Clearinghouse pointer or a source's allow-list) can only stop series creation on that expiry, never be
+settled on ([V2-ARCHITECTURE §6.6](docs/V2-ARCHITECTURE.md#66-the-admin-key)). Over a live series what
+is left is `adminResolve` inside the band of the recorded prices from expiry + 48 h (any price only
+when no pinned source ever answered; within a factor of 1.25 of a lone recorded price the guardian
+vetoed, from expiry + 7 days) — itself a `CONFIG_ADMIN` call, so scheduled 24 h in public first — and
+lifting the guardian's veto, which is instant. Configuration changes reach only expiries without
+series, whose pinned configuration is public before anyone trades them. The guardian can only stop new
+risk, hold uncorroborated settlements, clear a payout route and cancel a scheduled operation.
+
+### What a compromise of each v2 key buys
+
+Roles are the `uint64` ids of `script/v2/roles.v8.json:3-15`; the delay beside each is that role's
+execution delay from `script/v2/roles.v8.json:16-28`. The **Admin Safe holds every role in this table
+except `PRICER` and `BUYBACK`** (`script/v2/roles.v8.json:43-52`), so "a compromise of the Safe" is the
+union of its rows, each still paying its own delay, with `GUARDIAN` able to cancel everything but
+`ADMIN`'s and `OPS_ADMIN`'s. The four hot keys hold one instant role each and nothing else.
+
+| Key | Worst case | Detail |
+|---|---|---|
+| `ADMIN` (id 0, 48 h) — Admin Safe | the manager itself: grant or revoke any role, remap any `(target, selector)`, change any role admin or role guardian. **No target function is mapped to it** (`script/v2/roles.v8.json:204`), so it reaches nothing directly — it reaches everything by first giving itself the role that does, 48 h later and in public. **No guardian can cancel an `ADMIN` operation**: `AccessManager` never lets `ADMIN_ROLE` be given a role guardian, and the manifest sets none (`src/v2/access/V8Roles.sol:20-21`, [§2.3](docs/V2-ARCHITECTURE.md#23-every-guardian-power-and-its-worst-case)). That lane is protected by publicity and by a second `ADMIN` transaction, and by nothing else — accepted, V3-D24, below | [V2-ARCHITECTURE §2.1](docs/V2-ARCHITECTURE.md#21-roles) |
+| `FEE_MANAGER` (1, 48 h) | the book's fees to their ceilings — seller fee `PREMIUM_FEE_CEIL_BPS` 10 % of premium, taker fee `min(TAKER_FEE_FLAT_CEIL` 1 USDG`, TAKER_FEE_CAP_CEIL_BPS` 10 %`)` (`src/v2/interfaces/V2Constants.sol:75,82,84`) — including on resting orders, 48 h after the scheduled change becomes executable and 48 h after that again (`FEE_CHANGE_DELAY`); the maker registry and the discount module the book reads (both bounded: a rebate is clamped so a take's rebates never exceed its taker fee, a discount is clamped to `MAX_DISCOUNT_BPS` 50 % of the taker fee and read once with `DISCOUNT_READ_GAS` 30,000, `src/v2/interfaces/V2Constants.sol:105-112`); the keeper bounties and their daily cap; the FeeSplitter's burn share, per-buy cap and conversion slippage | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| `MARKET_FEE_MANAGER` (2, 72 h) | the exercise fee and the collateral-rent dial, both pinned into series created **afterwards** only. Ceilings: exercise fee `EXERCISE_FEE_CEIL_BPS` 200 bps; rent `MINT_FEE_CEIL_PPM` **5,000 ppm — 0.5 % of the locked collateral per `MINT_FEE_PERIOD` of 7 days of remaining life** (`src/v2/interfaces/V2Constants.sol:77,99,68`). v8 launches every market and the default at **rent 0** (owner decision V3-D18: writers pay the 5 % premium fee on first sale and nothing else; the tested dial stays in the contract, set to 0), so the ceiling is not a multiple of any live rate — it is the whole distance from charging writers nothing to charging them 0.5 % a week. Existing series and resting orders keep the rate pinned at their creation, and anyone can pre-create series up to `MAX_TENOR` 45 days out at today's rate (`:52`), so a raise reaches those only at their next creation. 72 h is the longest lane in the manifest precisely because this row is the one that can start charging a fee that does not exist today | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| `CONFIG_ADMIN` (3, 24 h) | the settlement configuration of every expiry that has no series yet, chosen in public (a series is created only on a pin equal to the configuration current at its creation; a pin made outside a series creation can only block that expiry's series: `PinnedSettlementTest.test_hiddenPrePin_throughTheClearinghousePointer`, `PinnedSettlementTest.test_hiddenPrePin_throughEachSourceAllowList`); stopping series creation by breaking the pin wiring; new series pinned to an oracle that never settles or settles anywhere; for live series only `adminResolve` inside the recorded band from expiry + 48 h (any price when none of the expiry's pinned sources ever answered; after a veto of an expiry with a single ok price, any price within a factor of 1.25 of it from expiry + 7 days, `SettlementOracleResolveTest.test_adminResolve_heldSingleSource_widensAfterSevenDays`); the minter allow-list, so a venue that mints at a price the protocol never sees; the payout routes, so ITM call conversions paid up to 300 bps under value (bound plus route fee; a payout adapter that misreports its route fee moves a floor by at most 100 bps, `ClearinghousePayoutTest.test_floor_routeFeeClampedToMax`; the USDG is counted at the Clearinghouse, so an adapter cannot meet the floor with the holder's own USDG pushed to the holder during the swap, `ClearinghousePayoutTest.test_convert_adapterPayingWithTheHoldersOwnUsdg_paysInKind`, sweep contracts-c30); the funding allow-list | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case), [§6.6](docs/V2-ARCHITECTURE.md#66-the-admin-key) |
+| `TREASURY_ADMIN` (4, 24 h) | everything that names or pays the treasury: both fee recipients, every `setTreasury`, the treasury budgets of KeeperRewards, MakerVault and RewardsDistributor, the MakerVault's limits and withdrawals, and the FeeSplitter's wiring. Treasury money, never user collateral | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| `LISTING` (5, 1 h) | registering a market, enabling or disabling one, the strike tick, the redeem floor, the base URI, the calendar's holidays and special expiries, the AutoRoller's minimum roll size. One hour, because a listing is reversible and cheap — and one hour is the shortest notice in the table | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| `OPS_ADMIN` (6, 0) | manager-only and instant: it is the role admin of `GUARDIAN`, `PRICER`, `QUOTER` and `BUYBACK` (`script/v2/roles.v8.json:29-34`), so it can revoke a compromised hot key with no delay — and grant those four roles to anyone with no delay either. It can grant nothing else. The deliberate hole in the other direction from `ADMIN`: rotation that waits is not rotation | [§2.1](docs/V2-ARCHITECTURE.md#21-roles) |
+| `GUARDIAN` (7, 0) — guardian key and the Admin Safe | no new series, mints or trading; uncorroborated settlements held until the veto is lifted or the expiry is resolved (a held single price opens the `CONFIG_ADMIN` factor-of-1.25 band from expiry + 7 days); a market's payout route cleared, so its converted payouts fall back in kind until a route is set again on the 24 h lane; the FeeSplitter paused. And, as the **role guardian of roles 1-5** (`script/v2/roles.v8.json:35-41`), the cancel of any scheduled fee, market-fee, config, treasury or listing operation while it waits. No guardian function touches a balance | [§2.3](docs/V2-ARCHITECTURE.md#23-every-guardian-power-and-its-worst-case) |
+| `PRICER` (8, 0) — pricer bot key | `AutoRoller.reprice` and nothing else (`script/v2/roles.v8.json:119`): smart-pricing writers' asks moved to the bottom of each writer's own band. Since INTERFACE_VERSION 7 it cannot reprice an ask the market has already reached at all (`InTheMoney`) | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| `QUOTER` (9, 0) — mm bot key and the Admin Safe | the MakerVault's whole USDG balance, moved to a counterparty by trading until the role is revoked. No quoter call pays anyone but the vault, but the guards bound each trade, not turnover: buying a partner's ask at the bid cap and selling the longs back into its one-tick bid returns exposure to 0 and leaves the partner the premium difference, round trip after round trip (`MakerVaultQuoterTest.test_compromisedQuoter_roundTripsMoveVaultUsdgToAPartner`; sweep contracts-c14). The key needs no partner and no capital: the vault writes an out-of-the-money call from its own collateral into the key holder's one-tick bid (the ask floor is 0), buys the longs back at the cap and closes the pair, up to `maxBidBpsOfSpot` of spot a share per round trip and up to `maxSeriesUnits` a series, with nothing on chain bounding how often (`MakerVaultQuoterTest.test_compromisedQuoter_aloneNeedsNoCapital`; sweep contracts-c21). A script empties the vault faster than a person can revoke the role. **Bounded from INTERFACE_VERSION 7** by `Limits.maxDailyOutflow`, a leaky bucket over `MakerVault.OUTFLOW_WINDOW` of 1 day on the net USDG a quoter call pays out: at most the cap at once and at most twice the cap in any window. `place(Bid)`, `replace(Bid)` and `take` revert `OutflowCapExceeded(available, outflow)` above it; `cancel`, `close`, the ledger moves, `claimOwed`, `sync` and every ask are never blocked, so a cap of 0 is a spend freeze that still allows the whole unwinding path (`MakerVaultOutflowTest`, `MakerVaultOutflowInvariantTest`). **INTERFACE_VERSION 8 removed v7's admin exemption** from that cap (`src/v2/mm/MakerVault.sol:136-146`): the bound is now a property of the contract rather than of who holds which key, which it had to be, because the Admin Safe is itself a `QUOTER` member (`script/v2/roles.v8.json:52`) and v7's exemption would have applied to it. What is still NOT bounded: option value sold cheaply inside the price guards and size caps and realised at settlement, at most about `maxTotalNotional × askToleranceBps / 1e4` per settlement cycle, which daily expiries make a daily figure. A second `QUOTER` holder shares the budget. Treasury money, not user collateral | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| `BUYBACK` (10, 0) — cranker key | `FeeSplitter.buyback(minTokenOut)` and nothing else (`script/v2/roles.v8.json:161`): it chooses **when** the splitter spends its buyback balance and what slippage floor to name, and it can spend it repeatedly. Every buy is bounded by the configured per-call cap (50 USDG at launch, `src/v2/periphery/FeeSplitter.sol:36-38`) under the compiled `BUYBACK_CAP_CEIL` of 1,000 USDG (`src/v2/interfaces/V2Constants.sol:137`) and by the compiled `BUYBACK_COOLDOWN` of 5 minutes between buys (`:63`). There is **no daily cap**, by owner decision (below). The balance can only ever be spent buying STONKHOUSE to burn, so the worst case is bad execution repeated, not a withdrawal | [§2.2](docs/V2-ARCHITECTURE.md#22-every-admin-power-and-its-worst-case) |
+| any keeper | chooses when to call; can take up to the conversion slippage bound (30 bps at launch, measured above the route's pool fee: floors of 35 / 60 / 130 bps on the 0.05 % / 0.30 % / 1 % pools) of a converted payout, less the swap's price impact, by moving the pool in the same transaction (`ClearinghousePayoutTest.testFuzz_floor_captureBounded`), plus however far the market has moved above the price the floor is valued at. That price is the higher of the settlement price and the oracle's spot whenever the oracle answers ok for it — a reading inside the market's own `spotMaxAge`, with no extra bound of the Clearinghouse's own since INTERFACE_VERSION 7 (owner sign-off c01) — so a move after the settlement window is not free to take (`ClearinghousePayoutTest.test_floorPrice_freshSpotAboveSettlement_valuesThePayoutAtSpot`, `ClearinghousePayoutTest.test_floorPrice_freshnessIsTheMarketsSpotMaxAgeAndNothingTighter`); without an ok spot a third party converts on the settlement price only within 30 minutes of expiry and pays in kind after that (`ClearinghousePayoutTest.test_floorPrice_noFreshSpot_lateThirdPartyPaysInKind`); bounties are capped | [§6.8](docs/V2-ARCHITECTURE.md#68-conversion-slippage-and-who-captures-it) |
+| Chainlink feed owner, Uniswap pool, Stock Token issuer, USDG issuer, sequencer | as for v1 ([§3](#3-what-a-compromise-of-each-key-buys)), with the v2 consequences in the architecture | [§2.6](docs/V2-ARCHITECTURE.md#26-external-parties), [§6](docs/V2-ARCHITECTURE.md#6-what-is-not-protected) |
+
+### Not protected
+
+Issuer freeze, pause and burn (shortfalls are first come, first served; a freeze or blocklist of a
+holder is not mirrored onto the Clearinghouse ledger or positions, so that holder can withdraw its free
+balance to another address, and the issuer's lever is then the pooled Clearinghouse balance); USDG issuer actions;
+sequencer censorship and outages (the pool snapshot grace and the feed replay bound can be run out);
+feed scale faults inside the jump bound (caught only by corroboration or the guardian's veto, and a vetoed single
+price settles only through `adminResolve`: within a factor of 1.25 of it from expiry + 7 days); feed
+precision near the strike; the Admin Safe's signers, who are one person (below); keeper liveness;
+conversion slippage; maker contracts that stop accepting tokens. Each is written up in
+[docs/V2-ARCHITECTURE.md §6](docs/V2-ARCHITECTURE.md#6-what-is-not-protected).
+
+Two items that were open in INTERFACE_VERSION 6 were **fixed in 7, with residuals that still stand**:
+
+- **An AutoRoller ask that keeps its roll-time price after spot rallies** (sweep contracts-c16). Anyone may
+  call `cancelStale(writer, underlying)` to withdraw a tracked live ask the market has reached, on a
+  fresh spot at or past the strike; `reprice` refuses an in-the-money ask; and a 30-minute open grace stops
+  a roll pricing off a pre-open reading. **Residual:** the cancel is a transaction after the fact, so a
+  taker who backruns the crossing print — or who trades on an off-chain price before the feed prints — can
+  still fill, and gaps, after-hours and weekend moves the feed never prints are not bounded while the book
+  trades 24/7. Nothing cancels unless someone calls, and a keeper outage longer than the market's
+  `spotMaxAge` after the crossing print leaves nothing cancellable until the next print. A paused or
+  reverting oracle returns false. The product cost stands: a rally past the strike ends the writer's ask for
+  the rest of the period with no same-period re-roll.
+- **The writer fee was avoidable** (sweep contracts-c05): a writer who minted outside the book and resold
+  the long paid nothing. v7 answered it with collateral rent at `Clearinghouse.mint`, refunded pro rata
+  by `close`, which every route to a long pays identically. **INTERFACE_VERSION 8 answers it a second,
+  stronger way and turns the rent off** (owner decisions V3-D7, V3-D17, V3-D18): options can only be
+  created inside a trade on an approved venue — `Clearinghouse.mint` now reverts `NotMinter()` for
+  anyone not on the `CONFIG_ADMIN` allow-list, and at launch the OrderBook is the only minter
+  (`src/v2/interfaces/V2Errors.sol:85-88`) — so every option's first sale carries the 5 % premium fee
+  and true resales stay at 0 %. The rent dial stays compiled and tested at 0.
+  **Residuals:** self-trading still skips the fee (accepted, below); the fee shape inverts the v7
+  relation `premiumFeeBps <= resaleFeeBps`, and at this commit the deploy path has only half caught up —
+  the deploy path has since caught up in full. `script/v2/VerifyV2.s.sol` is **deleted** and
+  `script/v2/VerifyV8.s.sol` replaces it; its header records that INTERFACE_VERSION 8 **deleted** the
+  `premiumFeeBps <= resaleFeeBps` check rather than inverting it (`VerifyV8.s.sol:89`), so the FAIL this
+  paragraph warned about cannot occur. `VerifyV8` is what the wrapper runs (`DeployV2Batch.sh:1310`,
+  `:1318`). Corrected by `T-585` on 2026-09-21; the earlier text named `V2DeployBase.sol:744`, a line
+  that has since drifted to unrelated code, which is why this now cites the verifier rather than a line
+  number in the deploy library.
+
+One more thing every consumer must act on: **the ABI churn reaches every decoder again.** v8 moved
+selectors, event topics and tuples a second time — `Clearinghouse.registerMarket` alone went
+`0x45baaccb` → `0xfb2a821f` (v7) → **`0x9ae621ee`** (v8, `registerMarket(address,uint64,bool)`; derived
+here with `cast sig` and pinned at `test/v2/InterfaceIds.t.sol:533-536`) — so a consumer left on v7
+ABIs mis-decodes a v8 deployment **silently** rather than failing loudly. Every lane gates on
+`interfaceVersion === 8`.
+
+### Accepted risks and the operating rules they rely on
+
+The first block is the owner's list, `v8-plan/00-MASTER-2026-09-19.md` §7, in its final state. The
+second block is the operating rules the contracts rely on rather than enforce.
+
+- **~~v8 ships unaudited~~ — withdrawn 2026-09-19 (V3-D33).** v8 launches verified and audited: before
+  the broadcast the owner reopens verification, a launch verification pass runs every gate and clears
+  the deferred-verification ledger, an external audit is done and its findings are fixed. **What
+  remains true:** the core is immutable, so anything the audit misses still means a redeploy, not a
+  patch. Today, at this commit, no report exists ([Status](#status)).
+- **The 5 % premium fee can be skipped by self-trading.** A writer can sell to their own second wallet
+  at the minimum price and resell at 0 %. Accepted (V3-D18): it is forgone revenue from sophisticated
+  writers only, nobody's funds are at risk, and the pattern is visible in the indexer, which flags it.
+- **No rent, so there is no fee floor under the 5 %.** Accepted (V3-D18) for simplicity for writers:
+  the rent dial is compiled, tested and set to 0, and can be turned on later through
+  `Clearinghouse.setMarketFees` with no redeploy — in the 72 h `MARKET_FEE_MANAGER` lane, in the open,
+  and cancellable by the guardian the whole time it waits.
+- **No daily buyback cap.** Accepted (V3-D20): the buyback balance can only ever be spent buying and
+  burning STONKHOUSE, and what remains is the compiled 5-minute `BUYBACK_COOLDOWN` and the compiled
+  `BUYBACK_CAP_CEIL` of 1,000 USDG over the configured per-call cap
+  (`src/v2/interfaces/V2Constants.sol:63,137`).
+- **A lending hook ships in an immutable core before any stock-lending market has borrowers.** Accepted
+  (V3-D3, V3-D19): lending is core to the thesis, and the hook is opt-in, gas-capped, and a failure
+  only skips that maker's order rather than failing the take.
+- **All three Admin Safe keys belong to one person.** Accepted (V3-D10): 2-of-3 removes single-key
+  compromise now, and signers can rotate to outsiders later without a redeploy. Nothing in this
+  repository can tell a 2-of-3 Safe from an EOA; the manifest knows only an address.
+- **The guardian cannot cancel role or mapping changes, only fee / config / treasury / listing
+  operations.** Accepted 2026-09-19 (V3-D24). `AccessManager` never lets `ADMIN_ROLE` be given a role
+  guardian and the manifest sets none, so the 48 h `ADMIN` lane is protected by publicity and by a
+  second `ADMIN` transaction and by nothing else. Revisit first when outside co-signers exist.
+
+- **A take pays the fees in effect when it is mined, not when it was signed — and v8's fix for that is
+  DECLARED BUT NOT YET WIRED.** `TakeParams` gained a `maxTotalFee` field in INTERFACE_VERSION 8
+  (`src/v2/interfaces/V2Types.sol:83-101`) and `V2Errors.FeeAboveMax(fee, max)` exists for it
+  (`src/v2/interfaces/V2Errors.sol:81-84`), but **`OrderBook.take` does not read the field and cannot
+  revert `FeeAboveMax` at this commit** (`src/v2/OrderBook.sol:421-456`) — the enforcement is `C8-03`'s, and `quoteTake` still answers
+  `sellerFees = 0` for a selling quote by its own admission (`src/v2/OrderBook.sol:463-467`). Until it
+  lands, a take signed before a scheduled fee change and mined at or after its `effectiveAt` pays the
+  new fees, up to the ceilings, and passing a cap buys nothing. **Operating rule, unchanged and still
+  load-bearing:** while a change is pending (`pendingFeeParams()` returns a non-zero `effectiveAt`),
+  every take's `deadline` is capped at `effectiveAt - 1`. `OrderBook.take` reverts `DeadlinePassed`
+  when `block.timestamp > deadline`, and the new fees apply only from `block.timestamp >= effectiveAt`,
+  so such a take either pays the fees it was quoted or does not execute. A take built while nothing is
+  pending, with a deadline less than `FEE_CHANGE_DELAY` after the block it read, cannot reach a change
+  scheduled later. A selling caller must keep passing `type(uint128).max` as its cap until `C8-03`
+  lands. Any other integration that builds takes must apply the same rules.
+- **Resting orders fill at the fees in effect at the fill.** A resting order filled at or after
+  `effectiveAt` pays the new seller fee and earns the new rebate, whatever the fees were when it was
+  placed (`OrderBookFeeDelayTest.test_take_restingOrders_payOldFeesBeforeEffectiveAt_newFeesFromIt`).
+  Makers get `FEE_CHANGE_DELAY` — 48 h from INTERFACE_VERSION 8 — of notice through
+  `FeeParamsScheduled(params, effectiveAt)` and `pendingFeeParams()`, on top of the 48 h the Admin Safe
+  waits on the manager before it can schedule at all, and `cancel` is never paused, so a maker who does
+  not accept the change cancels before `effectiveAt`. Whoever rests orders for others (the MakerVault
+  quoter, the AutoRoller's writers through the dapp) should act on that notice.
+- **A price source is listed only once it can pin.** Pinning fails closed: while a market's `setMarket`
+  list names a source that has no configuration for the underlying (`SourceNotPinned(source, NoSource)`)
+  or does not allow-list the oracle (`SourceNotPinned(source, NotAuthorized)`), no first series of any
+  expiry can be created (`PinnedSettlementTest.test_failClosed_unconfiguredListedSource_blocksCreation`,
+  `PinnedSettlementTest.test_failClosed_oracleRevokedOnAnySource_blocksCreationUntilRestored`). Operating rule:
+  configure the source (`setFeed` / `setPool`) and allow-list the oracle (`setOracle(oracle, true)`) before
+  `setMarket` lists it; to remove a source, `setMarket` without it first and unconfigure it afterwards.
+  `RegisterMarkets.s.sol` keeps this order (`RegisterMarketsPreflightTest.test_register_droppedPool_unlistsBeforeUnconfiguring`);
+  a change by hand (enabling Data Streams, docs/V2-DATA-STREAMS.md) must too, and the verifier's pin dry
+  run fails on a market that breaks it. Under v8 each of those calls is a `CONFIG_ADMIN` schedule, so
+  the order is an order of *scheduled* operations and each waits 24 h.
+- **A pool source is configured only with an observation ring that outlasts the snapshot grace.** A Uniswap v3 pool
+  writes at most one observation per second, and anyone can make it write one every second with dust mints and
+  burns, so a ring shallower than `MIN_POOL_OBSERVATION_CARDINALITY` — `SETTLEMENT_WINDOW + SNAPSHOT_GRACE + 1`,
+  2,401 slots (`src/v2/interfaces/V2Constants.sol:44,48,156`) — can be flooded past `expiry - 1800` before
+  `expiry + 600`, which removes the pool from that expiry's settlement for about 0.01 ETH of gas (sweep
+  contracts-c10). `UniV3TwapSource.setPool` refuses such a pool
+  (`UniV3TwapSourceTest.test_admin_setPool_refusesAnObservationRingShallowerThanTheGrace`) and
+  the RegisterMarkets preflight stops first. Operating rule: raise every registry pool with
+  `increaseObservationCardinalityNext(2401)` and wait for `slot0().observationCardinality` to reach it before
+  registering it (docs/DEPLOY-V2.md, step 0).
+
+---
+
+## The v1 record
 
 Read `docs/ARCHITECTURE.md` (stonkhousedotfun/callhouse) §2 for the trust boundaries and
 [docs/ACCOUNTING.md](docs/ACCOUNTING.md) for the money maths. The per-alert response runbooks
@@ -53,17 +301,26 @@ Bounding it (a cap on unsold inventory) was rejected in favour of closing it:
   `test/regression/`, one file per finding, each asserting the FIXED behaviour on the real Valorem
   bytecode where the loss lived in Valorem's bucket engine.
 
-**What stands behind this, and what does not (decision D14).** There is no external audit yet; one is pending (owner, 2026-09-15, reversing D14). The
-contracts are unaudited. Behind them are the internal reviews in §4 (the latest, 2026-09-14, found
-no Critical, High or Medium) and the test suite:
-`forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (405 tests;
+**What stands behind this, and what does not (decision D14, and its reversal).** **Decision D14 is no
+longer the standing decision.** D14 ruled that there would be no external audit; a 2026-09-15 note here
+said one was pending, reversing it; the owner's 2026-09-16 decision in the v2 plan restored it; and
+owner decision **V3-D33** of 2026-09-19 (`v8-plan/00-MASTER-2026-09-19.md` §2) reversed it for good.
+**INTERFACE_VERSION 8 launches verified and audited**, with a follow-up review and a bug bounty at
+$1 M TVL. What is true at this commit, as a fact rather than a policy: **no external audit report of
+these contracts exists and this repository links to none** — the v1 contracts described in this section
+have never been audited, and the v8 audit is commissioned by `OWN8-12`, with its link added by `C8-14`
+(see [v2, Status](#status)). Behind the v1 code are the internal reviews in §4 (the latest,
+2026-09-14, found no Critical, High or Medium) and the test suite:
+`forge fmt --check`, `forge build --sizes`, the unit, regression and invariant suites (the counts that
+stood here were measured on v1 in September 2026 and are not re-measured by the commit that wrote this
+line; they are in git history;
 the invariant campaign runs 64 × 600 calls with a third-party writer and exerciser in the vault's
 bucket and asserts after every call, through thirteen invariants, that the vault holds no option
 token, that its lifetime assignment never exceeds the contracts it sold, and that every armed id's
 option-token supply equals its unexercised collateral and sits with the buyer or the adversary),
 the real Seaport 1.6 runtime driven through five of its eight fulfilment entrypoints (single, advanced fractions, the
 same listing twice in one `fulfillAvailableAdvancedOrders` within and beyond the remainder, match,
-basic, skip-versus-revert, a hostile contract buyer), the fork suite against chain 4663 (20 tests,
+basic, skip-versus-revert, a hostile contract buyer), the fork suite against chain 4663 (
 on a vault the suite deploys against the live Seaport and Overcall's live Clear `0x9a7b…C0C0`,
 whose runtime equals ours except the metadata hash; no test touches the live vault or our Clear:
 first fill and top-up fill; an assigned week exercised by the
@@ -320,8 +577,9 @@ candidate and an exploit engineer for Medium and above, a gap round of 4 more re
 the checkpoint `25f4328` and found the first four things below to be launch-blocking. Every proof
 of concept is now a regression under `test/regression/`, one file per finding, asserting the FIXED
 behaviour; where the loss lived in Valorem's bucket engine the regression runs on the real Clear
-bytecode (`test/helpers/RealClearBase.sol`). Severities are the audit's. There is no external
-audit (D14).
+bytecode (`test/helpers/RealClearBase.sol`). Severities are the audit's. This was an INTERNAL
+audit; no external audit report of v1 exists ([v2, Status](#status): D14 was reversed by V3-D33 for
+v8, and the v1 contracts were never covered by it).
 
 | # | Severity | Finding | Fix | Regression tests |
 |---|---|---|---|---|
@@ -429,7 +687,10 @@ If you believe you have found a vulnerability, do not open a public issue. Send 
 `https://stonkhouse.fun/legal#reporting`. Both read `NEXT_PUBLIC_SECURITY_CONTACT_EMAIL` through
 `lib/legal.ts` (stonkhousedotfun/callhouse-site).
 
-There is no bug bounty. The contracts have had no external audit, and a report is a favour, not a
-claim. The live `https://stonkhouse.fun/legal` page still carries an older sentence (checked
-2026-09-15) saying a bug bounty opens in the second week after mainnet launch; no bounty programme
-exists, and reports go to security@stonkhouse.fun on the terms above.
+There is no bug bounty **today**, and no external audit report of these contracts exists at this
+commit, so a report is a favour, not a claim. Owner decision V3-D33 (2026-09-19) puts a follow-up
+review and a bug bounty at **$1 M TVL**, and commissions an external audit of v8 before its broadcast
+(`OWN8-12`); until `C8-14` adds that report's link here, treat everything in this repository as
+unreviewed by anyone outside it. The live `https://stonkhouse.fun/legal` page still carries an older
+sentence (checked 2026-09-15) saying a bug bounty opens in the second week after mainnet launch; no
+bounty programme exists, and reports go to security@stonkhouse.fun on the terms above.

@@ -57,7 +57,11 @@ library V2Errors {
     error TooEarly(uint40 notBefore);
     /// @notice The spot observation from `updatedAt` (unix seconds) is older than the market allows.
     error StaleSpot(uint256 updatedAt);
-    /// @notice No price source is configured or ok for the call.
+    /// @notice A dependency the contract needs for the call was never configured or is not usable: an address that
+    ///         is zero or has no code (a constructor or setter argument), a feed, pool, feed id or epoch root that was
+    ///         never set, a settlement window of zero, no price source that is ok for the call, or a HouseVault whose
+    ///         protocol accounts have not been named (so it is not yet armed). A missing or failing PRICE source is
+    ///         one case of this error, not its definition; reuse it rather than adding an error per dependency.
     error NoSource();
     /// @notice The settlement is already final.
     error AlreadyFinal();
@@ -78,4 +82,22 @@ library V2Errors {
     /// @notice A MakerVault quoter call would pay out `outflow` USDG base units net, more than the `available` part of
     ///         Limits.maxDailyOutflow (INTERFACE_VERSION 7).
     error OutflowCapExceeded(uint256 available, uint256 outflow);
+    /// @notice OrderBook.take: the call's taker-side fees came to `fee` USDG base units, above the `max` the taker set
+    ///         in TakeParams.maxTotalFee (INTERFACE_VERSION 8). Buying, `fee` is the taker fee; selling into bids it is
+    ///         the taker fee plus the seller fees. Checked after the final fee is known and before any USDG moves.
+    error FeeAboveMax(uint256 fee, uint256 max);
+    /// @notice Clearinghouse.mint: the caller is not on the minter allow-list (INTERFACE_VERSION 8). At launch the
+    ///         OrderBook is the only minter, so every long that exists was created inside a fill with a known premium.
+    ///         The writer-or-operator check still applies on top of it.
+    error NotMinter();
+    /// @notice PayoutRouter: the proposed route was refused (INTERFACE_VERSION 8). `reason` is one of the router's
+    ///         short codes -- the pair is not exactly (asset, USDG) sorted, the pool is uninitialised or has no
+    ///         liquidity, the fee carries the dynamic-fee flag, or the fee is above MAX_ROUTE_FEE_TIER.
+    error RouteRejected(bytes32 reason);
+    /// @notice The call is inside a compiled cooldown and is allowed again from `readyAt` (unix seconds)
+    ///         (INTERFACE_VERSION 8). Raised by FeeSplitter.buyback under V2Constants.BUYBACK_COOLDOWN.
+    error CooldownActive(uint40 readyAt);
+    /// @notice `amount` is above the `cap` configured for the call (INTERFACE_VERSION 8), as opposed to
+    ///         CeilingExceeded, which is a COMPILED bound. Raised by the FeeSplitter's per-call buyback cap.
+    error CapExceeded(uint256 amount, uint256 cap);
 }

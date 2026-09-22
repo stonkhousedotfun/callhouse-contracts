@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {Managed} from "../access/Managed.sol";
 import {IPriceSource} from "../interfaces/IPriceSource.sol";
 import {V2Constants} from "../interfaces/V2Constants.sol";
 import {V2Errors} from "../interfaces/V2Errors.sol";
@@ -13,9 +13,9 @@ import {PriceLib} from "./lib/PriceLib.sol";
 /// @title DataStreamsSource
 /// @notice Settlement source 3 (ADR-05), BUILT AND DISABLED: Chainlink Data Streams RWA Advanced (v11) reports, pushed
 ///         by keepers, verified through the chain's VerifierProxy, turned into Stock Token prices and kept as a
-///         per-underlying ring of observations that {windowPrice} time-weights. No deploy script registers it for any
-///         market; the owner enables it per market once Chainlink Data Streams credentials exist
-///         (docs/V2-DATA-STREAMS.md).
+///         per-underlying ring of observations that {windowPrice} time-weights. DeployV8 DEPLOYS this contract (it has
+///         an address on chain, disabled); no script REGISTERS it as a source for any market (RegisterMarkets lists
+///         Chainlink and the pool only). The owner enables it per market once credentials exist (V2-DATA-STREAMS.md).
 /// @dev UNITS. Prices are USDG base units (6 dp) per whole share (ADR-04); times are unix seconds unless a name says
 ///      otherwise. Report schema and verifier surface: see src/v2/oracle/DataStreamsDeps.sol, which cites the
 ///      Chainlink documentation and smartcontractkit sources (commits and dates) they were taken from.
@@ -87,7 +87,7 @@ import {PriceLib} from "./lib/PriceLib.sol";
 ///
 ///      Every external read of the token and the proxy's reply is a raw call with lengths checked before decoding: a
 ///      typed call to a target that answers short data reverts in the caller, where try/catch cannot catch it.
-contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransient {
+contract DataStreamsSource is IPriceSource, Managed, ReentrancyGuardTransient {
     /// @notice Why {submit} did not store a report (the {ReportSkipped} reason).
     enum SkipReason {
         /// @dev Stored (never emitted).
@@ -124,12 +124,17 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
         BadPrice
     }
 
-    /// @notice One stored observation. One slot.
+    /// @notice One stored observation. One slot (40 + 128 + 16 = 184 bits).
     struct Observation {
         /// @dev Unix seconds: the report's `observationsTimestamp`.
         uint40 observedAt;
         /// @dev USDG base units (6 dp) per whole Stock Token share: equity mid x uiMultiplier at submit time.
         uint128 price;
+        /// @dev WHICH MULTIPLIER REGIME THIS PRICE BELONGS TO (SEC-20). `price` bakes in the `uiMultiplier` read
+        ///      at submit, so two observations taken either side of an issuer corporate action are denominated
+        ///      differently and averaging them is meaningless. This counter, bumped by {_noteMultiplier} the
+        ///      first time a new multiplier is seen, is what lets {_window} notice that rather than blend them.
+        uint16 multiplierEpoch;
     }
 
     /// @notice What {record} stored for (underlying, expiry). One slot.
@@ -163,6 +168,9 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
         uint40 lastAt;
         /// @dev Seconds. Largest gap between consecutive observations inside the window.
         uint40 maxGap;
+        /// @dev SEC-20: the window contains observations from more than one multiplier regime, so its prices are
+        ///      not in one denomination and no average of them means anything. Never ok when true.
+        bool mixedMultiplier;
     }
 
     /// @notice Observations kept per underlying (architecture §3.3: at least 256).
@@ -186,6 +194,11 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
     bytes2 public constant V11_SECONDS_PREFIX = 0x000b;
     /// @notice Bytes of an ABI-encoded v11 report body: 14 static words.
     uint256 public constant REPORT_BODY_LENGTH = 448;
+    /// @notice A new `uiMultiplier` was seen for `underlying`; observations from here on carry `epoch` (SEC-20).
+    /// @dev Emitted from the submit path, so a keeper watching this knows a settlement window that straddles this
+    ///      moment will refuse rather than blend, and can plan to re-record after the window clears.
+    event MultiplierRegimeChanged(address indexed underlying, uint256 multiplier, uint16 epoch);
+
     /// @notice Decimals of `mid` in the equity streams (reference data directory multiplier 1e18).
     uint8 public constant REPORT_PRICE_DECIMALS = 18;
     /// @notice Scale of `uiMultiplier()` (ERC-8056: 1e18 = 1.0).
@@ -203,6 +216,18 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
     mapping(bytes32 feedId => address) public underlyingOf;
     /// @notice Observations stored for the underlying since its feed was last set; slot `i % RING_SIZE` holds the i-th.
     mapping(address underlying => uint256) public observationCount;
+
+    /// @notice The multiplier regime an underlying is currently in, and the multiplier that defined it (SEC-20).
+    /// @dev ONE SLOT, READ ONCE PER SUBMIT. `last` holds the `uiMultiplier` most recently seen by {_store};
+    ///      `epoch` counts how many times it has changed. `MAX_UI_MULTIPLIER` is 1e30 < 2^100, so uint240 is
+    ///      room to spare and the pair packs into a single word.
+    struct MultiplierState {
+        uint240 last;
+        uint16 epoch;
+    }
+
+    /// @notice Per-underlying multiplier regime. Public so a keeper can see a corporate action has been noticed.
+    mapping(address underlying => MultiplierState) public multiplierState;
     /// @notice {record} snapshots per underlying and expiry.
     mapping(address underlying => mapping(uint40 expiry => Snapshot)) public snapshots;
     /// @notice How many times {setFeed} changed the underlying's feed id (and restarted its history).
@@ -216,7 +241,7 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
 
     /// @notice The feed id of `underlying` changed (zero: removed). Its observation history restarts.
     event FeedSet(address indexed underlying, bytes32 indexed feedId);
-    /// @notice DEFAULT_ADMIN_ROLE allowed or disallowed `oracle` to call {pin}.
+    /// @notice CONFIG_ADMIN (v8 AccessManager, 24 h execution delay) allowed or disallowed `oracle` to call {pin}.
     event OracleSet(address indexed oracle, bool allowed);
     /// @notice {pin} tied `expiry` to the underlying's feed id `feedId` at {feedVersion} `version`.
     event FeedPinned(address indexed underlying, uint40 indexed expiry, bytes32 feedId, uint64 version);
@@ -235,14 +260,11 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
     /// @notice {record} stored the window price of (underlying, expiry), USDG 6 dp per share.
     event Recorded(address indexed underlying, uint40 indexed expiry, uint256 price, uint256 observations);
 
-    /// @param admin DEFAULT_ADMIN_ROLE holder (sets feed ids).
+    /// @param authority The `AccessManager` mapping this contract's selectors to roles (V8Roles).
     /// @param verifierProxy_ Chainlink Data Streams VerifierProxy of this chain.
-    constructor(address admin, address verifierProxy_) {
-        // A zero admin would leave the source permanently unconfigurable.
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
+    constructor(address authority, address verifierProxy_) Managed(authority) {
         if (verifierProxy_.code.length == 0) revert V2Errors.NoSource();
         verifierProxy = verifierProxy_;
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -250,7 +272,7 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Sets or removes the Data Streams feed of `underlying`.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). `feedId == 0` removes it. Setting the id it already has
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). `feedId == 0` removes it. Setting the id it already has
     ///      changes nothing. Any change restarts the underlying's observation history (a different stream's prints are
     ///      not this one's); snapshots already recorded stay. Reverts V2Errors.UnsupportedAsset for a zero underlying
     ///      or one whose `uiMultiplier()` does not answer in (0, MAX_UI_MULTIPLIER]; V2Errors.NoSource for a feed id
@@ -259,8 +281,7 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
     ///      change bumps {feedVersion}: every pinned expiry whose window is not recorded yet stops being priced here.
     /// @param underlying 18-dp Stock Token.
     /// @param feedId v11 Regular Hours feed id, or zero to remove.
-    function setFeed(address underlying, bytes32 feedId) external nonReentrant {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    function setFeed(address underlying, bytes32 feedId) external nonReentrant restricted {
         if (underlying == address(0)) revert V2Errors.UnsupportedAsset();
         bytes32 old = feedIdOf[underlying];
         if (feedId == old) return;
@@ -280,12 +301,11 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
     }
 
     /// @notice Allows or disallows `oracle` to call {pin}.
-    /// @dev DEFAULT_ADMIN_ROLE only (V2Errors.NotAuthorized). An allow-list for the reason ChainlinkFeedSource.setOracle
+    /// @dev CONFIG_ADMIN only (V2Errors.NotAuthorized). An allow-list for the reason ChainlinkFeedSource.setOracle
     ///      gives: two SettlementOracles may share this source while a market migrates.
     /// @param oracle SettlementOracle.
     /// @param allowed True to allow.
-    function setOracle(address oracle, bool allowed) external nonReentrant {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) revert V2Errors.NotAuthorized();
+    function setOracle(address oracle, bool allowed) external nonReentrant restricted {
         isOracle[oracle] = allowed;
         emit OracleSet(oracle, allowed);
     }
@@ -485,7 +505,9 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
         uint40 at = uint40(observedAt);
         // casting to 'uint128' is safe because the line above the cast returns for price > PriceLib.MAX_PRICE
         // forge-lint: disable-next-line(unsafe-typecast)
-        _ring[underlying][count % RING_SIZE] = Observation({observedAt: at, price: uint128(price)});
+        _ring[underlying][count % RING_SIZE] = Observation({
+            observedAt: at, price: uint128(price), multiplierEpoch: _noteMultiplier(underlying, multiplier)
+        });
         observationCount[underlying] = count + 1;
         emit ObservationStored(underlying, feedId, at, price, r.mid, multiplier);
         return SkipReason.None;
@@ -523,6 +545,9 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
         uint256 firstPrice = last.price;
         uint256 used = 1;
         uint256 maxGap;
+        // SEC-20: every observation the mean is taken over must belong to the newest one's multiplier regime.
+        uint16 epoch = last.multiplierEpoch;
+        bool mixed;
         // Complete when the ring still holds what precedes the window's first observation, or never wrapped.
         bool complete = oldest == 0;
         for (uint256 k = lo; k > oldest;) {
@@ -533,6 +558,7 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
                 break;
             }
             // Stored observations are strictly increasing in time ({_store}'s spacing rule), so this cannot underflow.
+            if (o.multiplierEpoch != epoch) mixed = true;
             uint256 gap = newer - o.observedAt;
             if (gap > maxGap) maxGap = gap;
             weighted += uint256(o.price) * gap;
@@ -549,7 +575,15 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
         w.lastAt = last.observedAt;
         // forge-lint: disable-next-line(unsafe-typecast)
         w.maxGap = uint40(maxGap);
-        w.ok = complete && used >= MIN_OBSERVATIONS && maxGap <= MAX_GAP && newer <= uint256(start) + MAX_GAP
+        w.mixedMultiplier = mixed;
+        // SEC-20 IS THE `!mixed` TERM, and it is a REFUSAL rather than a correction on purpose. The stored prices
+        // either side of a corporate action are in different denominations and nothing here can convert between
+        // them: re-scaling the older ones would need the multiplier that was in force when each was taken, which
+        // is not stored, and applying today's multiplier to all of them is a different wrong answer. So the
+        // window declines to answer. `record` then stores nothing, {SettlementOracle} sees this source produce
+        // no price, and the expiry stays unfinalised for it -- loud, and resolvable by the guardian/admin path --
+        // instead of finalising a blended number that looks ordinary.
+        w.ok = !mixed && complete && used >= MIN_OBSERVATIONS && maxGap <= MAX_GAP && newer <= uint256(start) + MAX_GAP
             && uint256(last.observedAt) + MAX_GAP >= end && uint256(end) + MAX_REPORT_AGE < block.timestamp
             && !_oraclePaused(underlying);
         if (w.ok) w.price = weighted / (end - start);
@@ -652,6 +686,38 @@ contract DataStreamsSource is IPriceSource, AccessControl, ReentrancyGuardTransi
         (bool success, bytes memory ret) = underlying.staticcall(abi.encodeCall(IOraclePausable.oraclePaused, ()));
         if (!success || ret.length < 32) return true;
         return abi.decode(ret, (uint256)) != 0;
+    }
+
+    /// @dev Records which multiplier regime `multiplier` belongs to and returns it, bumping the counter the first
+    ///      time a new value is seen (SEC-20).
+    ///
+    ///      WHY A COUNTER AND NOT THE MULTIPLIER ITSELF: {Observation} has 88 bits spare in its slot and
+    ///      `MAX_UI_MULTIPLIER` needs about 100, so the multiplier does not fit. What {_window} actually needs is
+    ///      not the value but the ANSWER TO "were these prices denominated the same way", and a counter answers
+    ///      that in 16 bits.
+    ///
+    ///      THE WRAP IS DELIBERATE AND HARMLESS. At 2^16 the counter wraps, so two regimes 65,536 corporate
+    ///      actions apart would alias. A settlement window is 30 minutes; a window that straddled that many
+    ///      multiplier changes is not a scenario this contract can be made correct for by a wider counter.
+    function _noteMultiplier(address underlying, uint256 multiplier) private returns (uint16) {
+        MultiplierState storage m = multiplierState[underlying];
+        // casting to 'uint240' is safe: the caller has already checked multiplier <= MAX_UI_MULTIPLIER (1e30).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint240 seen = uint240(multiplier);
+        if (m.last == 0) {
+            // FIRST OBSERVATION FOR THIS UNDERLYING: epoch 0 is a regime like any other, not a special case.
+            m.last = seen;
+            return m.epoch;
+        }
+        if (m.last != seen) {
+            m.last = seen;
+            unchecked {
+                // Wrapping is intended; see the note above.
+                m.epoch = m.epoch + 1;
+            }
+            emit MultiplierRegimeChanged(underlying, multiplier, m.epoch);
+        }
+        return m.epoch;
     }
 
     /// @dev The token's display multiplier, read now. Not ok when the read fails, is short, is 0 or exceeds

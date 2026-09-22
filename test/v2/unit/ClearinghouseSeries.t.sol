@@ -69,7 +69,7 @@ contract ClearinghouseSeriesTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory off = _cfg(address(oracle));
         off.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), off);
+        _reconfigure(ch, address(nvda), off);
         assertEq(_call(K_220, FRI_2026_09_11), longId, "existing id returns before pause and market checks");
 
         vm.warp(FRI_2026_09_11 + 1 days);
@@ -84,7 +84,7 @@ contract ClearinghouseSeriesTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory off = _cfg(address(oracle));
         off.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), off);
+        _reconfigure(ch, address(nvda), off);
         vm.expectRevert(V2Errors.MarketDisabled.selector);
         _call(K_220, FRI_2026_09_18);
     }
@@ -128,7 +128,9 @@ contract ClearinghouseSeriesTest is ClearinghouseTestBase {
         vm.expectRevert(V2Errors.BadExpiry.selector);
         _call(K_220, FRI_2026_09_18);
 
-        uint40 special = FRI_2026_09_18 + 1 hours;
+        // T-479: Thursday 15:00, inside a session. Friday 17:00 is now refused by the calendar (Friday is a holiday
+        // here and 17:00 is after the close), and this row checks that createSeries accepts a whitelisted instant.
+        uint40 special = FRI_2026_09_18 - 1 days - 1 hours;
         vm.prank(admin);
         calendar.setSpecialExpiry(special, true);
         uint256 longId = _call(K_220, special);
@@ -201,7 +203,7 @@ contract ClearinghouseSeriesTest is ClearinghouseTestBase {
         V2Types.MarketConfig memory cfg = _cfg(address(other));
         cfg.exerciseFeeBps = 200;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
 
         uint256 afterId = _call(K_240, FRI_2026_09_18);
         assertEq(ch.series(before).oracle, address(oracle));
@@ -232,7 +234,7 @@ contract ClearinghouseSeriesTest is ClearinghouseTestBase {
     function test_createSeries_pinsOnTheOracleItPinsIntoTheSeries() public {
         MockSettlementOracle other = new MockSettlementOracle();
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), _cfg(address(other)));
+        _reconfigure(ch, address(nvda), _cfg(address(other)));
         uint256 longId = _call(K_220, FRI_2026_09_18);
         assertEq(ch.series(longId).oracle, address(other), "series oracle");
         assertTrue(other.pinned(address(nvda), FRI_2026_09_18), "pinned there");

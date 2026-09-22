@@ -235,10 +235,13 @@ contract ClearinghouseRedeemTest is ClearinghouseTestBase {
         uint256 perUnit = uint256(strike) / 100;
         usdg.mint(alice, 2 * uint256(maxUnits) * perUnit);
         _deposit(alice, address(usdg), 2 * uint256(maxUnits) * perUnit);
-        vm.startPrank(alice);
+        // T-603: a startPrank block cannot mint -- `alice` is not allowlisted (Clearinghouse.sol:641). She
+        // authorises the allowlisted test contract, and both mints then run as that contract, which satisfies
+        // :641 and, as her operator, :642. Writer and receiver are unchanged.
+        vm.prank(alice);
+        ch.setOperator(address(this), true);
         ch.mint(bigPut, maxUnits, alice, bob);
         ch.mint(bigPut, maxUnits, alice, bob);
-        vm.stopPrank();
         assertEq(ch.balanceOf(bob, bigPut), 2 * uint256(maxUnits));
         assertEq(ch.openInterest(address(nvda), FRI_2026_09_18), 2 * uint256(maxUnits));
 

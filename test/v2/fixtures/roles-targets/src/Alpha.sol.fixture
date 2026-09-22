@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+/// @dev Fixture: a manager-gated contract. It declares a `restricted` selector, so the manifest MUST
+///      list it in .targets and may never write it off in .unmanagedTargets.
+contract Alpha {
+    function setThing(uint256 v) external restricted {}
+    function readThing() external view returns (uint256) {}
+}

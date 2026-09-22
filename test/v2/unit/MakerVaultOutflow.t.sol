@@ -302,25 +302,46 @@ contract MakerVaultOutflowTest is MakerTestBase {
         assertLe(_used(), frozenAt, "unwinding only ever credits");
     }
 
-    /// @dev The admin is booked but never checked, so treasury unwinding is never blocked by the cap and an
-    ///      admin-placed bid the quoter cancels gives back exactly what it took. Safe only while the mm-bot key never
-    ///      holds DEFAULT_ADMIN_ROLE, which VerifyV2 enforces (v7 design §4.6.4, residual §10.4).
-    function test_outflowCap_adminBookedNotChecked() public {
-        vm.startPrank(admin);
+    /// @dev INTERFACE_VERSION 8: THE CAP APPLIES TO EVERY CALLER. v7 booked the admin's calls and never checked
+    ///      them, which was only safe while the mm-bot key never held DEFAULT_ADMIN_ROLE -- a property a deploy check
+    ///      had to keep asserting about a key rather than one the contract held. The exemption is gone, and the
+    ///      Admin Safe is itself a QUOTER member (roles.v8.json `holders`), so the caller v7 exempted is exactly the
+    ///      caller this now bounds. Unwinding is still never blocked, because unwinding only ever CREDITS.
+    function test_outflowCap_appliesToEveryCallerIncludingTheAdminSafe() public {
+        vm.prank(admin);
         uint256 a = vault.place(callId, BID, P20_00, 10_000, 0);
-        uint256 b = vault.place(tslaId, BID, P20_00, 10_000, 0);
-        vm.stopPrank();
-        assertEq(_used(), 4_000e6, "4,000 USDG booked, past the 2,500 cap, with no revert");
-        assertEq(_available(), 0);
+        assertEq(_used(), 2_000e6, "the Admin Safe's bid is charged like anyone else's");
+        assertEq(_available(), 500e6);
 
-        vm.prank(quoter);
-        vm.expectRevert(abi.encodeWithSelector(V2Errors.OutflowCapExceeded.selector, 0, 10_000_000));
-        vault.place(putId, BID, P2_00, 500, 0);
+        // The second bid would take the Safe past the cap, and is refused -- in v7 it was allowed.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.OutflowCapExceeded.selector, 500e6, 2_000e6));
+        vault.place(tslaId, BID, P20_00, 10_000, 0);
 
+        // The quoter shares one bucket with it: there is no per-caller budget to split.
         vm.prank(quoter);
-        vault.cancel(_ids(a, b));
-        assertEq(_used(), 0, "the cancels credit back exactly what the admin's bids charged");
-        assertEq(_available(), MAX_DAILY_OUTFLOW, "and no more: an admin bid cannot create budget");
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.OutflowCapExceeded.selector, 500e6, 1_000e6));
+        vault.place(putId, BID, P20_00, 5_000, 0);
+
+        // Cancelling gives back exactly what it took, from either lane, and never builds a budget.
+        vm.prank(quoter);
+        vault.cancel(_ids(a));
+        assertEq(_used(), 0, "the cancel credits back exactly what the Safe's bid charged");
+        assertEq(_available(), MAX_DAILY_OUTFLOW, "and no more");
+    }
+
+    /// @dev The treasury lane is not the quoting lane: a TREASURY_ADMIN withdrawal is not booked at all, so an
+    ///      exhausted cap never traps protocol money in the vault, and a withdrawal never eats the quoter's budget.
+    ///      It cannot be used as an escape either -- {MakerVault.withdraw} pays {treasury} and takes no recipient.
+    function test_outflowCap_treasuryWithdrawalIsNotBooked() public {
+        _vaultPlace(callId, BID, P20_00, 10_000);
+        assertEq(_used(), 2_000e6, "the cap is nearly spent");
+
+        uint256 before = usdg.balanceOf(treasury);
+        vm.prank(admin);
+        vault.withdraw(address(usdg), 50_000e6);
+        assertEq(usdg.balanceOf(treasury) - before, 50_000e6, "the treasury got it");
+        assertEq(_used(), 2_000e6, "and the bucket did not move");
     }
 
     /// @dev The guarantee of v7 design §4.6.4, fuzzed: whatever order and timing a compromised quoter picks, the net
@@ -355,7 +376,9 @@ contract MakerVaultOutflowTest is MakerTestBase {
         }
 
         uint256 cashNow = _cash();
-        if (cashNow >= cashStart) return;
+        // T-OP-046: a sequence that left the vault no poorer has no net outflow to bound; forge counts it as a
+        // rejected input rather than a pass that asserted nothing.
+        vm.assume(cashNow < cashStart);
         uint256 elapsed = vm.getBlockTimestamp() - start;
         uint256 limit = uint256(MAX_DAILY_OUTFLOW) + uint256(MAX_DAILY_OUTFLOW) * elapsed / OUTFLOW_WINDOW;
         assertLe(cashStart - cashNow, limit, "net USDG out <= cap x (1 + t / OUTFLOW_WINDOW)");
@@ -398,10 +421,12 @@ contract MakerVaultOutflowTest is MakerTestBase {
         assertEq(ch.mintFee(put_, RENT_UNITS), 100_741, "put rent, USDG base units, rounded up");
 
         // `closeRefund` is clamped to the rent the series actually holds, so a refund needs a mint to have paid one.
-        vm.startPrank(alice);
+        if (!ch.isOperator(alice, address(this))) {
+            vm.prank(alice);
+            ch.setOperator(address(this), true);
+        }
         ch.mint(call_, RENT_UNITS, alice, alice);
         ch.mint(put_, RENT_UNITS, alice, alice);
-        vm.stopPrank();
 
         _skip(6 hours);
         assertEq(ch.closeRefund(call_, RENT_UNITS), 489_417_989_417_989, "call refund, rounded down");
@@ -482,7 +507,7 @@ contract MakerVaultOutflowTest is MakerTestBase {
         V2Types.MarketConfig memory cfg = ch.market(address(nvda));
         cfg.mintFeePpm = NVDA_MINT_FEE_PPM;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), cfg);
+        _reconfigure(ch, address(nvda), cfg);
         longId = ch.createSeries(address(nvda), isPut, isPut ? RENT_PUT_STRIKE : RENT_CALL_STRIKE, FRI_2026_09_18);
         assertEq(ch.series(longId).mintFeePpm, NVDA_MINT_FEE_PPM, "the new series pinned the rate");
         assertEq(ch.series(callId).mintFeePpm, 0, "and the fixture's own series still charge nothing");

@@ -3,7 +3,10 @@ pragma solidity 0.8.28;
 
 import {IERC1155Errors, IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {MakerTestBase} from "./MakerBase.t.sol";
+import {V8Roles} from "../../../src/v2/access/V8Roles.sol";
 import {IOrderBook} from "../../../src/v2/interfaces/IOrderBook.sol";
 import {V2Constants} from "../../../src/v2/interfaces/V2Constants.sol";
 import {V2Errors} from "../../../src/v2/interfaces/V2Errors.sol";
@@ -27,11 +30,28 @@ contract MakerVaultQuoterTest is MakerTestBase {
         assertEq(usdg.allowance(address(vault), address(book)), type(uint256).max, "USDG allowance to the book");
         assertEq(usdg.allowance(address(vault), address(ch)), 0, "no standing allowance to the clearinghouse");
         assertTrue(ch.thirdPartyRedeemAllowed(address(vault)), "anyone may push the vault's redemptions");
-        assertTrue(vault.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin), "admin");
-        assertTrue(vault.hasRole(V2Constants.QUOTER_ROLE, quoter), "quoter");
-        assertEq(vault.QUOTER_ROLE(), V2Constants.QUOTER_ROLE, "role id");
-        assertFalse(vault.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, quoter), "quoter is not admin");
+        assertEq(vault.treasury(), treasury, "the constructor pinned the only exit");
+        assertEq(vault.authority(), address(manager), "the AccessManager is the authority");
         assertTrue(vault.supportsInterface(type(IERC1155Receiver).interfaceId), "ERC-1155 receiver");
+        assertTrue(vault.supportsInterface(type(IERC165).interfaceId), "ERC-165");
+        // INTERFACE_VERSION 8: roles are not on the target any more, so AccessControl is no longer advertised.
+        assertFalse(vault.supportsInterface(type(IAccessControl).interfaceId), "no AccessControl in v8");
+
+        // The two lanes are disjoint on the manager: TREASURY_ADMIN cannot quote, QUOTER cannot reach the money.
+        (bool adminIsTreasury,) = manager.hasRole(V8Roles.TREASURY_ADMIN, admin);
+        (bool quoterIsTreasury,) = manager.hasRole(V8Roles.TREASURY_ADMIN, quoter);
+        (bool quoterIsQuoter,) = manager.hasRole(V8Roles.QUOTER, quoter);
+        assertTrue(adminIsTreasury, "admin holds TREASURY_ADMIN");
+        assertTrue(quoterIsQuoter, "quoter holds QUOTER");
+        assertFalse(quoterIsTreasury, "the mm-bot key is never in the treasury lane");
+        assertEq(
+            manager.getTargetFunctionRole(address(vault), MakerVault.withdraw.selector),
+            V8Roles.TREASURY_ADMIN,
+            "withdraw is TREASURY_ADMIN"
+        );
+        assertEq(
+            manager.getTargetFunctionRole(address(vault), MakerVault.place.selector), V8Roles.QUOTER, "place is QUOTER"
+        );
 
         MakerVault.Limits memory l = vault.limits();
         assertEq(l.maxSeriesUnits, MAX_SERIES_UNITS);
@@ -47,44 +67,76 @@ contract MakerVaultQuoterTest is MakerTestBase {
         assertEq(usdg.balanceOf(address(vault)), VAULT_USDG, "funded");
     }
 
-    function test_constructor_rejectsZeroAdminAndBadLimits() public {
+    /// @dev INTERFACE_VERSION 8: a code-less authority is `NoSource` (a vault whose manager has no code could never
+    ///      be gated and could never be repointed), a zero treasury is `NotAuthorized` (money must have an exit), and
+    ///      the bps ceilings are unchanged.
+    function test_constructor_rejectsBadAuthorityTreasuryAndLimits() public {
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new MakerVault(IOrderBook(address(book)), address(0), treasury, _defaultLimits());
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new MakerVault(IOrderBook(address(book)), makeAddr("eoaAuthority"), treasury, _defaultLimits());
+
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        new MakerVault(IOrderBook(address(book)), address(0), quoter, _defaultLimits());
+        new MakerVault(IOrderBook(address(book)), address(manager), address(0), _defaultLimits());
 
         MakerVault.Limits memory l = _defaultLimits();
         l.askToleranceBps = 10_001;
         vm.expectRevert(V2Errors.CeilingExceeded.selector);
-        new MakerVault(IOrderBook(address(book)), admin, quoter, l);
-
-        MakerVault noQuoter = new MakerVault(IOrderBook(address(book)), admin, address(0), _defaultLimits());
-        assertFalse(noQuoter.hasRole(V2Constants.QUOTER_ROLE, address(0)), "zero quoter grants nothing");
+        new MakerVault(IOrderBook(address(book)), address(manager), treasury, l);
     }
 
     /*//////////////////////////////////////////////////////////////
                            TREASURY (ADMIN)
     //////////////////////////////////////////////////////////////*/
 
-    function test_admin_depositMeasuresAndWithdrawSendsAnywhere() public {
-        _fund(admin, 5_000e6, 0, 0);
+    /// @dev INTERFACE_VERSION 8: {MakerVault.deposit} is permissionless and {MakerVault.withdraw} pays {treasury}
+    ///      and has no `to` argument at all, so the caller of an exit cannot choose where the money lands.
+    function test_depositIsPermissionlessAndWithdrawOnlyEverPaysTheTreasury() public {
+        _fund(stranger, 5_000e6, 0, 0);
+        vm.startPrank(stranger);
+        usdg.approve(address(vault), type(uint256).max);
         vm.expectEmit(address(vault));
-        emit MakerVault.Deposited(address(usdg), admin, 5_000e6);
-        vm.prank(admin);
-        assertEq(vault.deposit(address(usdg), 5_000e6), 5_000e6, "received");
+        emit MakerVault.Deposited(address(usdg), stranger, 5_000e6);
+        assertEq(vault.deposit(address(usdg), 5_000e6), 5_000e6, "a stranger may fund the vault");
+        vm.stopPrank();
         assertEq(usdg.balanceOf(address(vault)), VAULT_USDG + 5_000e6);
 
         vm.expectEmit(address(vault));
         emit MakerVault.Withdrawn(address(usdg), treasury, 1_000e6);
         vm.prank(admin);
-        vault.withdraw(address(usdg), 1_000e6, treasury);
+        vault.withdraw(address(usdg), 1_000e6);
         assertEq(usdg.balanceOf(treasury), 1_000e6, "treasury received");
 
         vm.prank(admin);
-        vault.withdraw(address(nvda), 1e18, treasury);
+        vault.withdraw(address(nvda), 1e18);
         assertEq(nvda.balanceOf(treasury), 1e18, "any asset");
+
+        // The v7 form with a free recipient is gone: nothing answers that selector any more.
+        (bool ok,) = address(vault)
+            .call(abi.encodeWithSignature("withdraw(address,uint256,address)", address(usdg), uint256(1), stranger));
+        assertFalse(ok, "withdraw(address,uint256,address) is deleted in v8");
+    }
+
+    /// @dev Only TREASURY_ADMIN may move the exit, and it is never zero.
+    function test_setTreasury_isTreasuryAdminOnlyAndNeverZero() public {
+        address next = makeAddr("nextTreasury");
+        vm.prank(quoter);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vault.setTreasury(next);
 
         vm.prank(admin);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.withdraw(address(usdg), 1, address(0));
+        vault.setTreasury(address(0));
+
+        vm.expectEmit(address(vault));
+        emit MakerVault.TreasurySet(next);
+        vm.prank(admin);
+        vault.setTreasury(next);
+        assertEq(vault.treasury(), next, "moved");
+
+        vm.prank(admin);
+        vault.withdraw(address(usdg), 1);
+        assertEq(usdg.balanceOf(next), 1, "and the exit follows it");
     }
 
     function test_admin_withdrawPositionRefreshesExposure() public {
@@ -95,11 +147,13 @@ contract MakerVaultQuoterTest is MakerTestBase {
         vm.expectEmit(address(vault));
         emit MakerVault.PositionWithdrawn(callId, treasury, 40);
         vm.prank(admin);
-        vault.withdrawPosition(callId, 40, treasury);
+        vault.withdrawPosition(callId, 40);
         assertEq(ch.balanceOf(treasury, callId), 40, "treasury holds the longs");
         assertEq(vault.seriesNotional(callId), 60 * uint256(CALL_STRIKE) / 100, "refreshed to 60");
     }
 
+    /// @dev The Admin Safe is a QUOTER member in `roles.v8.json`, so it can still cancel and close in an emergency.
+    ///      What it no longer gets is an exemption from the outflow cap ({MakerVaultOutflowTest}).
     function test_admin_canDoWhatTheQuoterDoes() public {
         vm.prank(admin);
         uint256 id = vault.place(callId, BID, P2_00, 100, 0);
@@ -108,9 +162,9 @@ contract MakerVaultQuoterTest is MakerTestBase {
         assertTrue(_order(id).cancelled, "admin cancelled");
     }
 
+    /// @dev Rotating a compromised quoter key is a manager call and never touches the vault (INTERFACE_VERSION 8).
     function test_revokedQuoterIsLockedOut() public {
-        vm.prank(admin);
-        vault.revokeRole(V2Constants.QUOTER_ROLE, quoter);
+        manager.revokeRole(V8Roles.QUOTER, quoter);
         vm.prank(quoter);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         vault.place(callId, BID, P2_00, 100, 0);
@@ -316,25 +370,33 @@ contract MakerVaultQuoterTest is MakerTestBase {
         vault.take(p);
     }
 
+    /// @dev The quoter lane cannot reach the money lane, and the vault has no role table left to attack: v7's
+    ///      `grantRole` / `revokeRole` / `setAuthority` are either gone or the manager's own.
     function test_quoterCannotReachTreasuryOrRoles() public {
         MakerVault.Limits memory loose = _defaultLimits();
         loose.maxBidBpsOfSpot = 10_000;
         vm.startPrank(quoter);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.withdraw(address(usdg), 1, quoter);
+        vault.withdraw(address(usdg), 1);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.withdrawPosition(callId, 1, quoter);
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.deposit(address(usdg), 1);
+        vault.withdrawPosition(callId, 1);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         vault.setLimits(loose);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.grantRole(V2Constants.QUOTER_ROLE, stranger);
+        vault.setTreasury(quoter);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.grantRole(V2Constants.DEFAULT_ADMIN_ROLE, quoter);
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
-        vault.revokeRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
+        vault.setAuthority(quoter);
         vm.stopPrank();
+
+        bytes[2] memory goneWithAccessControl = [
+            abi.encodeWithSignature("grantRole(bytes32,address)", V2Constants.QUOTER_ROLE, stranger),
+            abi.encodeWithSignature("revokeRole(bytes32,address)", V2Constants.DEFAULT_ADMIN_ROLE, admin)
+        ];
+        for (uint256 i; i < goneWithAccessControl.length; ++i) {
+            vm.prank(quoter);
+            (bool ok,) = address(vault).call(goneWithAccessControl[i]);
+            assertFalse(ok, "v7 AccessControl entry point must not exist on a v8 target");
+        }
     }
 
     function test_strangerCannotQuote() public {
@@ -343,6 +405,8 @@ contract MakerVaultQuoterTest is MakerTestBase {
         vm.startPrank(stranger);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         vault.depositToClearinghouse(address(usdg), 1);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vault.withdraw(address(usdg), 1);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         vault.withdrawFromClearinghouse(address(usdg), 1);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
@@ -496,7 +560,7 @@ contract MakerVaultQuoterTest is MakerTestBase {
         book.placeFor(address(vault), callId, WRITE, P2_00, 100, 0);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         book.placeFor(address(vault), callId, BID, P2_00, 100, 0);
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        vm.expectRevert(V2Errors.NotMinter.selector);
         ch.mint(callId, 1, address(vault), quoter);
         vm.expectRevert(
             abi.encodeWithSelector(IERC1155Errors.ERC1155MissingApprovalForAll.selector, quoter, address(vault))

@@ -12,9 +12,10 @@ import {MockSettlementOracle} from "../../../src/v2/mocks/MockSettlementOracle.s
 import {MakerVault} from "../../../src/v2/mm/MakerVault.sol";
 
 /// @notice Drives a real MakerVault, OrderBook and Clearinghouse for {MakerVaultOutflowInvariantTest}: a compromised
-///         QUOTER_ROLE key quoting and trading at any price the guards allow, three outsiders resting orders and
-///         filling the vault's, a keeper pruning, USDG arriving from outside, the spot moving, and time passing —
-///         all of it strictly BEFORE the series expire, so nothing settles and no redemption pays the vault.
+///         QUOTER key quoting and trading at any price the guards allow, the ADMIN SAFE quoting beside it (it is a
+///         QUOTER member too), three outsiders resting orders and filling the vault's, a keeper pruning, USDG
+///         arriving from outside, the spot moving, and time passing — all of it strictly BEFORE the series expire,
+///         so nothing settles and no redemption pays the vault.
 /// @dev THE QUOTER IS THE ADVERSARY. Every action it takes is legal: bids at or under the bid cap, asks at or above
 ///      the intrinsic-value floor, takes in both directions, replaces up and down, cancels, closes, both ledger moves,
 ///      owed claims and syncs. The handler never reverts — it bounds every argument into the legal range and swallows
@@ -33,10 +34,17 @@ import {MakerVault} from "../../../src/v2/mm/MakerVault.sol";
 ///        - {clock}: the simulated time. Never read back from `block.timestamp`, which via_ir may fold to its first
 ///          value in a frame.
 ///
-///      NO ADMIN QUOTING, NO ADMIN WITHDRAWAL. The admin is booked but never checked ({MakerVault} NatSpec), so an
-///      admin quote would legitimately push `used` past the cap and an admin withdrawal would legitimately take USDG
-///      out of the measure; both are covered by MakerVaultOutflowTest instead. Here the admin only deposits, so
-///      `used <= maxDailyOutflow` is exact.
+///      TWO QUOTING CALLERS, NO EXEMPT ONE (INTERFACE_VERSION 8). v7 booked the admin's calls and never checked
+///      them, so this handler had to keep the admin out of the quoting actions or `used <= maxDailyOutflow` would
+///      have been false for a legal reason. C8-05 removed that exemption, so the admin now quotes here through
+///      {safeBid} and {safeCancel} -- the Admin Safe is a QUOTER member in `roles.v8.json` -- and the bound is
+///      asserted over BOTH callers sharing one bucket. That is what turns
+///      `invariant_usedNeverAboveTheCapForEveryCaller` from a statement about one key into a statement about the
+///      contract.
+///      STILL NOT HERE: a TREASURY_ADMIN withdrawal. {MakerVault.withdraw} is not booked (it is not quoting) and
+///      legitimately takes USDG out of the measure, so it would move the left-hand side of bound 1 without being an
+///      outflow the cap is about. It is covered by MakerVaultOutflowTest and by the treasury-exit invariant, whose
+///      whole subject is where that money can land.
 contract MakerVaultOutflowHandler is Test {
     /*//////////////////////////////////////////////////////////////
                                  WIRING
@@ -67,6 +75,10 @@ contract MakerVaultOutflowHandler is Test {
     uint256 public immutable start;
     uint256 public immutable deadline;
 
+    /// @notice The vault's USDG cash when the campaign started: the left-hand side of the bound, mirrored here so the
+    ///         handler can tell, per call, whether the bound's assertion branch is the one about to run.
+    uint256 public immutable initialCash;
+
     /*//////////////////////////////////////////////////////////////
                                 GHOSTS
     //////////////////////////////////////////////////////////////*/
@@ -80,6 +92,8 @@ contract MakerVaultOutflowHandler is Test {
 
     /// @notice How often each shape of thing actually happened.
     uint256 public bidsPlaced;
+    /// @notice Bids the ADMIN SAFE rested: the caller v7 exempted from the cap.
+    uint256 public safeBidsPlaced;
     uint256 public asksPlaced;
     uint256 public replaces;
     uint256 public buysFilled;
@@ -92,6 +106,36 @@ contract MakerVaultOutflowHandler is Test {
     /// @notice The largest `used` the campaign ever reached.
     uint256 public peakUsed;
 
+    /// @notice T-OP-010. WHY {vaultOrdersFilledByOutsiders} IS WHAT IT IS. The outsider's `take` has two ways of
+    ///         leaving that counter at zero -- it RETURNED `(0,0,0)` (T-583's cause: no long to sell) or it REVERTED
+    ///         (a pause, a cap, a bad deadline) -- and until this row the second was swallowed by a bare `catch {}`,
+    ///         so a red `assertGt(vaultOrdersFilledByOutsiders, 0)` printed the same `0 <= 0` for both. These split
+    ///         them: {outsiderTakesReturnedZero} counts the first shape, {outsiderTakeReverts} the second, and
+    ///         {lastOutsiderTakeRevert} keeps the last revert data so the assertion can PRINT the reason.
+    uint256 public outsiderTakesReturnedZero;
+    uint256 public outsiderTakeReverts;
+    bytes public lastOutsiderTakeRevert;
+
+    /// @notice T-OP-011 COVERAGE GHOSTS. An invariant that never enters the state it protects is green for the same
+    ///         reason a broken one is. These count, per call, whether the post-call state the invariants are about to
+    ///         read is the interesting one: {netOutPositiveCalls} is the state
+    ///         `invariant_netOutflowIsBoundedByTheCapAndItsRefill` asserts in rather than returns early from,
+    ///         {usedNonZeroCalls} is the state `invariant_usedNeverAboveTheCapForEveryCaller` is about, and
+    ///         {creditCalls} is a call that gave budget BACK, which is the subject of
+    ///         `invariant_creditsNeverBuildABudget`. They are asserted deterministically in
+    ///         {MakerVaultOutflowInvariantTest.test_handlerExercisesEveryLeg}; a fuzz campaign rolls this state back
+    ///         between runs, so they are evidence about the scripted pass and a live figure inside one fuzz run.
+    /// @notice Calls after which the vault had paid out more than it can still get back.
+    uint256 public netOutPositiveCalls;
+    /// @notice Calls after which the outflow bucket held a charge.
+    uint256 public usedNonZeroCalls;
+    /// @notice Calls that lowered the bucket: escrow, income or a refill coming back.
+    uint256 public creditCalls;
+    /// @notice The largest net payout the campaign ever reached, in USDG base units.
+    uint256 public peakNetOut;
+    /// @dev `used` after the previous call, so a credit can be told from a charge.
+    uint256 private lastUsed;
+
     constructor(
         Clearinghouse ch_,
         OrderBook book_,
@@ -102,7 +146,8 @@ contract MakerVaultOutflowHandler is Test {
         address[4] memory actors, // quoter, admin, keeper, funder
         address[3] memory outsiders_,
         uint256[3] memory series_,
-        uint256 deadline_
+        uint256 deadline_,
+        uint256 initialCash_
     ) {
         ch = ch_;
         book = book_;
@@ -116,6 +161,7 @@ contract MakerVaultOutflowHandler is Test {
         clock = vm.getBlockTimestamp();
         start = clock;
         deadline = deadline_;
+        initialCash = initialCash_;
     }
 
     /// @dev Every action first moves the clock by `gap` seconds (0-30 min), never past {deadline}, so the campaign stays
@@ -127,6 +173,15 @@ contract MakerVaultOutflowHandler is Test {
         _;
         uint256 used = _used();
         if (used > peakUsed) peakUsed = used;
+        if (used != 0) ++usedNonZeroCalls;
+        if (used < lastUsed) ++creditCalls;
+        lastUsed = used;
+        uint256 left = initialCash + outsideInflow;
+        uint256 back = recoverable();
+        if (left > back) {
+            ++netOutPositiveCalls;
+            if (left - back > peakNetOut) peakNetOut = left - back;
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -325,6 +380,39 @@ contract MakerVaultOutflowHandler is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+                       THE ADMIN SAFE'S ACTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice The Admin Safe rests a bid of its own. It holds TREASURY_ADMIN **and** QUOTER, and from
+    ///         INTERFACE_VERSION 8 its bids are charged to, and refused by, the same bucket as the bot's.
+    /// @dev A bid is the charged leg: the book escrows its USDG at placement, which is exactly what {_bookOutflow}
+    ///      measures. So this is not a decorative second caller -- it competes for the same budget.
+    function safeBid(uint32 gap, uint8 which, uint128 price, uint64 units, uint32 life) external tick(gap) {
+        uint256 longId = _pick(which);
+        uint256 cap = _bidCap(longId);
+        if (cap < V2Constants.PRICE_TICK) return;
+        price = _tick(bound(price, V2Constants.PRICE_TICK, cap));
+        units = uint64(bound(units, 1, 10_000));
+        vm.prank(admin);
+        try vault.place(longId, V2Types.OrderKind.Bid, price, units, _validUntil(life)) returns (uint256 id) {
+            vaultOrderIds.push(id);
+            ++safeBidsPlaced;
+        } catch (bytes memory err) {
+            _countCapRevert(err);
+        }
+    }
+
+    /// @notice The Admin Safe cancels a vault order. Unwinding is never blocked, from either lane.
+    function safeCancel(uint32 gap, uint8 which) external tick(gap) {
+        (uint256 id,) = _liveVaultOrder(which);
+        if (id == 0) return;
+        vm.prank(admin);
+        try vault.cancel(_one(id)) {
+            ++cancels;
+        } catch {}
+    }
+
+    /*//////////////////////////////////////////////////////////////
                     OUTSIDERS, KEEPERS AND THE WORLD
     //////////////////////////////////////////////////////////////*/
 
@@ -351,11 +439,43 @@ contract MakerVaultOutflowHandler is Test {
         bool buying = o.kind != V2Types.OrderKind.Bid;
         uint128 limit = buying ? type(uint128).max : 1;
         vm.prank(filler);
-        try book.take(_paramsFor(filler, o.longId, buying, id, units, limit, !buying && who % 3 == 0)) returns (
+        // T-583. WRITE-TO-SELL IS DECIDED BY A DIFFERENT PART OF `who` THAN THE ONE THAT PICKS THE FILLER, and
+        // that separation is the whole fix. This read `!buying && who % 3 == 0` while the filler above is
+        // `outsiders[who % outsiders.length]` -- THE SAME MODULUS OVER THE SAME VALUE -- so permission to write a
+        // long to sell was reachable only for `outsiders[0]`. Every other outsider holds no longs, so `take`
+        // returned `(0,0,0)` and emitted `Taken(units: 0)` WITHOUT REVERTING; the `catch` never fired, `filled`
+        // was zero, and the counter below never moved. The remainder selects the filler; the QUOTIENT decides
+        // write-to-sell, and for `who` over its full range the two vary independently.
+        try book.take(
+            _paramsFor(filler, o.longId, buying, id, units, limit, !buying && (who / outsiders.length) % 2 == 0)
+        ) returns (
             uint64 filled, uint256, uint256
         ) {
             if (filled != 0) ++vaultOrdersFilledByOutsiders;
-        } catch {}
+            else ++outsiderTakesReturnedZero;
+        } catch (bytes memory err) {
+            // T-OP-010. The shape {quoterBid} already uses: capture the reason, feed the cap counter, and keep it.
+            _countCapRevert(err);
+            ++outsiderTakeReverts;
+            lastOutsiderTakeRevert = err;
+        }
+    }
+
+    /// @notice T-OP-010. The two causes of a zero {vaultOrdersFilledByOutsiders}, in one string for an assertion
+    ///         message: how many takes filled, how many returned `(0,0,0)`, how many reverted, and the last revert's
+    ///         data (its first four bytes are the error selector; `OutflowCapExceeded` is also counted in
+    ///         {capReverts}). A reader of a red `0 <= 0` no longer has to re-derive T-583 to know which it was.
+    function outsiderTakeDiagnosis() external view returns (string memory) {
+        return string.concat(
+            "filled=",
+            vm.toString(vaultOrdersFilledByOutsiders),
+            " returnedZero=",
+            vm.toString(outsiderTakesReturnedZero),
+            " reverted=",
+            vm.toString(outsiderTakeReverts),
+            " lastRevert=",
+            vm.toString(lastOutsiderTakeRevert)
+        );
     }
 
     /// @notice A keeper prunes the vault's expired orders. A pruned bid hands its escrow back with nothing booked,
@@ -373,7 +493,9 @@ contract MakerVaultOutflowHandler is Test {
         } catch {}
     }
 
-    /// @notice USDG arrives from outside a vault call: an admin deposit or a plain transfer. Never a budget.
+    /// @notice USDG arrives from outside a vault call: a permissionless deposit or a plain transfer. Never a budget.
+    /// @dev From INTERFACE_VERSION 8 {MakerVault.deposit} needs no role, so `viaAdmin` picks WHO deposits rather
+    ///      than whether the route is open at all; the funder is a plain address with no role anywhere.
     function usdgArrivesFromOutside(uint32 gap, bool viaAdmin, uint256 amount) external tick(gap) {
         amount = bound(amount, 1e6, 50_000e6);
         address from = viaAdmin ? admin : funder;
@@ -568,7 +690,9 @@ contract MakerVaultOutflowHandler is Test {
             recipient: recipient,
             // casting to 'uint40' is safe: the clock never passes `deadline`, itself far below 2^40
             // forge-lint: disable-next-line(unsafe-typecast)
-            deadline: uint40(clock + 1)
+            deadline: uint40(clock + 1),
+            // v8: hard cap on the taker-side fees; the existing cases assert fee behaviour elsewhere, so they opt out
+            maxTotalFee: type(uint128).max
         });
     }
 

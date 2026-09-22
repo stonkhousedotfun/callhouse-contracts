@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {Managed} from "./access/Managed.sol";
 import {IExpiryCalendar} from "./interfaces/IExpiryCalendar.sol";
 import {V2Constants} from "./interfaces/V2Constants.sol";
 import {V2Errors} from "./interfaces/V2Errors.sol";
@@ -22,13 +22,38 @@ import {V2Errors} from "./interfaces/V2Errors.sol";
 ///      switch cannot move either; only {newYorkOffset} resolves the switch to the second.
 ///
 ///      HOLIDAYS are admin data: the constructor seeds the NYSE full-day closures (2026-2028 at deploy) and the admin
-///      must extend the set before each new year. An unseeded holiday is an ordinary session day. Early closes (13:00)
-///      are ordinary session days: the settlement window simply averages the last prints.
+///      must extend the set before each new year. Early closes (13:00) are ordinary session days: the settlement window
+///      simply averages the last prints.
+///
+///      AN UNSEEDED YEAR FAILS CLOSED (SEC-48). A calendar constructed with at least one closure counts the closures
+///      set in each calendar year, and a year with none has NO session days: {isValidExpiry} refuses its closes (no
+///      series can be created on them), {nextExpiry} does not return them (it reverts BadExpiry once the whole search
+///      falls in such a year), and {isRegularSession}, {isWeekly} and {isSessionDay} are false in it. A forgotten
+///      year therefore stops listing, rolling and hedging at the year boundary instead of treating New Year's Day,
+///      Good Friday and the rest as trading days whose settlement windows have no fresh prints. Every NYSE year has at
+///      least nine full-day closures, so a seeded year always has one. What this does NOT catch: a year that is seeded
+///      but missing a closure (a special closure announced late, a holiday left out). That date is still an ordinary
+///      session day, exactly as before.
+///      Consequence for callers: HouseVault calls {nextExpiry} outside a try (constructor and epoch roll), so it
+///      cannot roll into, or be deployed within 14 days of, an unseeded year until the admin seeds it.
+///      A calendar constructed with NO closure makes no holiday claim at all and keeps every weekday a session day, in
+///      every year (the test harnesses' shape). DeployV8 refuses an empty V2_HOLIDAYS, so a deployed calendar is
+///      always in the fail-closed mode. The mode is fixed at construction.
 ///
 ///      SPECIAL EXPIRIES are exact instants whitelisted by the admin. They only widen {isValidExpiry}: {isWeekly},
 ///      {isRegularSession} and {nextExpiry} read the session-day grid alone, so a whitelisted instant never becomes a
 ///      weekly, never stops a later grid close from being the weekly, and is never returned to the AutoRoller.
-contract ExpiryCalendar is IExpiryCalendar, AccessControl, ReentrancyGuardTransient {
+///      A SPECIAL EXPIRY MUST BE ONE A MARKET SESSION CAN PRICE (T-479, BUG-04 F3): its whole settlement window
+///      [ts - SETTLEMENT_WINDOW, ts] must lie inside one regular session, opening at or after 09:30 New York on a
+///      session day and ending at or before that day's 16:00 close. An instant on a weekend, a holiday or outside
+///      the session has no fresh print for the Chainlink source (it is not ok once its round in force at the window
+///      start is older than `maxStale`), so on a single-source market no source is ever ok and the expiry could only
+///      settle through an {SettlementOracle.adminResolve} with no band at all. Refused here, before any series can
+///      be created on it, rather than bounded later: the oracle cannot tell such an expiry from one whose sources
+///      are legitimately down, and that admin fallback must stay.
+/// @dev C8-01 copy-me example: `Managed` + constructor `(address authority, …)` + `restricted` on the two
+///      LISTING setters. Later C8 tasks copy this shape; do not re-introduce AccessControl on a v8 target.
+contract ExpiryCalendar is IExpiryCalendar, Managed, ReentrancyGuardTransient {
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
@@ -62,17 +87,23 @@ contract ExpiryCalendar is IExpiryCalendar, AccessControl, ReentrancyGuardTransi
     /// @notice Whether this exact instant (unix seconds) is whitelisted as an expiry regardless of the grid.
     mapping(uint40 ts => bool) public specialExpiry;
 
+    /// @dev Closures currently set per calendar year of their day index ({_setHoliday}). Zero: the year is unseeded.
+    mapping(uint256 year => uint256) private _closuresInYear;
+
+    /// @dev True when the constructor was given at least one closure: an unseeded year then has no session days (see
+    ///      AN UNSEEDED YEAR FAILS CLOSED). Private, so the exported ABI does not change.
+    bool private immutable _unseededYearsClosed;
+
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @param admin Receives DEFAULT_ADMIN_ROLE: maintains holidays and special expiries.
+    /// @param authority_ The AccessManager that gates {setHolidays} and {setSpecialExpiry} (LISTING).
     /// @param holidays Initial full-day closures as day indexes (floor(16:00 New York instant / 86400)). The launch set
-    ///        is the NYSE 2026-2028 list in callhouse ops/markets/v2-sources.json `nyseHolidays.*.fullDays`.
-    constructor(address admin, uint32[] memory holidays) {
-        // An admin of address(0) would leave the holiday set frozen at the seed with nobody able to extend it.
-        if (admin == address(0)) revert V2Errors.NotAuthorized();
-        _grantRole(V2Constants.DEFAULT_ADMIN_ROLE, admin);
+    ///        is the NYSE 2026-2028 list in callhouse ops/markets/v2-sources.json `nyseHolidays.*.fullDays`. Non-empty:
+    ///        every year without a closure is closed, for the life of the calendar. Empty: no year ever is.
+    constructor(address authority_, uint32[] memory holidays) Managed(authority_) {
+        _unseededYearsClosed = holidays.length != 0;
         for (uint256 i; i < holidays.length; ++i) {
             _setHoliday(holidays[i], true);
         }
@@ -84,23 +115,26 @@ contract ExpiryCalendar is IExpiryCalendar, AccessControl, ReentrancyGuardTransi
 
     /// @notice Adds (`isHoliday` true) or removes full-day closures. Emits {HolidaySet} for every entry.
     /// @dev Affects every later read, including {isValidExpiry} for series creation; series already created keep their
-    ///      expiry (the Clearinghouse checks the calendar only at creation).
+    ///      expiry (the Clearinghouse checks the calendar only at creation). In the fail-closed mode the first closure
+    ///      set in a year opens that year's session days, and removing its last one closes them again (AN UNSEEDED YEAR
+    ///      FAILS CLOSED). Seeding a year means listing its full-day closures; there is no separate switch.
     /// @param dayIndexes Day indexes, floor(16:00 New York instant / 86400).
     /// @param isHoliday True to close the dates, false to reopen them.
-    function setHolidays(uint32[] calldata dayIndexes, bool isHoliday)
-        external
-        nonReentrant
-        onlyRole(V2Constants.DEFAULT_ADMIN_ROLE)
-    {
+    function setHolidays(uint32[] calldata dayIndexes, bool isHoliday) external nonReentrant restricted {
         for (uint256 i; i < dayIndexes.length; ++i) {
             _setHoliday(dayIndexes[i], isHoliday);
         }
     }
 
     /// @notice Whitelists (`allowed` true) or removes a special expiry instant. Emits {SpecialExpirySet}.
-    /// @param ts Expiry, unix seconds. Taken as given: the admin owns the choice of instant.
+    /// @dev Reverts V2Errors.BadExpiry when whitelisting an instant whose settlement window does not lie inside one
+    ///      regular session (see A SPECIAL EXPIRY MUST BE ONE A MARKET SESSION CAN PRICE). Removal is never refused, so
+    ///      an instant whitelisted before the rule existed can still be taken off; series already created on it keep
+    ///      their expiry either way.
+    /// @param ts Expiry, unix seconds. The admin chooses the instant; the calendar checks only that a session can price it.
     /// @param allowed True to accept `ts` in {isValidExpiry} regardless of the grid.
-    function setSpecialExpiry(uint40 ts, bool allowed) external nonReentrant onlyRole(V2Constants.DEFAULT_ADMIN_ROLE) {
+    function setSpecialExpiry(uint40 ts, bool allowed) external nonReentrant restricted {
+        if (allowed && !_windowInSession(ts)) revert V2Errors.BadExpiry();
         specialExpiry[ts] = allowed;
         emit SpecialExpirySet(ts, allowed);
     }
@@ -181,15 +215,27 @@ contract ExpiryCalendar is IExpiryCalendar, AccessControl, ReentrancyGuardTransi
                                INTERNALS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Every role check reverts with the shared v2 error instead of OpenZeppelin's, so the one error ABI every
-    ///      consumer merges (V2Errors) decodes it. This also covers grantRole / revokeRole.
-    function _checkRole(bytes32 role, address account) internal view override {
-        if (!hasRole(role, account)) revert V2Errors.NotAuthorized();
-    }
-
+    /// @dev Counts only real changes, so a day listed twice, or re-set to what it already is, moves nothing; the
+    ///      decrement follows a set that was counted, so it cannot underflow.
     function _setHoliday(uint32 dayIndex, bool isHoliday) private {
+        if (holiday[dayIndex] != isHoliday) {
+            uint256 year = _yearOf(dayIndex);
+            if (isHoliday) ++_closuresInYear[year];
+            else --_closuresInYear[year];
+        }
         holiday[dayIndex] = isHoliday;
         emit HolidaySet(dayIndex, isHoliday);
+    }
+
+    /// @dev The settlement window [ts - SETTLEMENT_WINDOW, ts] lies inside one regular session: it opens at or after
+    ///      09:30:00 New York on a session day and ends at or before that day's 16:00:00 close. The window start fixes
+    ///      the date, because inside a session the New York date is the UTC date ({isRegularSession}).
+    function _windowInSession(uint256 ts) private view returns (bool) {
+        if (ts < V2Constants.SETTLEMENT_WINDOW) return false;
+        uint256 start = ts - V2Constants.SETTLEMENT_WINDOW;
+        uint256 day = start / DAY;
+        uint256 shift = _isDstDate(day) ? 4 hours : 5 hours;
+        return _isSessionDay(day) && start >= day * DAY + SESSION_OPEN_LOCAL + shift && ts <= _closeOf(day);
     }
 
     /// @dev `ts` is exactly 16:00:00 New York on a session day.
@@ -202,11 +248,19 @@ contract ExpiryCalendar is IExpiryCalendar, AccessControl, ReentrancyGuardTransi
     ///      order {_isWeeklyDay} needs. The uint32 cast holds for every uint40 timestamp: 2^40 / 86400 < 2^24.
     function _isSessionDay(uint256 day) private view returns (bool) {
         // forge-lint: disable-next-line(unsafe-typecast)
-        return (day + 3) % 7 < 5 && !holiday[uint32(day)];
+        return (day + 3) % 7 < 5 && !holiday[uint32(day)] && _isSeededYear(day);
+    }
+
+    /// @dev False only in the fail-closed mode, for a year with no closure set (AN UNSEEDED YEAR FAILS CLOSED).
+    function _isSeededYear(uint256 day) private view returns (bool) {
+        return !_unseededYearsClosed || _closuresInYear[_yearOf(day)] != 0;
     }
 
     /// @dev A session day with no later session day in the same ISO week (Monday-Sunday). Only the remaining weekdays
     ///      can take the weekly away, so the scan stops at Saturday: at most four holiday reads.
+    ///      The scan reads `holiday` directly, NOT {_isSessionDay}: a later weekday in an unseeded year is not known to
+    ///      be closed, so it still takes the weekly away. A week that runs into an unseeded year therefore has no
+    ///      weekly until that year is seeded, rather than a weekly that seeding it would later move.
     function _isWeeklyDay(uint256 day) private view returns (bool) {
         if (!_isSessionDay(day)) return false;
         for (uint256 later = day + 1; (later + 3) % 7 < 5; ++later) {

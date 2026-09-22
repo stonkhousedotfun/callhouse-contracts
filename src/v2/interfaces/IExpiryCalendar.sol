@@ -5,7 +5,7 @@ pragma solidity ^0.8.28;
 /// @notice The v2 expiry grid: 16:00 America/New_York on NYSE session days (ADR-07, architecture §3.2).
 /// @dev A separate contract behind an admin-settable Clearinghouse pointer that affects NEW series only. The US DST
 ///      rule is implemented on chain; holidays and special expiries are admin-maintained. The admin setters
-///      (`setHolidays`, `setSpecialExpiry`, DEFAULT_ADMIN_ROLE) are implementation surface and not frozen here; their
+///      (`setHolidays`, `setSpecialExpiry`, LISTING, 1 h) are implementation surface and not frozen here; their
 ///      two events are. Every function below is a read callable by anyone. Early-close days (13:00) are normal days.
 interface IExpiryCalendar {
     /// @notice Whether a series may expire at `ts`.
@@ -44,12 +44,12 @@ interface IExpiryCalendar {
     /// @return secondsEastOfUtc -14400 or -18000
     function newYorkOffset(uint40 ts) external pure returns (int32 secondsEastOfUtc); // -14400 or -18000
 
-    /// @notice A holiday was added or removed (DEFAULT_ADMIN_ROLE).
+    /// @notice A holiday was added or removed (LISTING).
     /// @param dayIndex floor(ts / 86400) of the New York date's 16:00 instant.
     /// @param isHoliday True when the date is no longer a session day.
     event HolidaySet(uint32 indexed dayIndex, bool isHoliday);
 
-    /// @notice A special expiry was whitelisted or removed (DEFAULT_ADMIN_ROLE).
+    /// @notice A special expiry was whitelisted or removed (LISTING).
     /// @param ts Expiry, unix seconds.
     /// @param allowed True when `ts` is now valid regardless of the grid.
     event SpecialExpirySet(uint40 indexed ts, bool allowed);

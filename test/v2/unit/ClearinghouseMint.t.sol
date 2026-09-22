@@ -34,9 +34,9 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
         _deposit(alice, address(nvda), 2e18);
         uint256 chBalance = nvda.balanceOf(address(ch));
 
+        _asMinter(alice);
         vm.expectEmit(true, true, true, true, address(ch));
         emit IClearinghouse.Minted(callId, alice, bob, 150, 150e16, 0);
-        vm.prank(alice);
         ch.mint(callId, 150, alice, bob);
 
         assertEq(ch.free(alice, address(nvda)), 2e18 - 150e16, "free down by units * UNIT");
@@ -53,7 +53,7 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
 
     function test_mint_putLocksStrikeOver100Usdg() public {
         _deposit(alice, address(usdg), 1_000e6);
-        vm.prank(alice);
+        _asMinter(alice);
         ch.mint(putId, 37, alice, alice);
         assertEq(ch.locked(putId), 37 * (K_200 / 100), "37 units * 2.00 USDG");
         assertEq(ch.free(alice, address(usdg)), 1_000e6 - 74e6);
@@ -84,11 +84,9 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
     ///      never TransferBatch.
     function test_mint_logOrder() public {
         _deposit(alice, address(nvda), 1e18);
-        vm.prank(alice);
-        ch.setOperator(mm, true);
+        _asMinter(alice);
 
         vm.recordLogs();
-        vm.prank(mm);
         ch.mint(callId, 5, alice, bob);
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
@@ -97,8 +95,8 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
             assertEq(logs[i].emitter, address(ch));
             assertTrue(logs[i].topics[0] != TRANSFER_BATCH, "no TransferBatch");
         }
-        _assertTransferSingle(logs[0], mm, address(0), bob, callId, 5);
-        _assertTransferSingle(logs[1], mm, address(0), alice, _short(callId), 5);
+        _assertTransferSingle(logs[0], address(this), address(0), bob, callId, 5);
+        _assertTransferSingle(logs[1], address(this), address(0), alice, _short(callId), 5);
         assertEq(logs[2].topics[0], IClearinghouse.Minted.selector);
         assertEq(uint256(logs[2].topics[1]), callId);
         assertEq(address(uint160(uint256(logs[2].topics[2]))), alice, "writer");
@@ -110,28 +108,26 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
 
     function test_mint_cutoff() public {
         _deposit(alice, address(nvda), 1e18);
+        _asMinter(alice);
         uint40 cutoff = ch.mintCutoff(callId);
 
         vm.warp(cutoff - 1);
-        vm.prank(alice);
         ch.mint(callId, 1, alice, alice);
 
         vm.warp(cutoff);
-        vm.prank(alice);
         vm.expectRevert(V2Errors.PastCutoff.selector);
         ch.mint(callId, 1, alice, alice);
 
         vm.warp(FRI_2026_09_18 + 1 days);
-        vm.prank(alice);
         vm.expectRevert(V2Errors.PastCutoff.selector);
         ch.mint(callId, 1, alice, alice);
     }
 
     function test_mint_pausedAndDisabled() public {
         _deposit(alice, address(nvda), 1e18);
+        _asMinter(alice);
         vm.prank(guardian);
         ch.setMintPaused(address(nvda), true);
-        vm.prank(alice);
         vm.expectRevert(V2Errors.MintPaused.selector);
         ch.mint(callId, 1, alice, alice);
 
@@ -139,14 +135,13 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
         ch.setMintPaused(address(nvda), false);
         vm.prank(guardian);
         ch.setCreatePaused(true);
-        vm.prank(alice);
         ch.mint(callId, 1, alice, alice); // creation pause does not stop mints of existing series
 
         V2Types.MarketConfig memory off = _cfg(address(oracle));
         off.enabled = false;
-        vm.prank(admin);
-        ch.setMarketConfig(address(nvda), off);
-        vm.prank(alice);
+        vm.startPrank(admin);
+        _reconfigure(ch, address(nvda), off);
+        vm.stopPrank();
         vm.expectRevert(V2Errors.MarketDisabled.selector);
         ch.mint(callId, 1, alice, alice);
     }
@@ -155,30 +150,28 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
         _deposit(alice, address(nvda), 1e18);
 
         vm.prank(bob);
+        vm.expectRevert(V2Errors.NotMinter.selector);
+        ch.mint(callId, 1, alice, bob);
+
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         ch.mint(callId, 1, alice, bob);
 
-        vm.prank(alice);
+        _asMinter(alice);
         vm.expectRevert(V2Errors.UnknownSeries.selector);
         ch.mint(_short(callId), 1, alice, alice);
 
-        vm.prank(alice);
         vm.expectRevert(V2Errors.UnknownSeries.selector);
         ch.mint(12_345, 1, alice, alice);
 
-        vm.prank(alice);
         vm.expectRevert(V2Errors.BadUnits.selector);
         ch.mint(callId, 0, alice, alice);
 
-        vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(IERC1155Errors.ERC1155InvalidReceiver.selector, address(0)));
         ch.mint(callId, 1, alice, address(0));
 
-        vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(V2Errors.InsufficientCollateral.selector, 1e18, 101e16));
         ch.mint(callId, 101, alice, alice);
 
-        vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(V2Errors.InsufficientCollateral.selector, 0, 2_000_000));
         ch.mint(putId, 1, alice, alice);
     }
@@ -190,7 +183,7 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
 
         receiver.setReject(true);
         _deposit(alice, address(nvda), 1e16);
-        vm.prank(alice);
+        _asMinter(alice);
         vm.expectRevert(abi.encodeWithSelector(IERC1155Errors.ERC1155InvalidReceiver.selector, address(receiver)));
         ch.mint(callId, 1, alice, address(receiver));
     }
@@ -222,10 +215,10 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
         attacks[8] = abi.encodeCall(ch.setOperator, (alice, true));
         attacks[9] = abi.encodeCall(ch.deposit, (address(usdg), 0, address(probe)));
 
+        _asMinter(alice);
         for (uint256 i; i < attacks.length; ++i) {
             ClearinghouseTestReceiver receiver = new ClearinghouseTestReceiver();
             receiver.setAttack(address(ch), attacks[i], false);
-            vm.prank(alice);
             ch.mint(callId, 1, alice, address(receiver));
             assertTrue(receiver.attempted(), "hook ran");
             assertFalse(receiver.succeeded(), "re-entry blocked");
@@ -238,7 +231,6 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
 
         ClearinghouseTestReceiver loud = new ClearinghouseTestReceiver();
         loud.setAttack(address(ch), attacks[0], true);
-        vm.prank(alice);
         vm.expectRevert(ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
         ch.mint(callId, 1, alice, address(loud));
     }
@@ -247,21 +239,17 @@ contract ClearinghouseMintTest is ClearinghouseTestBase {
     ///      supply) and on a repeat mint.
     function test_gas_mint() public {
         _deposit(alice, address(nvda), 10e18);
+        _asMinter(alice);
         uint256 fresh = _call(K_220, FRI_2026_09_11);
 
-        vm.prank(alice);
         uint256 g = gasleft();
         ch.mint(fresh, 100, alice, bob);
         uint256 first = g - gasleft();
 
-        vm.prank(alice);
         g = gasleft();
         ch.mint(fresh, 100, alice, bob);
         uint256 repeat = g - gasleft();
 
-        vm.prank(alice);
-        ch.setOperator(mm, true);
-        vm.prank(mm);
         g = gasleft();
         ch.mint(callId, 1, alice, carol);
         uint256 viaOperator = g - gasleft();

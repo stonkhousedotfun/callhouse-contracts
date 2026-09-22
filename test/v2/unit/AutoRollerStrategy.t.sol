@@ -33,21 +33,23 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         assertEq(roller.strategy(alice, address(nvda)).otmBps, 2500, "stored");
     }
 
+    /// T-OP-063 / SEC-13: the compiled floor is 50 bps (was 5), so 49 is refused and 50 is the first accepted ask.
     function test_bounds_ask() public {
-        _expectBadStrategy(_weekly(500, 4));
+        _expectBadStrategy(_weekly(500, 49));
         _expectBadStrategy(_weekly(500, 1001));
-        _setStrategy(alice, _weekly(500, 5));
+        _setStrategy(alice, _weekly(500, 50));
         _setStrategy(alice, _weekly(500, 1000));
         assertEq(roller.strategy(alice, address(nvda)).askBps, 1000, "stored");
     }
 
+    /// T-OP-063 / SEC-13: the band's floor is MIN_ASK_BPS = 50 (was 5): minAskBps 49 is refused, 50 accepted.
     function test_bounds_smartPricingBand() public {
-        _expectBadStrategy(_smart(4, 150, 500));
+        _expectBadStrategy(_smart(49, 150, 500));
         _expectBadStrategy(_smart(151, 150, 500));
         _expectBadStrategy(_smart(50, 150, 149));
         _expectBadStrategy(_smart(50, 150, 1001));
         _setStrategy(alice, _smart(150, 150, 150));
-        _setStrategy(alice, _smart(5, 150, 1000));
+        _setStrategy(alice, _smart(50, 150, 1000));
 
         // Without smart pricing the band is never read, so it is not checked.
         V2Types.Strategy memory s = _weekly(500, 150);
@@ -326,7 +328,7 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         V2Types.MarketConfig memory m = ch.market(address(nvda));
         m.enabled = false;
         vm.prank(admin);
-        ch.setMarketConfig(address(nvda), m);
+        _reconfigure(ch, address(nvda), m);
         _spotAt(_ny(THU_0910, 10, 0, 0), 220_00000000);
         _expectRollReverts(V2Errors.MarketDisabled.selector);
     }
@@ -395,6 +397,10 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         roller.reprice(alice, address(nvda), 4_000_000);
     }
 
+    /// T-OP-063 / SEC-13: the band floor (1.10 at spot 220.00) is reached from the 3.30 roll ask through a ladder of
+    /// <= 25 % steps on the PRICE_TICK grid rather than one call -- the drop cap refuses the direct 66.7 % drop -- and
+    /// the raise to the ceiling is a single call, as before. The two BadPrice expectations are the band's own: the
+    /// band is checked before the cap, so a below-band price is BadPrice whatever the drop.
     function test_reprice_bandIsInclusiveAndExact() public {
         _rollSmart();
         vm.startPrank(pricer);
@@ -402,6 +408,9 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         roller.reprice(alice, address(nvda), 1_099_900);
         vm.expectRevert(V2Errors.BadPrice.selector);
         roller.reprice(alice, address(nvda), 11_000_100);
+        roller.reprice(alice, address(nvda), 2_475_000);
+        roller.reprice(alice, address(nvda), 1_856_300);
+        roller.reprice(alice, address(nvda), 1_392_300);
         roller.reprice(alice, address(nvda), 1_100_000);
         roller.reprice(alice, address(nvda), 11_000_000);
         vm.stopPrank();
@@ -409,11 +418,13 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         assertEq(_order(orderId).price, 11_000_000, "top of the band");
     }
 
+    /// T-OP-063: the off-tick price sits INSIDE the drop cap (2.50005 from 3.30 is a 24 % drop), so the BadPrice here
+    /// is the book's tick refusal and not the cap; 2.00005 (39 %) would have been RepriceDropExceeded first.
     function test_reprice_offTick_reverts() public {
         _rollSmart();
         vm.prank(pricer);
         vm.expectRevert(V2Errors.BadPrice.selector);
-        roller.reprice(alice, address(nvda), 2_000_050);
+        roller.reprice(alice, address(nvda), 2_500_050);
     }
 
     function test_reprice_staleSpot_reverts() public {
@@ -541,11 +552,13 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         assertEq(_mustRoll(alice).units, 99, "placed");
         assertEq(usdg.balanceOf(keeper), 0, "below minRollUnits: no bounty");
 
+        // The threshold cannot go below DEFAULT_MIN_ROLL_UNITS (T-313), so the setter is exercised upwards.
+        s.maxUnits = 101;
         _setStrategy(bob, s);
         _onboardWriter(bob, WRITER_SHARES);
         vm.prank(admin);
-        roller.setMinRollUnits(99);
-        _mustRoll(bob);
+        roller.setMinRollUnits(101);
+        assertEq(_mustRoll(bob).units, 101, "placed at the raised threshold");
         assertEq(usdg.balanceOf(keeper), ROLL_BOUNTY, "at the threshold: bounty");
     }
 
@@ -574,13 +587,18 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         assertEq(address(roller.clearinghouse()), address(ch), "clearinghouse from the book");
         assertEq(roller.usdg(), address(usdg), "usdg from the clearinghouse");
         assertEq(roller.minRollUnits(), roller.DEFAULT_MIN_ROLL_UNITS(), "default threshold");
-        assertTrue(roller.hasRole(V2Constants.DEFAULT_ADMIN_ROLE, admin), "admin");
+        assertEq(roller.authority(), address(manager), "the AccessManager is the authority");
         assertTrue(roller.supportsInterface(type(IAutoRoller).interfaceId), "IAutoRoller");
-        assertTrue(roller.supportsInterface(type(IAccessControl).interfaceId), "IAccessControl");
         assertTrue(roller.supportsInterface(type(IERC165).interfaceId), "IERC165");
+        // INTERFACE_VERSION 8: roles are not on the target, so AccessControl is no longer advertised.
+        assertFalse(roller.supportsInterface(type(IAccessControl).interfaceId), "no IAccessControl in v8");
 
-        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        // A code-less authority is refused: every restricted call would revert and {setAuthority} could never fix
+        // it, because only the authority may call it.
+        vm.expectRevert(V2Errors.NoSource.selector);
         new AutoRoller(IOrderBook(address(book)), address(0));
+        vm.expectRevert(V2Errors.NoSource.selector);
+        new AutoRoller(IOrderBook(address(book)), makeAddr("eoaAuthority"));
     }
 
     function test_admin_setters_roleAndBounds() public {
@@ -590,8 +608,19 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         vm.expectRevert(V2Errors.NotAuthorized.selector);
         roller.setMinRollUnits(1);
         vm.expectRevert(V2Errors.NotAuthorized.selector);
-        roller.grantRole(V2Constants.PRICER_ROLE, alice);
+        roller.setAuthority(alice);
         vm.stopPrank();
+
+        // The roller has no role table of its own left to attack.
+        vm.prank(alice);
+        (bool ok,) =
+            address(roller).call(abi.encodeWithSignature("grantRole(bytes32,address)", V2Constants.PRICER_ROLE, alice));
+        assertFalse(ok, "grantRole must not exist on a v8 target");
+
+        // The PRICER lane is the pricer's and nobody else's, even the admin's.
+        vm.prank(alice);
+        vm.expectRevert(V2Errors.NotAuthorized.selector);
+        roller.reprice(alice, address(nvda), 1);
 
         vm.startPrank(admin);
         vm.expectRevert(V2Errors.NoSource.selector);
@@ -600,10 +629,10 @@ contract AutoRollerStrategyTest is AutoRollerTestBase {
         emit AutoRoller.KeeperRewardsSet(address(0));
         roller.setKeeperRewards(address(0));
         vm.expectEmit(address(roller));
-        emit AutoRoller.MinRollUnitsSet(7);
-        roller.setMinRollUnits(7);
+        emit AutoRoller.MinRollUnitsSet(101);
+        roller.setMinRollUnits(101);
         vm.stopPrank();
         assertEq(address(roller.keeperRewards()), address(0), "payer cleared");
-        assertEq(roller.minRollUnits(), 7, "threshold");
+        assertEq(roller.minRollUnits(), 101, "threshold");
     }
 }

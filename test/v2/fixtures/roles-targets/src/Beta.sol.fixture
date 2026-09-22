@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+/// @dev Fixture: a contract with a state-changing external and NO restricted selector - the shape
+///      that is legitimately absent from .targets and therefore must be a written-down decision.
+contract Beta {
+    function doThing() external {}
+}

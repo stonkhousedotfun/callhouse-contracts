@@ -43,9 +43,13 @@ contract SettlementOracleSourcesTest is BaseV2Test {
     }
 
     function _deployCore() internal override {
-        cl = new ChainlinkFeedSource(admin);
-        uni = new UniV3TwapSource(admin, address(usdg));
-        oracle = new SettlementOracle(admin, guardian);
+        _deployManager();
+        cl = new ChainlinkFeedSource(address(manager));
+        _wire(address(cl), "ChainlinkFeedSource", admin, 0);
+        uni = new UniV3TwapSource(address(manager), address(usdg));
+        _wire(address(uni), "UniV3TwapSource", admin, 0);
+        oracle = new SettlementOracle(address(manager));
+        _wire(address(oracle), "SettlementOracle", admin, 0);
         address[] memory sources = new address[](2);
         (sources[0], sources[1]) = (address(cl), address(uni));
         vm.startPrank(admin);
@@ -161,9 +165,82 @@ contract SettlementOracleSourcesTest is BaseV2Test {
         assertEq(uint8(_status()), uint8(V2Types.SettlementStatus.Pending), "resumes");
     }
 
-    /// Spot from the feed's latest round goes stale after spotMaxAge; UniV3TwapSource.record is never called early.
+    /// @dev T-495's launch-phase action, and the one fact its whole "not reachable today" reading rests on.
+    ///      T-495 argued that an early-close day leaves the settlement window with no print inside it, and that the
+    ///      Chainlink source nonetheless stays ok BECAUSE `maxStale` is 26 h -- so `_band` never takes its
+    ///      `okCount == 0` exit and `adminResolve` stays bounded. That is an argument about a configured number, and
+    ///      T-495 recorded that nothing proves it. This is the proof, in both directions.
+    ///
+    ///      THE GAP IS DERIVED, NEVER TYPED. On a half day the last print is 13:00 and the expiry is still anchored
+    ///      at the 16:00 close, so the window `[expiry - SETTLEMENT_WINDOW, expiry]` opens
+    ///      `3 hours - SETTLEMENT_WINDOW` after that print. T-502's author published this figure as 1.5 h, corrected
+    ///      it to 2.5 h mid-row, and said plainly that the number was load-bearing and wrong in two messages. So it
+    ///      is computed here from `V2Constants.SETTLEMENT_WINDOW` and can never drift from it.
+    ///
+    ///      BOTH DIRECTIONS ARE ASSERTED ON PURPOSE. Ok-at-26 h alone would also pass against a source that ignores
+    ///      staleness entirely, which is the shape of every false green this build has produced. The not-ok-at-1 h
+    ///      leg is what proves the rule at `ChainlinkFeedSource.sol:235` is doing the work, and it is also the
+    ///      standing record that `MIN_MAX_STALE` sits BELOW the gap: the configuration T-502 documents as reachable
+    ///      by a direct CONFIG_ADMIN `setFeed` is the one that puts the half-day window back in the unbounded case.
+    function test_T495_halfDayWindowIsOkAt26hAndNotOkAtTheOneHourFloor() public {
+        uint40 gap = uint40(3 hours) - V2Constants.SETTLEMENT_WINDOW;
+        assertEq(gap, 9000, "the half-day gap is 2.5 h: (16:00 close - 13:00 early close) - SETTLEMENT_WINDOW");
+        assertGt(gap, cl.MIN_MAX_STALE(), "the floor must sit BELOW the gap or this test proves nothing");
+
+        // The window opens exactly `gap` after the day's last print, and nothing prints inside it.
+        uint40 start = E + 4 hours;
+        uint40 end = start + V2Constants.SETTLEMENT_WINDOW;
+        feed.push(NVDA_FEED_ANSWER, start - gap);
+        vm.warp(end);
+
+        (bool okAtDefault, uint256 priceAtDefault) = cl.windowPrice(address(nvda), start, end);
+        assertTrue(okAtDefault, "at DEFAULT_MAX_STALE 26 h the half-day window still has an ok price");
+        assertEq(priceAtDefault, uint256(uint256(int256(NVDA_FEED_ANSWER)) / 100), "and it is the price in force");
+
+        // BOTH ARGUMENTS ARE READ BEFORE THE PRANK IS ARMED, and that is not style. `vm.prank` applies to the very
+        // next call, so an external read written inside the argument list EATS IT: the first version of this test
+        // put `cl.MIN_MAX_STALE()` in the call and the manager saw `canCall(SettlementOracleSourcesTest, ...)` and
+        // reverted NotAuthorized. That is the T-263 cheatcode-eaten-by-an-argument class, and the reason it is worth
+        // a comment is that it failed LOUDLY here only because setFeed is restricted -- on an unguarded call the
+        // prank would have been eaten in silence and the test would have passed as the wrong caller.
+        uint32 floorMaxStale = cl.MIN_MAX_STALE();
+        uint16 jumpBps = cl.DEFAULT_MAX_ROUND_JUMP_BPS();
+        vm.prank(admin);
+        cl.setFeed(address(nvda), address(feed), floorMaxStale, jumpBps);
+        (bool okAtFloor,) = cl.windowPrice(address(nvda), start, end);
+        assertFalse(okAtFloor, "at MIN_MAX_STALE 1 h the same window has no ok price at all");
+    }
+
+    /// Spot from the feed's latest round goes stale after spotMaxAge WHEN NOTHING CORROBORATES IT; UniV3TwapSource.record
+    /// is never called early.
+    /// @dev T-OP-087 (SettlementOracle._spot, step 2) made a print older than SPOT_CORROBORATION_AGE spot as long as the
+    ///      market's source 1 is ok and agrees within maxDeviationBps, up to MAX_SPOT_MAX_AGE; the spotMaxAge clock this
+    ///      test is named for is step 3, reached only when source 1 is NOT ok. Until T-OP-128 this test asserted the
+    ///      pre-087 rule against a fixture whose pool sits 9 bps from the print, so the print was corroborated and
+    ///      `spot()` no longer reverted (T-OP-097 (b)(3)). The uncorroborated arm is now driven both ways the landed
+    ///      rule defines it -- the pool DOWN (step 3, the 1 h clock) and the pool DISAGREEING (step 2, the witness
+    ///      says the market moved) -- with the corroborated case first as the control that separates the new rule
+    ///      from the old one.
     function test_spotStale_andSnapshotTooEarly() public {
         vm.warp(E - 900 + 1 hours + 1);
+        // Control for the landed rule: the hour-old 220.40 print is SPOT while the pool (220.00, 18 bps away, inside
+        // the 150 bps default band) agrees with it. Under the pre-087 rule this line reverted StaleSpot.
+        (uint256 price, uint256 updatedAt) = oracle.spot(address(nvda));
+        assertEq(price, 220_400_000, "an hour-old print the pool agrees with is spot (T-OP-087 step 2)");
+        assertEq(updatedAt, E - 900, "the answer is still source 0's timestamp");
+
+        // The arm the test is named for: the pool is DOWN, so there is no witness and the uncorroborated spotMaxAge
+        // clock (DEFAULT_SPOT_MAX_AGE, 1 h) governs -- the same print, one second past the hour, is stale.
+        pool.setObserveReverts(true);
+        vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, uint256(E - 900)));
+        oracle.spot(address(nvda));
+        pool.setObserveReverts(false);
+
+        // The other uncorroborated arm: the pool is up but says the market MOVED. A state pushed one second before
+        // the pool's DEFAULT_WINDOW (300 s) began makes the whole window read 229.99 (tick 221941), 4.4 % from the
+        // print and outside the 150 bps band, so the witness refuses the print rather than corroborating it.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        pool.pushState(uint40(block.timestamp - uni.DEFAULT_WINDOW() - 1), 221941, LIQ);
         vm.expectRevert(abi.encodeWithSelector(V2Errors.StaleSpot.selector, uint256(E - 900)));
         oracle.spot(address(nvda));
 

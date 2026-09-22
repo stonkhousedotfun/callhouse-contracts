@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "Alpha": {
+      "setThing(uint256)": "ADMIN"
+    },
+    "Gamma": {
+      "baseAdmin(address)": "ADMIN"
+    },
+    "Beta": {
+      "doThing()": "ADMIN"
+    }
+  },
+  "unmanagedTargets": {
+    "_comment": "fixture",
+    "Beta": "fixture reason"
+  }
+}
