@@ -19,7 +19,7 @@
     },
     {
       "path": "test/v2/lib/V4ProtocolFeeMirror.sol",
-      "sha256": "6876f27d544f28c3cea425256d1cd7eb372a6d99aa8a5f2e3beb66f2b03e0785",
+      "sha256": "3d37008fdaba6ecc04e5a4770fd0b2ca0700832e5a892296d988345dffa7f182",
       "assertion": "MIRRORED, NOT RE-DERIVED. Copied line for line from the v4-core checkout on this machine. If v4-core changes these, this file is wrong and the pin must be re-mirrored from the same path.",
       "upstream": "Uniswap v4-core src/libraries/ProtocolFeeLibrary.sol:8,17-23; local checkout recorded by the file header",
       "why": "This test-only dependency mirror is deliberately independent of the production decode sites. Silent edits would make the supposed upstream reference agree with the code under test for the wrong reason."

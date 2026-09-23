@@ -816,7 +816,7 @@ externals_forge() { # log target [env assignments are the caller's]
 # stage records the factory and runs MapExternals (factory mapped), pass B reuses the factory with
 # V2_HOUSE_REQUIRE_VAULTS=true and creates the vault(s) as the deployer, whose transient step-4 LISTING
 # self-grant is still live while the hand-back is deferred; the stage records v2.contracts.houseVault (the
-# first launch ticker's, coordinator answer A on Q-5c08997202314b50; per-ticker vaults are a callhouse row) and
+# first launch ticker's, coordinator answer A an owner question; per-ticker vaults are a callhouse row) and
 # the final MapExternals (after every external) maps the vault(s).
 externals_house_env() { # the launch tickers' rows + limits for DeployHouseVault
   local t launch

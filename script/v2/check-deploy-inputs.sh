@@ -1110,7 +1110,7 @@ SR
   set +e; out=$("$0" --registry "$clean" --sources "$TMPD/v2-sources.json" --wrapper "$TMPD/wb-underivable.sh" $libargs --mode rehearse --recorded none --no-checksum 2>&1); rc=$?; set -e
   if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'writes v2\.externalDeployBlocks\[key\] but key is neither'; then echo "  ok    a write-back keyed by a name typed inside write_back() refuses to run (rc=2) naming the write"; st_pass=$((st_pass + 1))
   else echo "  FAIL  an underivable write-back key set should be rc=2 naming the write (rc=$rc)" >&2; printf '%s\n' "$out" | tail -3 >&2; st_fail=$((st_fail + 1)); fi
-  # 16. T-OP-116's ACTUAL shape (claude-625632, M-b71f686e47ca4aa0): the externals are recorded by a LIBRARY
+  # 16. T-OP-116's ACTUAL shape (M-b71f686e47ca4aa0): the externals are recorded by a LIBRARY
   #     function whose node body destructures process.argv, called through two bash functions with
   #     positional arguments; the key at the outermost call site is either a loop variable over a column-0
   #     list in the library (`for k in $SELFTEST_EXTERNAL_ORDER` here; the landed shape uses EXTERNAL_DEPLOY_ORDER,

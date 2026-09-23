@@ -235,13 +235,13 @@ contract StockLoanAdapterTest is Test {
 }
 
 /// @notice A code-bearing interest-rate model placeholder.
-/// @dev T-CV-OTHER-CONTRACTS epoch 4 (claude-824720) PROVED THIS REPAIR IS LOAD-BEARING rather than assuming it,
+/// @dev T-CV-OTHER-CONTRACTS epoch 4 PROVED THIS REPAIR IS LOAD-BEARING rather than assuming it,
 ///      after a rebase moved it onto a base it was not written against. Restoring the code-less IRM
 ///      (`StubIrm(address(1))`) reproduces `[FAIL: NoSource()] test_borrowCycle_andHealthFactor`, exactly the
 ///      failure this repair exists to remove; restored byte-identical and the suite returns 8/8.
 ///
 ///      TWO LANES FOUND THIS INDEPENDENTLY AND THAT IS THE USEFUL PART. T-591 landed `baea30bd` with `StubIrm`
-///      and `605d2789` (claude-894318, T-CV-OTHER-CONTRACTS epochs 2-3) landed the same repair with a `MockIrm`,
+///      and `605d2789` (T-CV-OTHER-CONTRACTS epochs 2-3) landed the same repair with a `MockIrm`,
 ///      both tracing it to `StockLoanAdapter.sol:74` / `V2Errors.NoSource`, the SEC-32 guard added by `6e1d659f`
 ///      after this file was last touched. The rebase surfaced them as a conflict; the agreed resolution keeps
 ///      `StubIrm` because it already exists and carries a `rate` field, and drops the duplicate -- which rebased

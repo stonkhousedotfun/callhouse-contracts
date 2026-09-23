@@ -117,7 +117,7 @@ interface IEarnVault {
     /// @param assets Base units to pull from `msg.sender` (approve the vault first).
     /// @param receiver Who gets the shares.
     /// @return shares Shares minted.
-    /// @dev THE SELECTOR IS UNCHANGED, BY OWNER RULING 2026-09-20 on question Q-76a519afccce44c2, and the return
+    /// @dev THE SELECTOR IS UNCHANGED, BY OWNER RULING 2026-09-20 on an owner question, and the return
     ///      value now carries a second meaning that callers MUST handle. A deposit into a flat vault mints and
     ///      returns the shares, as before. A deposit that arrives while the vault has a written series outstanding
     ///      QUEUES instead of pricing and RETURNS ZERO -- it has not failed, and the assets are escrowed, not lost.

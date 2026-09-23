@@ -96,7 +96,7 @@ import {V2DeployBase} from "./lib/V2DeployBase.sol";
 ///      "hNVDA" for `markets[0]`; here the name and symbol are derived per ticker ("Stonkhouse House <T>", "h<T>")
 ///      so the launch set (`V2_TICKERS`, exported by the registry projection from `launchSet.markets`; NVDA and SPCX
 ///      today) gets one vault each. THE REGISTRY HOME, ruled by the coordinator on this row's question
-///      (Q-5c08997202314b50, answer A): `v2.contracts.houseVault` stays ONE address and is the FIRST launch
+///      (owner answer A): `v2.contracts.houseVault` stays ONE address and is the FIRST launch
 ///      ticker's vault, so VerifyV8's single `HouseVault` target and every address|null consumer keep working; the
 ///      per-ticker vaults live at `markets[].v2.houseVault`, a per-market write-back field like `registeredAt`
 ///      (the callhouse schema row is the coordinator's, not this one). So the JSON out carries BOTH: `houseVault`

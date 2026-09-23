@@ -12,7 +12,7 @@ pragma solidity 0.8.28;
 ///      instead of finding it. That gap is what this file closes.
 ///
 ///      MIRRORED, NOT RE-DERIVED. Copied line for line from the v4-core checkout on this machine,
-///      `/Users/omaidfaizyar/Desktop/web3-repos/Uniswap__v4-core/src/libraries/ProtocolFeeLibrary.sol`:
+///      `a local Uniswap v4-core checkout/src/libraries/ProtocolFeeLibrary.sol`:
 ///        - `:8`      `uint16 public constant MAX_PROTOCOL_FEE = 1000;`   ("Max protocol fee is 0.1% (1000 pips)")
 ///        - `:17-19`  `getZeroForOneFee(uint24 self) => uint16(self & 0xfff)`
 ///        - `:21-23`  `getOneForZeroFee(uint24 self) => uint16(self >> 12)`

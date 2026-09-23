@@ -5,7 +5,7 @@
 //   upstream : https://raw.githubusercontent.com/Uniswap/v3-core/6562c52e8f75f0c10f9deaf44861847585fc8129/contracts/libraries/TickMath.sol
 //   commit   : 6562c52e8f75f0c10f9deaf44861847585fc8129 (the same commit FullMath.sol's vendoring header names)
 //   sha256   : 007a6e5778bc21c18c1ea9379ce1390810d879e213f1dcecc77247eb7cccdc15 (of the fetched file, 9418 bytes)
-//   fetched  : 2026-09-22 by claude-513998, under the standing network grant
+//   fetched  : 2026-09-22 by an internal lane, under the standing network grant
 // The rename is the ONLY edit, so the copy can sit beside the repo's first-party rewrite in one test. NOTHING SHIPS
 // IT: it lives under test/v2/fixtures/ and is imported only by test/v2/unit/TickMath.t.sol, which measures the
 // rewrite (src/v2/oracle/lib/TickMath.sol, the code on the price path through UniV3TwapSource) against it.

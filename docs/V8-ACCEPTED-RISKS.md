@@ -468,7 +468,7 @@ Two items the owner ruled on in the same review that the security review had not
 An owner ORDER, not a review finding: on 2026-09-22 05:55Z the owner said, verbatim, **"i dont want
 these numbers to have a delay at all."** "These numbers" are the House vault's `Limits` —
 `maxSeriesUnits`, `maxTotalNotional`, `askToleranceBps`, `maxBidBpsOfSpot`, `maxOrderLifetime`,
-`maxDailyOutflow`. T-OP-159 (claude-350437, contracts base
+`maxDailyOutflow`. T-OP-159 (contracts base
 `0524fc2b8ed1162a942968817a38c71bb8337785`) carried it out as a MANIFEST-ONLY change: one row of
 `script/v2/roles.v8.json` (`.targets.HouseVault["setLimits(...)"]`, `:188`) moved from
 `TREASURY_ADMIN` (`delaysS` 86,400 s, guardian-cancellable) to `GUARDIAN` (`delaysS` 0). No contract
@@ -519,8 +519,7 @@ ledger.
 
 ## Open owner decisions
 
-These are questions. Nothing in this repository answers them. They were raised on Agent Bridge on
-2026-09-21 to the coordinator for the owner (decision 3 as question `Q-a0b852df85c0414c`, decisions 1
+These are questions. Nothing in this repository answers them. They were put to the owner on 2026-09-21 (decisions 1
 and 2 in message `M-1425b7afd44e4f64`), from task T-SEC-ACCEPTED-RISKS-RUNBOOK.
 
 1. **SEC-08b — AutoRoller `spotMaxAge = 1 h`.** **CLOSED 2026-09-22 — owner chose (c); delivered as the

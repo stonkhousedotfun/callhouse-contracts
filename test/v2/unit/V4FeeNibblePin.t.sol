@@ -17,7 +17,7 @@ import {V4ProtocolFeeMirror} from "../lib/V4ProtocolFeeMirror.sol";
 ///      IT NOW PINS AGAINST THE DEPENDENCY, NOT ONLY AGAINST ITSELF (T-250). The paragraph that used to sit here
 ///      said our convention could not be checked against v4-core because it is not a submodule. That was true of
 ///      this REPOSITORY and false of this MACHINE: v4-core is checked out at
-///      `/Users/omaidfaizyar/Desktop/web3-repos/Uniswap__v4-core`, and its two accessors are now mirrored into
+///      `a local Uniswap v4-core checkout`, and its two accessors are now mirrored into
 ///      `test/v2/lib/V4ProtocolFeeMirror.sol` with their upstream file and line numbers recorded. The tests at the
 ///      bottom of this file assert our decode sites against THAT mirror, so "every site is wrong in the same
 ///      direction" is now a failing test rather than a frozen error.
